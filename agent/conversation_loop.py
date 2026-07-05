@@ -1158,6 +1158,14 @@ def run_conversation(
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                # Copilot x-initiator: the first API call of a user turn is
+                # marked "user" so Copilot bills a premium request; tool-loop
+                # follow-ups keep the default "agent" header (#3040).
+                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
+                    _xh = dict(api_kwargs.get("extra_headers") or {})
+                    _xh["x-initiator"] = "user"
+                    api_kwargs["extra_headers"] = _xh
+                    agent._is_user_initiated_turn = False
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -3692,6 +3700,8 @@ def run_conversation(
                     if agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                        elif classified.reason == FailoverReason.ssl_cert_verification:
+                            agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
@@ -3718,6 +3728,11 @@ def run_conversation(
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
+                            f"{_nonretryable_summary}"
+                        )
+                    elif classified.reason == FailoverReason.ssl_cert_verification:
+                        agent._emit_status(
+                            f"❌ TLS certificate verification failed: "
                             f"{_nonretryable_summary}"
                         )
                     else:
@@ -3791,6 +3806,43 @@ def run_conversation(
                         )
                         agent._vprint(
                             f"{agent.log_prefix}        hermes fallback add   (interactive picker — same as `hermes model`)",
+                            force=True,
+                        )
+                    # TLS certificate failures are environment problems, not
+                    # provider/prompt problems — tell the user exactly which
+                    # knobs fix each common cause. Inspired by Claude Code
+                    # v2.1.199's immediate SSL fix hints.
+                    if classified.reason == FailoverReason.ssl_cert_verification:
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 The TLS certificate chain could not be verified. This fails the same",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      way on every retry — fix the environment, then try again:",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Corporate TLS-inspecting proxy? Point Python at its CA bundle:",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}        export SSL_CERT_FILE=/path/to/corp-ca.pem  (also REQUESTS_CA_BUNDLE)",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Missing/stale system CA store? Install/refresh it:",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}        pip install --upgrade certifi   (macOS: run 'Install Certificates.command')",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Self-signed local endpoint (llama.cpp, LM Studio, vLLM)? Use http://",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}        for localhost, or add the server's cert to your trust store.",
                             force=True,
                         )
                     logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")

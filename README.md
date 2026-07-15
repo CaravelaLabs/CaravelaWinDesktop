@@ -20,13 +20,13 @@ What this fork changes relative to upstream:
 
 - **Branding & theme** — Caravela visual identity (logo, wordmark, colors, backdrop) applied across the desktop app, installer, and updater.
 - **User-facing copy** — product name shown in the UI, dialogs, notifications, and update flow reads "Caravela".
-- **Release channel** — installers (`Caravela-<version>-win-x64.exe`) are built from tagged upstream releases and published on this repository's [Releases](../../releases) page; the app's self-update mechanism points here.
+- **Release channel** — installers (`caravela-<version>-win-x64.exe`, versioned by release date, e.g. `caravela-2026.7.15-win-x64.exe`) are built and published on this repository's [Releases](../../releases) page; the app's self-update mechanism points here.
 
 What this fork does **not** change: the agent's functionality. All core capabilities are upstream Hermes Agent — see the preserved original documentation in [`UPSTREAM_README.md`](UPSTREAM_README.md) and the upstream docs at [hermes-agent.nousresearch.com](https://hermes-agent.nousresearch.com/docs/).
 
 ## Download & install
 
-**[⬇ Download the latest Windows installer](https://github.com/CaravelaCompute/CaravelaWinDesktop/releases/latest)** — grab the `Caravela-<version>-win-x64.exe` asset and run it.
+**[⬇ Download the latest Windows installer](https://github.com/CaravelaCompute/CaravelaWinDesktop/releases/latest)** — grab the `caravela-<version>-win-x64.exe` asset and run it.
 
 Every release on the [Releases](../../releases) page ships the installer as an attached asset, so a working download is always available here. The app self-updates from this repository afterwards.
 

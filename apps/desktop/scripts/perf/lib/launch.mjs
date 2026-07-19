@@ -12,7 +12,7 @@
 // spent regardless of the isolated backend.
 
 import { spawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -69,6 +69,42 @@ function seedConfigFrom(sourceHome, targetHome) {
   }
 }
 
+// Resolve the vite CLI entry via its package.json `bin` (Vite 8's `exports`
+// blocks importing `vite/bin/vite.js` directly).
+function resolveViteBin() {
+  const pkgPath = require.resolve('vite/package.json')
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+  const rel = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.vite
+
+  if (!rel) {
+    throw new Error('could not resolve the vite CLI from vite/package.json')
+  }
+
+  return join(dirname(pkgPath), rel)
+}
+
+// Poll the perf driver's `connected()` until the gateway socket is open.
+// Returns false if the probe predates this helper or the timeout elapses.
+async function waitForConnected(cdp, timeoutMs) {
+  const hasProbe = await cdp.eval('typeof window.__PERF_DRIVE__.connected === "function"')
+
+  if (!hasProbe) {
+    return false
+  }
+
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    if (await cdp.eval('window.__PERF_DRIVE__.connected()')) {
+      return true
+    }
+
+    await sleep(500)
+  }
+
+  return false
+}
+
 function runNode(scriptRelPath, args = []) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(process.execPath, [join(DESKTOP_DIR, scriptRelPath), ...args], {
@@ -99,7 +135,9 @@ export async function startIsolatedInstance({
   hermesHome,
   userDataDir,
   seedConfig = true,
-  bootFakeStepMs = 120
+  bootFakeStepMs = 120,
+  settleMs = 2500,
+  connectTimeoutMs = 90000
 } = {}) {
   const children = []
   const tempDirs = []
@@ -141,7 +179,7 @@ export async function startIsolatedInstance({
   try {
     // 1. Renderer: reuse an already-running dev server, else start one.
     if (!(await reachable(devUrl))) {
-      const viteBin = require.resolve('vite/bin/vite.js')
+      const viteBin = resolveViteBin()
       const vite = spawn(process.execPath, [viteBin, '--host', '127.0.0.1', '--port', String(devPort)], {
         cwd: DESKTOP_DIR,
         stdio: ['ignore', 'inherit', 'inherit']
@@ -158,7 +196,21 @@ export async function startIsolatedInstance({
     const electronBin = require('electron')
     const electron = spawn(
       electronBin,
-      ['.', `--user-data-dir=${userData}`, `--remote-debugging-port=${port}`],
+      [
+        '.',
+        `--user-data-dir=${userData}`,
+        `--remote-debugging-port=${port}`,
+        // The perf window usually opens behind the user's other windows, and
+        // Chromium throttles frame production for backgrounded/occluded windows
+        // (~17fps), which shows up as choppy frames with ZERO longtasks and
+        // wrecks the stream frame-pacing metric. Disable every throttle path so
+        // measurements reflect real render cost regardless of window state
+        // (CalculateNativeWinOcclusion is the macOS/Windows occlusion detector).
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-features=CalculateNativeWinOcclusion'
+      ],
       {
         cwd: DESKTOP_DIR,
         stdio: ['ignore', 'inherit', 'inherit'],
@@ -194,7 +246,37 @@ export async function startIsolatedInstance({
       { timeoutMs: 120000, label: 'isolated renderer + __PERF_DRIVE__' }
     )
 
+    // Electron throttles rAF/timers for a window that isn't foregrounded
+    // (per-window backgroundThrottling, which the Chromium CLI flags above don't
+    // override). Focus emulation makes the renderer behave as if focused so
+    // frame-pacing measurements are real even though the perf window sits behind
+    // the user's other windows — WITHOUT actually stealing OS focus.
+    try {
+      // Behave as if focused so frame-pacing isn't throttled while the perf
+      // window sits behind the user's IDE/terminal — WITHOUT stealing OS focus.
+      await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true })
+    } catch {
+      // Older CDP / not supported — fall back to the anti-throttle flags above.
+    }
+
+    // Wait for the gateway socket to actually open. A booting/absent backend
+    // retries on a 1–15s backoff, and that churn contaminates frame-pacing
+    // (the `stream` scenario). Best-effort: proceed after the timeout so the
+    // backend-independent scenarios (keystroke, transcript) still run.
+    const connected = await waitForConnected(cdp, connectTimeoutMs)
+
+    if (!connected) {
+      console.warn(
+        `[perf] gateway did not connect within ${connectTimeoutMs}ms — ` +
+          'stream/frame numbers may be inflated by reconnect churn.'
+      )
+    }
+
+    // Let residual cold-start work (vite dep pre-bundling, initial paint) drain.
+    await sleep(settleMs)
+
     return {
+      connected,
       cdp,
       devUrl,
       port,

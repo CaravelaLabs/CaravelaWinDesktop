@@ -26,7 +26,7 @@ What this fork does **not** change: the agent's functionality. All core capabili
 
 ## Download & install
 
-**[⬇ Download the latest Windows installer](https://github.com/CaravelaCompute/CaravelaWinDesktop/releases/latest)** — grab the `caravela-<version>-win-x64.exe` asset and run it.
+**[⬇ Download the latest Windows installer](https://github.com/CaravelaLabs/CaravelaWinDesktop/releases/latest)** — grab the `caravela-<version>-win-x64.exe` asset and run it.
 
 Every release on the [Releases](../../releases) page ships the installer as an attached asset, so a working download is always available here. The app self-updates from this repository afterwards.
 

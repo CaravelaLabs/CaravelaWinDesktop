@@ -72,7 +72,7 @@ def _termux_api_app_installed() -> bool:
         result = subprocess.run(
             ["pm", "list", "packages", "com.termux.api"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=5,
             check=False,
             stdin=subprocess.DEVNULL,
@@ -389,7 +389,7 @@ class TermuxAudioRecorder:
             "-c", str(CHANNELS),
         ]
         try:
-            subprocess.run(command, capture_output=True, text=True, timeout=15, check=True, stdin=subprocess.DEVNULL)
+            subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15, check=True, stdin=subprocess.DEVNULL)
         except subprocess.CalledProcessError as e:
             details = (e.stderr or e.stdout or str(e)).strip()
             raise RuntimeError(f"Termux microphone start failed: {details}") from e
@@ -406,7 +406,7 @@ class TermuxAudioRecorder:
         mic_cmd = _termux_microphone_command()
         if not mic_cmd:
             return
-        subprocess.run([mic_cmd, "-q"], capture_output=True, text=True, timeout=15, check=False, stdin=subprocess.DEVNULL)
+        subprocess.run([mic_cmd, "-q"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15, check=False, stdin=subprocess.DEVNULL)
 
     def stop(self) -> Optional[str]:
         with self._lock:
@@ -870,6 +870,57 @@ def is_whisper_hallucination(transcript: str) -> bool:
     if _HALLUCINATION_REPEAT_RE.match(cleaned):
         return True
     return False
+
+
+# ============================================================================
+# Voice-chat stop phrases
+# ============================================================================
+
+DEFAULT_VOICE_STOP_PHRASES = ("stop",)
+
+
+def _load_voice_stop_phrases() -> tuple:
+    """Return the configured ``voice.stop_phrases`` list (default: ("stop",)).
+
+    Malformed config (scalar, dict, list of non-strings) falls back to the
+    default rather than crashing the voice loop.
+    """
+    try:
+        from hermes_cli.config import load_config
+        voice_cfg = load_config().get("voice", {})
+        if isinstance(voice_cfg, dict):
+            raw = voice_cfg.get("stop_phrases", DEFAULT_VOICE_STOP_PHRASES)
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, (list, tuple)):
+                phrases = tuple(
+                    str(p).strip().lower() for p in raw
+                    if isinstance(p, (str, int, float)) and str(p).strip()
+                )
+                return phrases  # empty tuple = feature disabled
+    except Exception:
+        pass
+    return DEFAULT_VOICE_STOP_PHRASES
+
+
+def is_voice_stop_phrase(transcript: str, stop_phrases: Optional[tuple] = None) -> bool:
+    """Return True when *transcript* is EXACTLY a configured stop phrase.
+
+    Ends the voice conversation when the user says "stop" (or another
+    configured phrase) and nothing else. Deliberately strict: the whole
+    utterance — after lowercasing and stripping surrounding punctuation —
+    must equal a phrase, so "stop doing that and try again" still reaches
+    the agent. Configure via ``voice.stop_phrases`` in config.yaml
+    (set ``[]`` to disable).
+    """
+    if not transcript:
+        return False
+    cleaned = transcript.strip().lower().strip(".,!?;: \t\n\"'")
+    if not cleaned:
+        return False
+    if stop_phrases is None:
+        stop_phrases = _load_voice_stop_phrases()
+    return cleaned in stop_phrases
 
 
 # ============================================================================

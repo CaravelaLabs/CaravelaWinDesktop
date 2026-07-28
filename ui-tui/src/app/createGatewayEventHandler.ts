@@ -22,7 +22,7 @@ import { topLevelSubagents } from '../lib/subagentTree.js'
 import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '../lib/terminalModes.js'
 import { formatAbandonedClarify, formatToolCall, stripAnsi } from '../lib/text.js'
 import { bootSeededPin, invalidateBootBackground, writeBootTheme } from '../lib/themeBoot.js'
-import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme } from '../theme.js'
+import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, themeToneHex } from '../theme.js'
 import type { Msg, SubagentProgress, SubagentStatus } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
@@ -126,11 +126,13 @@ const themesEqual = (a: Theme, b: Theme) => {
 // the theme's text color. Without the pair, a dark skin on a light terminal
 // leaves default-fg text at the HOST's near-black: invisible. Opt-in stays
 // intact: no `background` ⇒ both defaults restore to the terminal's own.
+// The text tone resolves through themeToneHex because a limited-palette
+// terminal quantizes it to `ansi256(N)`, which OSC-10 cannot speak.
 const paintTerminalDefaults = (theme: Theme) => {
   const background = lastSkin?.colors?.background ?? ''
 
   setTerminalBackground(background)
-  setTerminalForeground(isPaintableHex(background) ? theme.color.text : '')
+  setTerminalForeground(isPaintableHex(background) ? themeToneHex(theme.color.text) : '')
 }
 
 const applySkin = (s: GatewaySkin) => {
@@ -1003,6 +1005,25 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'moa.aggregating':
         // Spinner/status transition only — the aggregator's response follows
         // through the normal message stream. No committed transcript entry.
+        return
+
+      case 'moa.progress':
+        // Live fan-out progress — one activity line, replaced in place as each
+        // reference completes ("MoA: refs 2/3"), so the user sees movement
+        // during the (potentially long) reference phase without transcript spam.
+        if (typeof ev.payload?.refs_done === 'number' && typeof ev.payload?.refs_total === 'number') {
+          turnController.pushActivity(`MoA: refs ${ev.payload.refs_done}/${ev.payload.refs_total}`, 'info', 'MoA')
+        }
+
+        return
+
+      case 'moa.phase':
+        // Phase transition — currently only phase="aggregator" (fan-out done,
+        // aggregator acting). Swap the progress line for aggregator copy.
+        if (ev.payload?.phase === 'aggregator') {
+          turnController.pushActivity('MoA: aggregating…', 'info', 'MoA')
+        }
+
         return
 
       case 'tool.progress':

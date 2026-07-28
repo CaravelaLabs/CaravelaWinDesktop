@@ -132,6 +132,7 @@ export const en: Translations = {
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT needs ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'ElevenLabs rejected the API key (401).',
+      gatewayAuthFailed: 'Gateway authentication failed — check your API_SERVER_KEY.',
       methodNotAllowed:
         'The desktop backend rejected that request (405 Method Not Allowed). Try restarting Caravela Desktop.',
       microphonePermission: 'Microphone permission was denied.',
@@ -165,7 +166,7 @@ export const en: Translations = {
       inputTitle: 'Input needed',
       inputBody: 'Caravela is waiting for your response.',
       turnDoneTitle: 'Caravela finished',
-      turnDoneBody: 'The response is ready.',
+      turnDoneBody: '',
       turnErrorTitle: 'Turn failed',
       backgroundDoneTitle: 'Background task finished',
       backgroundFailedTitle: 'Background task failed',
@@ -193,7 +194,6 @@ export const en: Translations = {
     search: 'Search',
     searchTitle: 'Search sessions, views, and actions',
     swapSidebarSides: 'Swap sidebar sides',
-    swapSidebarSidesTitle: 'Swap the sessions and file browser sides',
     hideRightSidebar: 'Hide right sidebar',
     showRightSidebar: 'Show right sidebar',
     muteHaptics: 'Mute haptics',
@@ -256,6 +256,7 @@ export const en: Translations = {
       'view.toggleSidebar': 'Toggle sessions sidebar',
       'view.toggleRightSidebar': 'Toggle file browser',
       'view.toggleReview': 'Toggle review pane',
+      'view.toggleStatusbar': 'Toggle status bar',
       'view.showFiles': 'Show file browser',
       'view.showTerminal': 'Toggle terminal',
       'view.newTerminal': 'New terminal',
@@ -266,6 +267,9 @@ export const en: Translations = {
       'view.closeTab': 'Close tab',
       'view.reopenTab': 'Reopen closed tab',
       'view.flipPanes': 'Swap sidebar sides',
+      'view.findInPage': 'Find in page',
+      'view.findNext': 'Find next match',
+      'view.findPrevious': 'Find previous match',
       'appearance.toggleMode': 'Toggle light / dark',
       'profile.default': 'Switch to default profile',
       'profile.switch.1': 'Switch to profile 1',
@@ -301,6 +305,11 @@ export const en: Translations = {
       'composer.history': 'Cycle popover / history',
       'composer.cancel': 'Close popover · cancel run'
     }
+  },
+
+  findInPage: {
+    next: 'Next match',
+    previous: 'Previous match'
   },
 
   language: {
@@ -340,8 +349,7 @@ export const en: Translations = {
     },
     plugins: {
       title: 'Desktop plugins',
-      blurb:
-        'UI extensions loaded into this app — bundled with the build, or dropped into the desktop-plugins folder (including ones Hermes writes). Disabling unloads a plugin live and survives restarts.',
+      blurb: 'Bundled or dropped into the desktop-plugins folder. Disable to unload live.',
       count: n => `${n} installed`,
       openFolder: 'Open plugins folder',
       rescan: 'Rescan',
@@ -354,10 +362,9 @@ export const en: Translations = {
     },
     notifications: {
       title: 'Notifications',
-      intro:
-        'Native desktop notifications, separate from in-app toasts. These are device-local — each computer keeps its own settings.',
+      intro: 'OS notifications (not in-app toasts). Per device.',
       enableAll: 'Enable notifications',
-      enableAllDesc: 'Master switch. Turn this off to silence every notification below.',
+      enableAllDesc: 'Off silences every notification below.',
       focusedHint: 'Completion alerts only fire while Caravela is in the background.',
       kinds: {
         approval: {
@@ -374,7 +381,7 @@ export const en: Translations = {
         },
         turnError: {
           label: 'Turn failed',
-          description: 'A turn ended with an error.'
+          description: 'Background turn errors.'
         },
         backgroundDone: {
           label: 'Background task finished',
@@ -419,8 +426,7 @@ export const en: Translations = {
     },
     appearance: {
       title: 'Appearance',
-      intro:
-        'These are desktop-only display preferences. Mode controls brightness; theme controls the accent palette and chat surface styling.',
+      intro: 'Desktop-only. Mode is brightness; theme is palette and chat chrome.',
       colorMode: 'Color Mode',
       colorModeDesc: 'Pick a fixed mode or let Caravela follow your system setting.',
       toolViewTitle: 'Tool Call Display',
@@ -540,7 +546,22 @@ export const en: Translations = {
       imported: 'Config imported',
       invalidJson: 'Invalid config JSON',
       keepAwakeTitle: 'Keep computer awake',
-      keepAwakeDesc: 'Stop this machine from sleeping so long or overnight runs keep going. The display can still dim.'
+      keepAwakeDesc: 'Stop this machine from sleeping so long or overnight runs keep going. The display can still dim.',
+      attachmentSizeTitle: 'Max attachment size',
+      attachmentSizeDesc:
+        'How big a local file Desktop will load for attach and previews, in MB. Default is 16. This is only a limit on this computer. Setting it very high loads the whole file into memory and can freeze or crash the app.',
+      attachmentSizeUnit: 'MB',
+      attachmentSizeLabel: 'Max attachment size in megabytes'
+    },
+    quickEntry: {
+      enabledTitle: 'Quick Entry',
+      enabledDesc:
+        'Summon a small composer from anywhere with a global shortcut and fire a prompt without opening Caravela.',
+      shortcutTitle: 'Quick Entry shortcut',
+      shortcutDesc: 'Needs at least one modifier, e.g. CommandOrControl+Shift+Space.',
+      active: 'Shortcut is active.',
+      takenBy: 'Another app already uses this shortcut — pick a different one.',
+      invalidShortcut: 'Not a valid shortcut. Include at least one modifier key.'
     },
     credentials: {
       pasteKey: 'Paste key',
@@ -553,8 +574,7 @@ export const en: Translations = {
       saving: 'Saving'
     },
     envActions: {
-      actionsFor: label => `Actions for ${label}`,
-      credentialActions: 'Credential actions',
+      actions: 'Actions',
       manageInKeys: 'Manage in API Keys',
       docs: 'Docs',
       hideValue: 'Hide value',
@@ -570,18 +590,20 @@ export const en: Translations = {
       title: 'Gateway Connection',
       envOverride: 'env override',
       intro:
-        'Caravela Desktop starts its own local gateway by default. Use a remote gateway when you want this app to control an already-running Caravela backend on another machine or behind a trusted proxy. Pick a profile below to give it its own remote host.',
+        'Local by default. Use remote when this app should drive a Caravela backend elsewhere. Per-profile overrides below.',
       appliesTo: 'Applies to',
       allProfiles: 'All profiles',
       defaultConnection: 'Default connection for every profile that has no override of its own.',
       profileConnection: profile =>
-        `Connection used only when “${profile}” is the active profile. Set it to Local to inherit the default.`,
+        `Connection used only when “${profile}” is the active profile. Choose Use default gateway to remove its override.`,
       envOverrideTitle: 'Environment variables are controlling this desktop session.',
       envOverrideDesc:
         'Unset HERMES_DESKTOP_REMOTE_URL and HERMES_DESKTOP_REMOTE_TOKEN to use the saved setting below.',
       modeTitle: 'Connection mode',
       localTitle: 'Local gateway',
       localDesc: 'Start a private Caravela backend on localhost. This is the default and works offline.',
+      inheritTitle: 'Use default gateway',
+      inheritDesc: "Remove this profile's override and use the default connection.",
       remoteTitle: 'Remote gateway',
       remoteDesc: 'Connect this desktop shell to a remote Caravela backend.',
       remoteAuthHint: 'Hosted gateways use OAuth or a username and password; self-hosted ones may use a session token.',
@@ -663,7 +685,7 @@ export const en: Translations = {
       saveFailed: 'Could not save gateway settings',
       sshTitle: 'Connect via SSH',
       sshDesc:
-        'Hermes is launched on the remote over SSH and tunneled to this app — nothing to start or expose yourself. Requires working key-based SSH access to the host.',
+        'Caravela is launched on the remote over SSH and tunneled to this app — nothing to start or expose yourself. Requires working key-based SSH access to the host.',
       sshTrustHint: 'The first presented host key is trusted and pinned; later changes fail closed.',
       sshHostTitle: 'Host',
       sshHostDesc: 'user@host, or a Host alias from ~/.ssh/config.',
@@ -678,25 +700,25 @@ export const en: Translations = {
       sshPortDesc: 'Blank = 22 or the ~/.ssh/config port.',
       sshKeyTitle: 'Identity file',
       sshKeyDesc: 'Private key path. Blank = ssh-agent or ~/.ssh/config.',
-      sshHermesPathTitle: 'Hermes path (optional)',
+      sshHermesPathTitle: 'Caravela path (optional)',
       sshHermesPathDesc: 'Full path to the remote hermes binary. Blank = auto-detect.',
       sshHermesPathPlaceholder: 'auto-detect',
       sshTestConnection: 'Test SSH',
       sshConnect: 'Connect',
       sshButtonsHint: 'Save applies on the next launch. Connect reconnects now.',
-      sshReachable: (host, platform) => `Reachable: ${host} (${platform}) — Hermes found`,
+      sshReachable: (host, platform) => `Reachable: ${host} (${platform}) — Caravela found`,
       sshIncompleteHost: 'Enter an SSH host before connecting.',
       sshErrUnreachable: 'Could not reach that host over SSH. Check the host, port, and your network.',
       sshErrAuth:
-        'SSH authentication failed. Load your key into the ssh-agent (ssh-add) or set an IdentityFile in ~/.ssh/config — Hermes runs ssh non-interactively.',
+        'SSH authentication failed. Load your key into the ssh-agent (ssh-add) or set an IdentityFile in ~/.ssh/config — Caravela runs ssh non-interactively.',
       sshErrHostKey:
         'The host key has CHANGED since you last connected. Verify this is expected, then run ssh-keygen -R <host> and reconnect.',
       sshErrNotInstalled:
-        'Hermes is not installed on the remote host. Install it there (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh) or set the Hermes path.',
+        'Caravela is not installed on the remote host. Install it there (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh) or set the Caravela path.',
       sshErrPlatform:
-        'Unsupported remote platform. Hermes Desktop SSH mode supports Linux, macOS, and Windows remote hosts.',
+        'Unsupported remote platform. Caravela Desktop SSH mode supports Linux, macOS, and Windows remote hosts.',
       sshErrTimeout: 'SSH connection timed out. The host may be unreachable or asleep.',
-      sshErrUpdateRequired: 'Update Hermes on the remote host before connecting with Desktop SSH.',
+      sshErrUpdateRequired: 'Update Caravela on the remote host before connecting with Desktop SSH.',
       sshErrUnknown: 'SSH connection failed.'
     },
     keys: {
@@ -826,7 +848,7 @@ export const en: Translations = {
       noKeysMatch: 'No providers match your search.',
       localEndpoint: {
         title: 'Local / custom endpoint',
-        description: 'Point Hermes at any OpenAI-compatible endpoint (Zyphra, vLLM, llama.cpp, Ollama, etc).'
+        description: 'Point Caravela at any OpenAI-compatible endpoint (Zyphra, vLLM, llama.cpp, Ollama, etc).'
       },
       loading: 'Loading providers...'
     },
@@ -842,6 +864,12 @@ export const en: Translations = {
       messages: count => `${count} ${count === 1 ? 'message' : 'messages'}`,
       restored: 'Restored',
       deleteConfirm: title => `Permanently delete "${title}"? This cannot be undone.`,
+      autoArchiveTitle: 'Auto-archive stale chats',
+      autoArchiveDesc:
+        "Automatically archive chats you haven't touched in a while. Pinned chats are never archived, and nothing is deleted — archived chats just move here.",
+      autoArchiveDaysLabel: 'Archive after',
+      autoArchiveDaysUnit: 'days of inactivity',
+      autoArchiveFailed: 'Could not update auto-archive',
       defaultDirTitle: 'Default project directory',
       defaultDirDesc:
         'New sessions start in this folder unless you pick another. Leave it unset to use your home directory.',
@@ -1415,6 +1443,72 @@ export const en: Translations = {
     platformIntro: {}
   },
 
+  webhooks: {
+    search: 'Search webhooks...',
+    loading: 'Loading webhooks...',
+    loadFailed: 'Webhooks failed to load',
+    subscriptions: (count: number) => `Subscriptions (${count})`,
+    hint: 'Subscription changes hot-reload once the receiver is running. Disabled subscriptions reject incoming events.',
+    empty: 'No webhook subscriptions yet.',
+    disabledTitle: 'Webhook receiver disabled',
+    disabledBody:
+      'Webhooks are their own gateway platform. Enable them here to accept incoming HTTP events; chat channels are only needed when a subscription delivers to Telegram, Discord, Slack, or another channel.',
+    enable: 'Enable webhooks',
+    enabling: 'Enabling...',
+    enabled: (name: string) => `Enabled: "${name}"`,
+    disabled: (name: string) => `Disabled: "${name}"`,
+    enableRow: 'Enable',
+    disableRow: 'Disable',
+    delete: 'Delete',
+    deleting: 'Deleting...',
+    deleted: 'Webhook deleted',
+    deleteTitle: 'Delete webhook',
+    deleteDescPrefix: 'This will permanently remove ',
+    deleteDescSuffix: '. This cannot be undone.',
+    deleteFailed: (name: string) => `Failed to delete "${name}"`,
+    toggleFailed: (name: string) => `Failed to update "${name}"`,
+    newSubscription: 'New subscription',
+    restarting: 'Gateway restarting...',
+    restartNeeded: 'Webhooks are enabled, but the gateway still needs a restart before the receiver can come online.',
+    restartGateway: 'Restart gateway',
+    restartingGateway: 'Restarting...',
+    restartFailed: (detail: string) => `Gateway restart failed${detail}`,
+    enabledRestarting: 'Webhooks enabled; gateway restarting...',
+    all: '(all)',
+    deliverOnly: 'deliver only',
+    createdTitle: 'Subscription created',
+    createdSecretHint: 'Copy the secret now — it is only shown once.',
+    webhookUrl: 'Webhook URL',
+    secretOnce: 'Secret (shown once)',
+    done: 'Done',
+    fieldName: 'Name',
+    fieldNamePlaceholder: 'e.g. github-push',
+    fieldDescription: 'Description',
+    fieldDescriptionPlaceholder: 'What this webhook does (optional)',
+    fieldEvents: 'Events',
+    fieldEventsPlaceholder: 'comma-separated, leave empty for all',
+    fieldSkills: 'Skills',
+    fieldSkillsPlaceholder: 'comma-separated skill names (optional)',
+    fieldDeliver: 'Deliver to',
+    fieldDeliverOnly: 'Deliver payload only',
+    fieldPrompt: 'Prompt',
+    fieldPromptPlaceholder: 'Instructions for the agent when this webhook fires (optional)',
+    nameRequired: 'Name required',
+    create: 'Create',
+    creating: 'Creating...',
+    created: 'Created',
+    createFailed: (detail: string) => `Failed to create: ${detail}`,
+    copy: 'Copy',
+    deliverOptions: {
+      log: 'Log',
+      telegram: 'Telegram',
+      discord: 'Discord',
+      slack: 'Slack',
+      email: 'Email',
+      github_comment: 'GitHub comment'
+    }
+  },
+
   profiles: {
     close: 'Close profiles',
     nameHint: 'Lowercase letters, digits, hyphens, and underscores. Must start with a letter or digit.',
@@ -1427,9 +1521,9 @@ export const en: Translations = {
     showAllProfiles: 'Show all profiles',
     switchToProfile: name => `Switch to ${name}`,
     manageProfiles: 'Manage profiles…',
-    actionsFor: name => `Actions for ${name}`,
+    actions: 'Actions',
     color: 'Color…',
-    colorFor: name => `Color for ${name}`,
+    colorFor: 'Color',
     setColor: color => `Set color ${color}`,
     autoColor: 'Auto',
     noProfiles: 'No profiles yet.',
@@ -1563,7 +1657,6 @@ export const en: Translations = {
     showRuns: 'Show runs',
     hideRuns: 'Hide runs',
     runHistory: 'Run history',
-    actionsFor: title => `Actions for ${title}`,
     actionsTitle: 'Cron job actions',
     resume: 'Resume cron',
     pause: 'Pause cron',
@@ -1596,6 +1689,7 @@ export const en: Translations = {
     promptPlaceholder: 'Summarize my unread Slack threads and email me the top 5...',
     frequencyLabel: 'Frequency',
     deliverLabel: 'Deliver to',
+    deliverNeedsHomeChannel: 'set a home channel first',
     modelLabel: 'Model',
     modelDefault: 'Default (global model)',
     customScheduleLabel: 'Custom schedule',
@@ -1607,7 +1701,25 @@ export const en: Translations = {
     scheduleRequired: 'Schedule is required.',
     scriptOnlyEditHint: 'Script-only job (no AI prompt). Job id:',
     saveChanges: 'Save changes',
-    createAction: 'Create cron'
+    createAction: 'Create cron',
+    tabs: {
+      jobs: 'Jobs',
+      blueprints: 'Blueprints'
+    },
+    blueprints: {
+      tab: 'Blueprints',
+      startFrom: 'Start from',
+      custom: 'Custom',
+      subtitle: 'Ready-made automations',
+      dialogDesc: 'Fill in the details and schedule it.',
+      scheduleIt: 'Schedule it',
+      scheduling: 'Scheduling...',
+      scheduled: 'Blueprint scheduled',
+      loading: 'Loading blueprints...',
+      failedLoad: 'Failed to load blueprints',
+      emptyTitle: 'No blueprints available',
+      emptyDesc: 'No automation blueprints are available on this backend.'
+    }
   },
 
   artifacts: {
@@ -1645,6 +1757,26 @@ export const en: Translations = {
     copyPath: 'Copy path'
   },
 
+  artifactCard: {
+    kind: { code: 'Code', html: 'Interactive page', svg: 'Graphic' },
+    generating: lines => `Generating… ${lines} lines`,
+    versionBadge: count => `${count} versions`,
+    open: 'Open'
+  },
+
+  artifactPreview: {
+    versionOf: (current, total) => `v${current} of ${total}`,
+    olderVersion: 'Older version',
+    newerVersion: 'Newer version',
+    latest: 'Latest',
+    copyContent: 'Copy content',
+    download: 'Download',
+    openInBrowser: 'Open in browser',
+    openInBrowserFailed: 'Could not open in browser',
+    missingTitle: 'Artifact unavailable',
+    missingBody: 'This artifact is no longer in the local registry.'
+  },
+
   sidebar: {
     nav: {
       'new-session': 'New session',
@@ -1669,11 +1801,11 @@ export const en: Translations = {
     allPinned: 'Everything here is pinned. Unpin a chat to show it in recents.',
     shiftClickHint: 'Shift-click a chat to pin',
     noWorkspace: 'No workspace',
-    noProject: 'No project',
     projectEmpty: 'No sessions yet',
     noSessions: 'No sessions yet',
     projects: {
       sectionLabel: 'Projects',
+      home: 'Home',
       newButton: 'New project',
       createTitle: 'New project',
       createDesc: 'Name a workspace and add one or more folders.',
@@ -1691,7 +1823,7 @@ export const en: Translations = {
       primaryBadge: 'primary',
       removeFolder: 'Remove',
       create: 'Create',
-      menu: 'Project actions',
+      menu: 'Actions',
       menuRename: 'Rename',
       menuAppearance: 'Appearance',
       noColor: 'No color',
@@ -1753,7 +1885,6 @@ export const en: Translations = {
       openInNewTab: 'Open in new tab',
       openInSplit: 'Open in split',
       copyIdFailed: 'Could not copy session ID',
-      actionsFor: title => `Actions for ${title}`,
       sessionActions: 'Session actions',
       sessionRunning: 'Session running',
       needsInput: 'Needs your input',
@@ -1765,13 +1896,20 @@ export const en: Translations = {
       renamed: 'Renamed',
       renameFailed: 'Rename failed',
       renameTitle: 'Rename session',
-      renameDesc: 'Give this chat a memorable title. Leave empty to clear.',
+      renameDesc: 'Leave empty to clear.',
       untitledPlaceholder: 'Untitled session',
       untitledChat: id => `Chat ${id}`,
       ageNow: 'now',
       ageDay: 'd',
       ageHour: 'h',
       ageMin: 'm'
+    },
+    dateDivider: {
+      today: 'Earlier today',
+      yesterday: 'Yesterday',
+      thisWeek: 'Earlier this week',
+      lastWeek: 'Last week',
+      thisMonth: 'Earlier this month'
     }
   },
 
@@ -1912,6 +2050,10 @@ export const en: Translations = {
   statusStack: {
     agents: 'Agents',
     background: count => `${count} Background`,
+    goalActive: 'Goal active',
+    goalDone: 'Goal done',
+    goalPaused: 'Goal paused',
+    goalWaiting: 'Goal waiting',
     subagents: count => `${count} Subagent${count === 1 ? '' : 's'}`,
     todos: (done, total) => `Tasks ${done}/${total}`,
     running: 'Running',
@@ -2040,6 +2182,40 @@ export const en: Translations = {
     viewDocs: 'View install docs',
     installTo: 'Will install to',
     retryAfterRun: 'I’ve run it -- retry',
+    setupChoiceTitle: 'Set up Caravela Desktop',
+    setupChoiceDesc:
+      'Connect this app to a Caravela gateway you already run, or install Caravela locally on this computer.',
+    connectExistingTitle: 'Connect to existing Caravela',
+    connectExistingShort: 'Connect existing',
+    connectExistingDesc: 'Use a remote backend with a session token or browser sign-in. No local install will start.',
+    installLocalTitle: 'Install Caravela locally',
+    installLocalDesc: 'Download Caravela, create its Python environment, and run the backend on this computer.',
+    localStartUnavailable: 'Local installation could not start. Restart Caravela Desktop and try again.',
+    remoteSetupTitle: 'Connect to existing Caravela',
+    remoteSetupDesc: 'Enter your gateway URL. Caravela Desktop will detect whether it needs a token or browser sign-in.',
+    remoteUrlTitle: 'Gateway URL',
+    remoteUrlDesc: 'Use the base URL of the Caravela gateway, including https:// when remote.',
+    remoteUrlPlaceholder: 'https://gateway.example.com/hermes',
+    probing: 'Detecting gateway authentication...',
+    probeError: 'Could not reach that Caravela gateway.',
+    identityProvider: 'your identity provider',
+    authTitle: 'Authentication',
+    authNeedsOauth: provider => `Sign in with ${provider} before testing this gateway.`,
+    authSignedIn: 'Browser sign-in completed.',
+    connected: 'Connected',
+    signIn: 'Sign in',
+    signInWith: provider => `Sign in with ${provider}`,
+    enterUrlFirst: 'Enter a gateway URL first.',
+    signInIncomplete: 'The sign-in window closed before authentication completed.',
+    tokenTitle: 'Session token',
+    tokenDesc: 'Paste the session token from the remote gateway .env file.',
+    pasteSessionToken: 'Paste session token',
+    incompleteSignInTest: 'Sign in before testing this OAuth-gated gateway.',
+    incompleteTokenTest: 'Enter a session token before testing this gateway.',
+    testConnection: 'Test connection',
+    testSucceeded: (baseUrl, version) => `Connected to ${baseUrl}${version ? ` (${version})` : ''}.`,
+    applyRemote: 'Apply and reconnect',
+    backToSetup: 'Back',
     failedTitle: 'Installation failed',
     settingUpTitle: 'Setting up Caravela Agent',
     finishingTitle: 'Finishing up',
@@ -2173,8 +2349,7 @@ export const en: Translations = {
       noModels: 'No models found',
       editModels: 'Edit Models…',
       refreshModels: 'Refresh Models',
-      fast: 'Fast',
-      medium: 'Med'
+      fast: 'Fast'
     },
     modelOptions: {
       noOptions: 'No options for this model',
@@ -2229,9 +2404,9 @@ export const en: Translations = {
       connectionSsh: host => `SSH: ${host}`,
       connectionRemote: host => `Remote: ${host}`,
       connectionCloud: host => `Cloud: ${host}`,
-      connectionCloudTooltip: host => `Connected to Hermes Cloud at ${host} · click to manage`,
-      connectionSshTooltip: host => `Connected over SSH to ${host} · click to manage`,
-      connectionRemoteTooltip: host => `Connected to remote backend ${host} · click to manage`,
+      connectionCloudTooltip: host => `Hermes Cloud · ${host}`,
+      connectionSshTooltip: host => `SSH · ${host}`,
+      connectionRemoteTooltip: host => `Remote · ${host}`,
       backendLabel: version => `backend v${version}`,
       commit: sha => `commit ${sha}`,
       branch: branch => `branch ${branch}`,
@@ -2246,7 +2421,18 @@ export const en: Translations = {
       gatewayConnecting: 'connecting',
       gatewayOffline: 'offline',
       gatewayRestarting: 'restarting…',
-      gatewayTitle: 'Caravela inference gateway status',
+      gatewayTitle: 'Gateway',
+      customizeTitle: 'Show in status bar',
+      hideStatusbar: 'Hide status bar',
+      toggleApprovalMode: 'Approvals',
+      toggleBackendVersion: 'Backend version',
+      toggleCommandCenter: 'Command Center',
+      toggleContextUsage: 'Context meter',
+      toggleRunningTimer: 'Turn timer',
+      toggleSessionTimer: 'Session timer',
+      toggleTerminal: 'Terminal',
+      toggleVersion: 'Version & updates',
+      toggleWorkspace: 'Workspace',
       agents: 'Agents',
       closeAgents: 'Close agents',
       openAgents: 'Open agents',
@@ -2255,10 +2441,11 @@ export const en: Translations = {
       running: count => `${count} running`,
       cron: 'Cron',
       openCron: 'Open cron jobs',
+      webhooks: 'Webhooks',
+      openWebhooks: 'Open webhooks',
       starmap: 'Memory Graph',
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
-      currentTurnElapsed: 'Current turn elapsed',
       contextUsage: 'Context usage',
       contextUsagePanel: {
         categories: {
@@ -2277,11 +2464,9 @@ export const en: Translations = {
         title: 'Context Usage',
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
-      openContextUsage: 'Open context usage breakdown',
       session: 'Session',
-      runtimeSessionElapsed: 'Runtime session elapsed',
-      yoloOn: 'YOLO on — auto-approving dangerous commands. Click to turn off. Shift+click toggles it globally.',
-      yoloOff: 'YOLO off — click to auto-approve dangerous commands. Shift+click toggles it globally.',
+      yoloOn: 'YOLO on — auto-approving dangerous commands. Shift+click toggles globally.',
+      yoloOff: 'YOLO off. Shift+click toggles globally.',
       modelNone: 'none',
       noModel: 'no model',
       switchModel: 'Switch model',
@@ -2302,7 +2487,7 @@ export const en: Translations = {
     remotePickerTitle: 'Choose remote folder',
     remotePickerDescription: 'Browse folders on the connected backend.',
     remotePickerSelect: 'Select folder',
-    folderTip: cwd => `${cwd} — click to change folder`,
+    folderTip: cwd => cwd,
     openFolder: 'Open folder',
     refreshTree: 'Refresh tree',
     collapseAll: 'Collapse all folders',
@@ -2480,6 +2665,9 @@ export const en: Translations = {
           ? 'Will resume when the background task finishes'
           : `Will resume when ${count} background tasks finish`,
       thinking: 'Thinking',
+      thought: 'Thought',
+      thoughtBriefly: 'Thought briefly',
+      thoughtFor: duration => `Thought for ${duration}`,
       today: time => `Today, ${time}`,
       yesterday: time => `Yesterday, ${time}`,
       copy: 'Copy',
@@ -2537,7 +2725,6 @@ export const en: Translations = {
       lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.'
     },
     tool: {
-      code: 'Code',
       copyCode: 'Copy code',
       renderingImage: 'Rendering image',
       copyOutput: 'Copy output',
@@ -2605,6 +2792,7 @@ export const en: Translations = {
         execute_code: { done: 'Ran code', pending: 'Scripting', pendingAction: 'Scripting' },
         image_generate: { done: 'Generated image', pending: 'Generating image', pendingAction: 'Generating' },
         list_files: { done: 'Listed files', pending: 'Listing files', pendingAction: 'Listing' },
+        memory: { done: 'Saved to memory', pending: 'Saving to memory', pendingAction: 'Saving' },
         patch: { done: 'Patched file', pending: 'Patching file', pendingAction: 'Patching' },
         read_file: { done: 'Read file', pending: 'Reading file', pendingAction: 'Reading' },
         search_files: { done: 'Searched files', pending: 'Searching files', pendingAction: 'Searching' },

@@ -1247,6 +1247,28 @@ def setup_terminal_backend(config: dict):
         config["terminal"].setdefault(
             "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
         )
+        print()
+        print_info("Docker sandboxes can be protected with the egress credential firewall.")
+        print_info(
+            "It routes sandbox traffic through iron-proxy so containers receive "
+            "proxy tokens instead of real API keys."
+        )
+        print_info(
+            "   Docker only for now; Modal, SSH, Daytona, and Singularity are not wired yet."
+        )
+        if prompt_yes_no("  Enable egress firewall for Docker sandboxes?", False):
+            proxy_cfg = config.setdefault("proxy", {})
+            proxy_cfg["enabled"] = True
+            proxy_cfg.setdefault("enforce_on_docker", True)
+            print_success("Egress firewall enabled in config")
+            print_info(
+                "Run `hermes egress setup` then `hermes egress start` to mint "
+                "tokens and launch the proxy."
+            )
+        else:
+            print_info(
+                "Skipping egress firewall. You can enable it later with `hermes egress setup`."
+            )
 
     elif selected_backend == "singularity":
         print_success("Terminal backend: Singularity/Apptainer")
@@ -1428,7 +1450,7 @@ def setup_terminal_backend(config: dict):
                 ssh_cmd.extend(["-p", port])
             ssh_cmd.append(f"{user}@{host}" if user else host)
             ssh_cmd.append("echo ok")
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
             if result.returncode == 0:
                 print_success("  SSH connection successful!")
             else:
@@ -2200,6 +2222,37 @@ def setup_tools(config: dict, first_install: bool = False):
 
 
 # =============================================================================
+# Shared Metrics
+# =============================================================================
+
+
+def setup_telemetry(config: dict):
+    """Configure the local, privacy-safe shared-metrics subscriber."""
+    print_header("Shared Metrics")
+    print_info("Shared metrics contain only bounded counters and histograms.")
+    print_info("Packages stay under this Hermes profile and are not uploaded.")
+
+    telemetry = config.get("telemetry")
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+        config["telemetry"] = telemetry
+    shared_metrics = telemetry.get("shared_metrics")
+    if not isinstance(shared_metrics, dict):
+        shared_metrics = {}
+        telemetry["shared_metrics"] = shared_metrics
+
+    current = shared_metrics.get("enabled") is True
+    shared_metrics["enabled"] = prompt_yes_no(
+        "Enable local shared metrics?",
+        default=current,
+    )
+    if shared_metrics["enabled"]:
+        print_success("Local shared metrics enabled.")
+    else:
+        print_info("Local shared metrics disabled.")
+
+
+# =============================================================================
 # Post-Migration Section Skip Logic
 # =============================================================================
 
@@ -2607,6 +2660,7 @@ SETUP_SECTIONS = [
     ("terminal", "Terminal Backend", setup_terminal_backend),
     ("gateway", "Messaging Platforms (Gateway)", setup_gateway),
     ("tools", "Tools", setup_tools),
+    ("telemetry", "Shared Metrics", setup_telemetry),
     ("agent", "Agent Settings", setup_agent_settings),
 ]
 
@@ -2705,6 +2759,7 @@ def run_setup_wizard(args):
       hermes setup terminal  — just terminal backend
       hermes setup gateway   — just messaging platforms
       hermes setup tools     — just tool configuration
+      hermes setup telemetry — just local shared metrics
       hermes setup agent     — just agent settings
     """
     from hermes_cli.config import is_managed, managed_error

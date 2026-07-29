@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -31,11 +34,44 @@ logger = logging.getLogger(__name__)
 def _get_flush_dir():
     """Return the pending-messages flush directory under the active HERMES_HOME."""
     from hermes_constants import get_hermes_home
-    from pathlib import Path
 
     flush_dir = get_hermes_home() / "pending_messages"
-    flush_dir.mkdir(parents=True, exist_ok=True)
+    flush_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        os.chmod(flush_dir, 0o700)
     return flush_dir
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry on platforms that support directory fsync."""
+    if os.name != "posix":
+        return
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> None:
+    """Atomically write one private, uniquely named recovery payload."""
+    from utils import atomic_json_write
+
+    file_id = uuid.uuid4().hex
+    final_path = flush_dir / f"pending-{file_id}.json"
+    atomic_json_write(
+        final_path,
+        payload,
+        mode=0o600,
+        default=str,
+    )
+
+    try:
+        _fsync_directory(flush_dir)
+    except OSError as exc:
+        # The atomically published file is still the only recovery copy.
+        # Keep it even if this filesystem cannot persist directory entries.
+        logger.debug("Failed to fsync pending-message directory: %s", exc)
 
 
 def flush_pending_to_file(
@@ -72,16 +108,14 @@ def flush_pending_to_file(
             serialised = _serialise_value(value)
             if serialised is None:
                 continue
-            safe_key = session_key.replace("/", "_").replace("\\", "_")
-            path = flush_dir / f"{safe_key}_{ts}.json"
-            path.write_text(
-                json.dumps({
+            _write_payload(
+                flush_dir,
+                {
                     "session_key": session_key,
                     "reason": reason,
                     "ts": ts,
                     "data": serialised,
-                }, ensure_ascii=False, default=str),
-                encoding="utf-8",
+                },
             )
             flushed += 1
         except Exception as exc:
@@ -148,8 +182,6 @@ def recover_pending_to_db(
     int
         Number of messages recovered.
     """
-    from pathlib import Path
-
     flush_dir = _get_flush_dir()
     flush_files = sorted(flush_dir.glob("*.json"))
     if not flush_files:
@@ -170,7 +202,11 @@ def recover_pending_to_db(
             data = payload.get("data", {})
             text = data.get("text", "")
             if not text or not session_key:
-                path.unlink(missing_ok=True)
+                logger.warning(
+                    "Cannot recover structurally invalid pending message from %s; "
+                    "the flush file has been preserved",
+                    path,
+                )
                 continue
 
             # The session_key is a gateway routing key (e.g.

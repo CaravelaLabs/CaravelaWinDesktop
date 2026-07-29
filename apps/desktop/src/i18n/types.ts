@@ -445,6 +445,9 @@ export interface Translations {
       builtinOnly: string
       notSet: string
       commaSeparated: string
+      searchPlaceholder: string
+      noResults: string
+      systemDefault: string
       loading: string
       emptyTitle: string
       emptyDesc: string
@@ -783,6 +786,9 @@ export interface Translations {
       ready: string
       needsSignIn: string
       needsSetup: string
+      activeBackend: string
+      activeBackendHint: string
+      useBackend: string
       nousIncluded: string
       nousAuthNeededTitle: string
       nousAuthNeededMessage: (provider: string) => string
@@ -1644,6 +1650,9 @@ export interface Translations {
     voiceDictation: string
     speakReplies: string
     stopSpeakingReplies: string
+    wakeWordListening: (phrase: string) => string
+    wakeWordOff: (phrase: string) => string
+    wakeWordPausedVoice: (phrase: string) => string
     lookupLoading: string
     lookupNoMatches: string
     lookupTry: string

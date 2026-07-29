@@ -39,13 +39,27 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
-from utils import atomic_replace
+from utils import atomic_replace, atomic_write_text
 
-try:
-    from croniter import croniter
-    HAS_CRONITER = True
-except ImportError:
-    HAS_CRONITER = False
+# ``croniter`` compiles ~15 ms of regexes at import and only matters for
+# 5-field cron expressions. Resolve lazily; ``HAS_CRONITER`` stays a module
+# attribute (tests monkeypatch it, and a monkeypatched value wins because
+# ``_ensure_croniter`` only probes while it's still None).
+croniter = None
+HAS_CRONITER: Optional[bool] = None
+
+
+def _ensure_croniter() -> bool:
+    """Import croniter on first use; honor a pre-set HAS_CRONITER override."""
+    global croniter, HAS_CRONITER
+    if HAS_CRONITER is None:
+        try:
+            from croniter import croniter as _croniter
+            croniter = _croniter
+            HAS_CRONITER = True
+        except ImportError:
+            HAS_CRONITER = False
+    return bool(HAS_CRONITER)
 
 # =============================================================================
 # Configuration
@@ -585,7 +599,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     if len(parts) >= 5 and all(
         re.match(r'^[\d\*\-,/]+$', p) for p in parts[:5]
     ):
-        if not HAS_CRONITER:
+        if not _ensure_croniter():
             raise ValueError("Cron expressions require 'croniter' package. Install with: pip install croniter")
         # Validate cron expression
         try:
@@ -738,7 +752,7 @@ def _compute_grace_seconds(schedule: dict) -> int:
         grace = period_seconds // 2
         return max(MIN_GRACE, min(grace, MAX_GRACE))
 
-    if kind == "cron" and HAS_CRONITER:
+    if kind == "cron" and _ensure_croniter():
         expr = schedule.get("expr")
         if expr:
             try:
@@ -791,7 +805,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         expr = schedule.get("expr")
         if not expr:
             return None
-        if not HAS_CRONITER:
+        if not _ensure_croniter():
             logger.warning(
                 "Cannot compute next run for cron schedule %r: 'croniter' is "
                 "not installed. croniter is a core dependency as of v0.9.x; "
@@ -824,24 +838,13 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 def _atomic_write_epoch(path: Path) -> None:
     """Atomically write the current epoch time to ``path``.
 
-    Uses the same tmpfile + ``atomic_replace`` pattern as ``save_jobs`` so a
-    concurrent reader in another process (``hermes cron status``) never sees a
-    torn/truncated file. Best-effort: failures are swallowed by callers.
+    Delegates to :func:`utils.atomic_write_text` (tmpfile + fsync +
+    ``atomic_replace``, same pattern as ``save_jobs``) so a concurrent reader
+    in another process (``hermes cron status``) never sees a torn/truncated
+    file. Best-effort: failures are swallowed by callers.
     """
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=".hb_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(str(time.time()))
-            f.flush()
-            os.fsync(f.fileno())
-        atomic_replace(tmp_path, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, str(time.time()), tmp_prefix=".hb_")
 
 
 def _atomic_write_counter(path: Path, value: int) -> None:
@@ -1145,14 +1148,12 @@ def _resolve_default_model_snapshot() -> Optional[str]:
     or resolution fails (fail-open — caller treats ``None`` as "no snapshot").
     """
     try:
-        import yaml
-        from hermes_cli.config import _expand_env_vars
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
 
         cfg_path = get_hermes_home() / "config.yaml"
         if not cfg_path.exists():
             return None
-        with cfg_path.open(encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = read_user_config_raw(cfg_path)
         try:
             from hermes_cli import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)

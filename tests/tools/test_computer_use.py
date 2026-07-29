@@ -394,9 +394,35 @@ class TestSafetyGuards:
         assert "error" in parsed
         assert "blocked key combo" in parsed["error"]
 
+    @pytest.mark.parametrize("keys", [
+        "ctrl-alt-delete",          # hyphen notation (alt -> option)
+        "alt-f4",                   # force-quit window
+        "cmd-shift-q",              # log out, hyphenated
+        "cmd+shift-backspace",      # mixed + and - separators
+    ])
+    def test_blocked_key_combos_hyphen_notation(self, keys, noop_backend):
+        # The cua-driver backend splits key strings on both '+' and '-'
+        # (cua_backend._parse_key_combo), so "ctrl-alt-delete" executes as the
+        # real destructive combo. The block must canonicalize the same way or
+        # it is trivially bypassed with hyphen notation.
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "key", "keys": keys})
+        parsed = json.loads(out)
+        assert "error" in parsed
+        assert "blocked key combo" in parsed["error"]
+
     def test_safe_key_combos_pass(self, noop_backend):
         from tools.computer_use.tool import handle_computer_use
         out = handle_computer_use({"action": "key", "keys": "cmd+s"})
+        parsed = json.loads(out)
+        assert "error" not in parsed
+
+    @pytest.mark.parametrize("keys", ["cmd-c", "ctrl-c", "cmd+-"])
+    def test_safe_hyphen_key_combos_pass(self, keys, noop_backend):
+        # Non-destructive combos written with hyphens (and the literal '-'
+        # zoom key) must not be caught by the widened separator.
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "key", "keys": keys})
         parsed = json.loads(out)
         assert "error" not in parsed
 
@@ -1530,6 +1556,195 @@ def _make_cua_backend_with_windows_and_apps(
 
     backend._session.call_tool.side_effect = _call_tool
     return backend
+
+
+def _make_cua_backend_with_tool_result(result: Dict[str, Any]):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    backend = CuaDriverBackend()
+    backend._session = MagicMock()
+    backend._session.call_tool.return_value = result
+    return backend
+
+
+class TestCuaDriverWindowResultShapes:
+    def test_extracts_windows_from_structured_content(self):
+        from tools.computer_use.cua_backend import _windows_from_tool_result
+
+        windows = [{"app_name": "Terminal", "pid": 1, "window_id": 2}]
+
+        assert _windows_from_tool_result({
+            "structuredContent": {"windows": windows},
+            "data": {},
+        }) == windows
+
+    def test_extracts_windows_from_data_windows(self):
+        from tools.computer_use.cua_backend import _windows_from_tool_result
+
+        windows = [{"app_name": "Terminal", "pid": 1, "window_id": 2}]
+
+        assert _windows_from_tool_result({
+            "structuredContent": None,
+            "data": {"windows": windows},
+        }) == windows
+
+    def test_extracts_windows_from_legacy_data_windows(self):
+        from tools.computer_use.cua_backend import _windows_from_tool_result
+
+        windows = [{"app_name": "Terminal", "pid": 1, "window_id": 2}]
+
+        assert _windows_from_tool_result({
+            "structuredContent": None,
+            "data": {"_legacy_windows": windows},
+        }) == windows
+
+    def test_empty_structured_windows_falls_through_to_data_windows(self):
+        from tools.computer_use.cua_backend import _windows_from_tool_result
+
+        windows = [{"app_name": "Terminal", "pid": 1, "window_id": 2}]
+
+        assert _windows_from_tool_result({
+            "structuredContent": {"windows": []},
+            "data": {"windows": windows},
+        }) == windows
+
+    def test_extracts_windows_from_top_level_windows(self):
+        from tools.computer_use.cua_backend import _windows_from_tool_result
+
+        windows = [{"app_name": "Terminal", "pid": 1, "window_id": 2}]
+
+        assert _windows_from_tool_result({"windows": windows}) == windows
+
+    def test_extracts_windows_from_top_level_legacy_windows(self):
+        from tools.computer_use.cua_backend import _windows_from_tool_result
+
+        windows = [{"app_name": "Terminal", "pid": 1, "window_id": 2}]
+
+        assert _windows_from_tool_result({"_legacy_windows": windows}) == windows
+
+    def test_extract_windows_missing_fields_returns_empty(self):
+        from tools.computer_use.cua_backend import _windows_from_tool_result
+
+        assert _windows_from_tool_result({
+            "structuredContent": None,
+            "data": {},
+        }) == []
+
+    def test_ingest_windows_skips_malformed_members(self):
+        from tools.computer_use.cua_backend import _ingest_windows
+
+        valid = {"app_name": "Terminal", "pid": 100, "window_id": 7}
+
+        assert _ingest_windows([None, "bad", [], valid]) == [  # type: ignore[list-item]
+            {"app_name": "Terminal", "pid": 100, "window_id": 7,
+             "off_screen": False, "title": "", "z_index": 0},
+        ]
+
+    def test_ingest_windows_normalizes_untrusted_display_fields(self):
+        from tools.computer_use.cua_backend import _ingest_windows
+
+        assert _ingest_windows([{
+            "app_name": None, "pid": "100", "window_id": "7",
+            "title": ["bad"], "z_index": "bad",
+        }]) == [{
+            "app_name": "", "pid": 100, "window_id": 7,
+            "off_screen": False, "title": "", "z_index": 0,
+        }]
+
+    def test_capture_uses_data_windows_shape(self):
+        windows = [
+            {"app_name": "Terminal", "pid": 100, "window_id": 7,
+             "is_on_screen": True, "title": "shell", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_tool_result({
+            "data": {"windows": windows},
+            "images": [],
+            "isError": False,
+            "structuredContent": None,
+        })
+        backend._session.call_tool.side_effect = [
+            {"data": {"windows": windows}, "images": [], "isError": False,
+             "structuredContent": None},
+            {"data": "ok", "images": [], "isError": False, "structuredContent": None},
+        ]
+
+        cap = backend.capture(mode="ax", app="Terminal")
+
+        assert cap.app == "Terminal"
+        assert backend._active_pid == 100
+        assert backend._active_window_id == 7
+
+    def test_focus_app_uses_legacy_data_windows_shape(self):
+        windows = [
+            {"app_name": "Terminal", "pid": 100, "window_id": 7,
+             "is_on_screen": True, "title": "shell", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_tool_result({
+            "data": {"_legacy_windows": windows},
+            "images": [],
+            "isError": False,
+            "structuredContent": None,
+        })
+
+        res = backend.focus_app("Terminal")
+
+        assert res.ok is True
+        assert backend._active_pid == 100
+        assert backend._active_window_id == 7
+
+    def test_list_apps_accepts_top_level_windows_without_data(self):
+        windows = [
+            {"app_name": "Terminal", "pid": 100, "window_id": 7},
+            {"app_name": "Notes", "pid": 200, "window_id": 9},
+        ]
+        backend = _make_cua_backend_with_tool_result({
+            "windows": windows,
+            "images": [],
+            "isError": False,
+        })
+
+        assert backend.list_apps() == [
+            {"name": "Terminal", "pid": 100},
+            {"name": "Notes", "pid": 200},
+        ]
+
+    def test_list_apps_accepts_top_level_legacy_windows_without_data(self):
+        windows = [{"app_name": "Terminal", "pid": 100, "window_id": 7}]
+        backend = _make_cua_backend_with_tool_result({
+            "_legacy_windows": windows,
+            "images": [],
+            "isError": False,
+        })
+
+        assert backend.list_apps() == [{"name": "Terminal", "pid": 100}]
+
+    def test_list_apps_prefers_structured_apps_over_data_apps(self):
+        backend = _make_cua_backend_with_tool_result({
+            "structuredContent": {"apps": [{"name": "Canonical", "pid": 1}]},
+            "data": {"apps": [{"name": "Stale", "pid": 2}]},
+            "images": [],
+            "isError": False,
+        })
+
+        assert backend.list_apps() == [{"name": "Canonical", "pid": 1}]
+
+    def test_list_apps_derives_apps_from_data_windows_shape(self):
+        windows = [
+            {"app_name": "Terminal", "pid": 100, "window_id": 7},
+            {"app_name": "Terminal", "pid": 100, "window_id": 8},
+            {"app_name": "Notes", "pid": 200, "window_id": 9},
+        ]
+        backend = _make_cua_backend_with_tool_result({
+            "data": {"windows": windows},
+            "images": [],
+            "isError": False,
+            "structuredContent": None,
+        })
+
+        assert backend.list_apps() == [
+            {"name": "Terminal", "pid": 100},
+            {"name": "Notes", "pid": 200},
+        ]
 
 
 class TestCuaDriverSessionReconnect:
@@ -4085,7 +4300,7 @@ class TestStartupTimeoutPhaseDetail:
     def test_timeout_error_includes_startup_phase(self):
         import threading
         from typing import Any, cast
-        from unittest.mock import MagicMock
+        from unittest.mock import MagicMock, patch as _patch
         from tools.computer_use.cua_backend import _CuaDriverSession
 
         session = cast(Any, _CuaDriverSession.__new__(_CuaDriverSession))
@@ -4101,8 +4316,20 @@ class TestStartupTimeoutPhaseDetail:
         session._bridge = fake_bridge
 
         import asyncio
-        from unittest.mock import patch as _patch
-        with _patch.object(session._ready_event, "wait", return_value=False), \
+
+        class _FakeEvent:
+            """Event whose wait() always returns False (timeout path).
+
+            #69372: _start_lifecycle_locked reassigns a fresh threading.Event()
+            at line 786, so patching the pre-made instance's wait() is lost.
+            Patching threading.Event itself ensures the fresh instance also
+            has the mocked wait()."""
+            def set(self): pass
+            def is_set(self): return False
+            def clear(self): pass
+            def wait(self, timeout=None): return False
+
+        with _patch.object(threading, "Event", _FakeEvent), \
              _patch.object(asyncio, "run_coroutine_threadsafe", return_value=MagicMock()), \
              _patch.object(_CuaDriverSession, "_lifecycle_coro", lambda self: None):
             try:
@@ -4131,7 +4358,13 @@ class TestStartupTimeoutPhaseDetail:
         fake_bridge._loop = MagicMock()
         session._bridge = fake_bridge
 
-        with _patch.object(session._ready_event, "wait", return_value=False), \
+        class _FakeEvent:
+            def set(self): pass
+            def is_set(self): return False
+            def clear(self): pass
+            def wait(self, timeout=None): return False
+
+        with _patch.object(threading, "Event", _FakeEvent), \
              _patch.object(asyncio, "run_coroutine_threadsafe", return_value=MagicMock()), \
              _patch.object(_CuaDriverSession, "_lifecycle_coro", lambda self: None):
             try:

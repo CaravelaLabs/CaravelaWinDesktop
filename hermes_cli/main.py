@@ -450,6 +450,7 @@ from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
 from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
+from hermes_cli.subcommands.import_agent import build_import_agent_parser
 from hermes_cli.subcommands.config import build_config_parser
 from hermes_cli.subcommands.skin import build_skin_parser
 from hermes_cli.subcommands.console import build_console_parser
@@ -464,6 +465,7 @@ from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.monitoring import build_monitoring_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -15425,10 +15427,10 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "pairing", "pets", "plugins", "portal", "profile",
+        "model", "monitoring", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -15910,6 +15912,51 @@ def cmd_insights(args):
         print(f"Error generating insights: {e}")
 
 
+def cmd_monitoring(args):
+    """Gateway monitoring status: health & diagnostics export posture."""
+    from hermes_cli.config import load_config
+
+    action = getattr(args, "monitoring_action", None) or "status"
+    config = load_config()
+    mon_raw = config.get("monitoring")
+    mon: dict = mon_raw if isinstance(mon_raw, dict) else {}
+
+    if action == "status":
+        from agent.monitoring import otlp_exporter
+
+        gh_raw = mon.get("gateway_health_export")
+        gh: dict = gh_raw if isinstance(gh_raw, dict) else {}
+        export_raw = mon.get("export")
+        export_cfg: dict = export_raw if isinstance(export_raw, dict) else {}
+        otlp_raw = export_cfg.get("otlp")
+        otlp: dict = otlp_raw if isinstance(otlp_raw, dict) else {}
+
+        print("Gateway monitoring")
+        print(f"  Health export:  {'enabled' if gh.get('enabled') else 'disabled'} "
+              f"(monitoring.gateway_health_export.enabled)")
+        if gh.get("enabled"):
+            print(f"    Metrics:            {'on' if gh.get('metrics_enabled', True) else 'off'} "
+                  f"(interval {gh.get('export_interval_seconds', 60)}s)")
+            print(f"    Diagnostic events:  {'on' if gh.get('diagnostic_events_enabled', True) else 'off'}")
+            print(f"    Warning/error logs: {'on' if gh.get('warning_error_events_enabled', True) else 'off'} "
+                  f"(interval {gh.get('logs_export_interval_seconds', 5)}s)")
+            print("    Content safety:     always on "
+                  "(rendered messages are never exported; not configurable)")
+        endpoint = otlp.get("endpoint") or ""
+        if otlp.get("enabled") and endpoint:
+            print(f"  OTLP endpoint:  {endpoint}")
+        else:
+            print("  OTLP endpoint:  not configured (monitoring.export.otlp)")
+        print(f"  OTel SDK:       {'installed' if otlp_exporter.is_available() else 'not installed'} "
+              f"(optional extra: hermes-agent[otlp])")
+        print("\n  Scope: gateway service health + redacted diagnostics only.")
+        print("  No prompts, messages, tool args/results, usage analytics, or traces.")
+        return
+
+    print(f"Unknown monitoring action: {action}", file=sys.stderr)
+    sys.exit(2)
+
+
 def cmd_skills(args):
     # Route 'config' action to skills_config module
     if getattr(args, "skills_action", None) == "config":
@@ -16336,6 +16383,15 @@ def main():
     # import command  (parser built in hermes_cli/subcommands/import_cmd.py)
     # =========================================================================
     build_import_cmd_parser(subparsers, cmd_import=cmd_import)
+
+    # =========================================================================
+    # import-agent command  (parser: hermes_cli/subcommands/import_agent.py)
+    # =========================================================================
+    def cmd_import_agent(args):
+        from hermes_cli.agent_import import import_agent_command
+        import_agent_command(args)
+
+    build_import_agent_parser(subparsers, cmd_import_agent=cmd_import_agent)
 
     # =========================================================================
     # config command  (parser built in hermes_cli/subcommands/config.py)
@@ -18206,6 +18262,7 @@ def main():
     # insights command  (parser built in hermes_cli/subcommands/insights.py)
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
+    build_monitoring_parser(subparsers, cmd_monitoring=cmd_monitoring)
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)

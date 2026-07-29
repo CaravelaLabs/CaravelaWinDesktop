@@ -11995,6 +11995,7 @@ def _run_prompt_submit(
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
+        thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
@@ -12142,6 +12143,36 @@ def _run_prompt_submit(
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
             tts_queue = _tts_stream_begin()
+
+            # Ambient "thinking" sound (voice mode only): calm bubble blips
+            # while the agent works with no audio flowing, so long
+            # thinking/tool stretches don't read as a dead session. Per-blip
+            # gate skips while real TTS audio flows or the mic is capturing;
+            # stopped in the finally the instant the turn ends.
+            # voice.thinking_sound config-gates it; macOS TCC handled inside.
+            thinking_started = False
+            if _voice_mode_enabled():
+                try:
+                    from tools.voice_mode import (
+                        is_audio_output_active,
+                        start_thinking_sound,
+                    )
+
+                    def _thinking_should_play() -> bool:
+                        if is_audio_output_active():
+                            return False
+                        try:
+                            from hermes_cli.voice import is_continuous_active
+
+                            return not is_continuous_active()
+                        except Exception:
+                            return True
+
+                    thinking_started = start_thinking_sound(
+                        should_play=_thinking_should_play
+                    )
+                except Exception:
+                    thinking_started = False
 
             # Barged mid-speech? Tell the model (API-message note, same
             # enrichment channel as attached images) so it can react
@@ -12509,11 +12540,11 @@ def _run_prompt_submit(
                 and _voice_tts_enabled()
             ):
                 try:
-                    from hermes_cli.voice import speak_text
-
                     spoken = raw
+                    # Barge-aware: spoken interruptions must cut this
+                    # fallback playback too, not just the streaming path.
                     threading.Thread(
-                        target=speak_text, args=(spoken,), daemon=True
+                        target=_speak_text_with_barge, args=(spoken,), daemon=True
                     ).start()
                 except ImportError:
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
@@ -12551,6 +12582,15 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            if thinking_started:
+                # Kill the ambient thinking sound the moment the turn ends —
+                # error and success paths both land here.
+                try:
+                    from tools.voice_mode import stop_thinking_sound
+
+                    stop_thinking_sound()
+                except Exception:
+                    pass
             if tts_queue is not None:
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
             if one_turn_restore:
@@ -17701,6 +17741,21 @@ def _voice_tts_enabled() -> bool:
     return os.environ.get("HERMES_VOICE_TTS", "").strip() == "1"
 
 
+def _any_session_running() -> bool:
+    """True while any session's agent turn is in flight.
+
+    Registered as the voice busy-probe (``hermes_cli.voice.set_voice_busy_probe``)
+    so silent capture cycles during a long agent turn don't count toward the
+    no-speech limit — the user is correctly quiet while the agent works.
+    Voice is process-global (one microphone), so any running session holds.
+    """
+    try:
+        with _sessions_lock:
+            return any(s.get("running") for s in _sessions.values())
+    except Exception:
+        return False
+
+
 # ── Streaming TTS (one active pipeline per process — one speaker) ──────────
 # Token deltas from the running turn feed a sentence-buffering consumer
 # (tools.tts_tool.stream_tts_to_speaker) so speech starts on the first
@@ -17757,6 +17812,12 @@ def _tts_stream_stop(user_barge: bool = True) -> None:
     if state is None:
         return
     if user_barge and not state["done"].is_set():
+        import traceback as _tb
+        logger.debug(
+            "TTS CUT: _tts_stream_stop(user_barge=True) — new turn or "
+            "interrupt cutting in-flight TTS\n%s",
+            "".join(_tb.format_stack()),
+        )
         from tools.tts_streaming import mark_speech_interrupted
 
         mark_speech_interrupted()
@@ -17782,10 +17843,28 @@ def _tts_stream_barge_in_monitor(stop: threading.Event, done: threading.Event) -
         from tools.tts_streaming import mark_speech_interrupted
         from tools.voice_mode import listen_for_speech, stop_playback, transcribe_recording
 
+        # Grace period: wait briefly before opening the mic so the
+        # first TTS sentence is already playing and the VAD calibration
+        # samples the actual playback level (not silence).  This
+        # prevents speaker bleed from falsely triggering barge-in
+        # at the start of playback.  Mirrors the CLI path in cli.py
+        # _voice_barge_in_monitor.
+        _grace_s = float(_voice_cfg_dict().get("barge_in_grace_seconds", 2.0))
+        if _grace_s > 0:
+            stop.wait(timeout=_grace_s)
+            if stop.is_set() or done.is_set():
+                return
+
         barged = threading.Event()
 
         def _cut_playback():
             if not done.is_set():
+                import traceback as _tb
+                logger.debug(
+                    "TTS CUT: gateway barge-in _cut_playback fired (VAD trip) — "
+                    "stop.set() + stop_playback()\n%s",
+                    "".join(_tb.format_stack()),
+                )
                 barged.set()
                 mark_speech_interrupted()
                 stop.set()
@@ -17796,6 +17875,8 @@ def _tts_stream_barge_in_monitor(stop: threading.Event, done: threading.Event) -
             lambda: stop.is_set() or done.is_set(),
             capture=True,
             on_trigger=_cut_playback,
+            sustained_ms=1000,
+            calibration_ms=800,
         )
         if not (wav_path and barged.is_set()):
             return
@@ -17835,6 +17916,39 @@ def _tts_stream_barge_in_monitor(stop: threading.Event, done: threading.Event) -
                 pass
     except Exception as e:
         logger.debug("TTS barge-in monitor failed: %s", e)
+
+
+def _speak_text_with_barge(text: str) -> None:
+    """Speak *text* via hermes_cli.voice.speak_text with spoken barge-in.
+
+    The streaming-TTS turn pipeline arms ``_tts_stream_barge_in_monitor``;
+    the fallback whole-reply path (streaming couldn't start) and the
+    ``voice.tts`` RPC previously called ``speak_text`` bare — speech over
+    those paths was UNINTERRUPTIBLE by voice. Run the same monitor beside
+    the speak thread: it cuts playback (``stop_playback`` kills the file
+    player; the stop event drains a streaming dispatch inside speak_text),
+    captures the interruption, and emits ``voice.transcript`` /
+    the stop-phrase signal exactly like the streaming path.
+    """
+    from hermes_cli.voice import speak_text
+
+    stop = threading.Event()
+    done = threading.Event()
+
+    def _speak():
+        try:
+            speak_text(text, stop)
+        except TypeError:
+            # Older wrapper without the stop_event parameter.
+            speak_text(text)
+        finally:
+            done.set()
+
+    threading.Thread(target=_speak, daemon=True).start()
+    if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
+        threading.Thread(
+            target=_tts_stream_barge_in_monitor, args=(stop, done), daemon=True
+        ).start()
 
 
 def _voice_cfg_dict() -> dict:
@@ -18246,6 +18360,18 @@ def _(rid, params: dict) -> dict:
         # persisted stale toggle.
         os.environ["HERMES_VOICE"] = "1" if enabled else "0"
 
+        stop_hint = ""
+        if enabled:
+            # Spoken-stop hint for the client to render on voice-mode start.
+            # Sourced from voice.stop_phrases (custom phrases render
+            # correctly); empty when the feature is disabled.
+            try:
+                from tools.voice_mode import voice_stop_hint
+
+                stop_hint = voice_stop_hint()
+            except Exception:
+                stop_hint = ""
+
         if not enabled:
             # Disabling the mode must tear the continuous loop down; the
             # loop holds the microphone and would otherwise keep running.
@@ -18269,6 +18395,7 @@ def _(rid, params: dict) -> dict:
                 "enabled": enabled,
                 "record_key": _voice_record_key(),
                 "tts": _voice_tts_enabled(),
+                "stop_hint": stop_hint,
             },
         )
 
@@ -18327,6 +18454,18 @@ def _(rid, params: dict) -> dict:
                 _voice_event_sid = params.get("session_id") or _voice_event_sid
 
             from hermes_cli.voice import start_continuous
+
+            # Register the agent-busy probe so the shared voice wrapper can
+            # hold the no-speech counter during long agent turns (item:
+            # silence must not end the chat while the agent works). Safe to
+            # re-register on every start; older wrappers without the setter
+            # are tolerated.
+            try:
+                from hermes_cli.voice import set_voice_busy_probe
+
+                set_voice_busy_probe(_any_session_running)
+            except Exception:
+                pass
 
             # Shape-safe lookups: malformed ``voice:`` YAML (bool/scalar/list)
             # must not crash /voice with a 5025 — fall back to VAD defaults.
@@ -18444,9 +18583,13 @@ def _(rid, params: dict) -> dict:
     if not text:
         return _err(rid, 4020, "text required")
     try:
-        from hermes_cli.voice import speak_text
+        # Import check up front so a missing voice module still returns the
+        # documented 5026 instead of failing silently in the thread.
+        import hermes_cli.voice  # noqa: F401
 
-        threading.Thread(target=speak_text, args=(text,), daemon=True).start()
+        threading.Thread(
+            target=_speak_text_with_barge, args=(text,), daemon=True
+        ).start()
         return _ok(rid, {"status": "speaking"})
     except ImportError:
         return _err(rid, 5026, "voice module not available")

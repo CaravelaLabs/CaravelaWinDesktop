@@ -6939,7 +6939,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _strip(_session_messages)
                         except Exception:
                             pass
-                    _flush(_session_messages)
+                    try:
+                        _flush(_session_messages)
+                    except Exception as _flush_err:
+                        # The in-memory transcript could not be persisted
+                        # (e.g. FTS/SQLite index corruption — #72680). A plain
+                        # debug log loses the conversation permanently when the
+                        # process exits. Dump the live agent history to an
+                        # external JSON recovery snapshot so an operator can
+                        # salvage it after repairing state.db. The flush is
+                        # non-fatal; shutdown must never block on a best-effort
+                        # backup.
+                        logger.warning(
+                            "Shutdown transcript flush failed (%s); preserving "
+                            "%d in-memory message(s) to recovery snapshot",
+                            _flush_err,
+                            len(_session_messages),
+                        )
+                        from gateway.shutdown_flush import flush_agent_history_to_file
+                        flush_agent_history_to_file(
+                            getattr(agent, "session_id", None),
+                            _session_messages,
+                        )
             except Exception as _e:
                 logger.debug("Shutdown transcript flush failed: %s", _e)
             try:
@@ -7073,6 +7094,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         try:
             if hasattr(agent, "shutdown_memory_provider"):
+                # Drain queued memory writes BEFORE tearing the provider down.
+                # The memory manager persists per-turn sync and end-of-session
+                # extraction on a single serialized background worker.
+                # shutdown_memory_provider() -> shutdown_all() only gives that
+                # worker a ~5s bounded drain and abandons (cancels) anything
+                # still queued past it, so a /reset — or any gateway session
+                # rotation that reaches this cleanup path — could silently drop
+                # writes the session had already handed off. The next session
+                # then loads stale memory (#73297). Give pending work a bounded
+                # head start through the manager's own barrier first, mirroring
+                # the CLI exit path (cli.py). Best-effort: a flush failure must
+                # never block teardown.
+                _mm = getattr(agent, "_memory_manager", None)
+                if _mm is not None and hasattr(_mm, "flush_pending"):
+                    try:
+                        _mm.flush_pending(timeout=10)
+                    except Exception:
+                        pass
                 # Pass the agent's own conversation transcript so memory
                 # providers' ``on_session_end`` hooks see the real messages
                 # instead of the empty default (#15165). ``_session_messages``
@@ -8117,6 +8156,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             write_runtime_status(gateway_state="starting", exit_reason=None)
         except Exception:
             pass
+        try:
+            from hermes_cli.config import load_config
+            from agent.monitoring.gateway_health_export import start_gateway_health_export
+            self._gateway_health_export_runtime = start_gateway_health_export(load_config())
+            if getattr(self._gateway_health_export_runtime, "enabled", False):
+                logger.info("Gateway health OTLP export: enabled")
+        except Exception:
+            logger.debug("gateway health OTLP export startup failed", exc_info=True)
 
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
@@ -10204,6 +10251,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._update_runtime_status("running", self._exit_reason)
             else:
                 self._update_runtime_status("stopped", self._exit_reason)
+            _shutdown_gateway_health_export(self)
             logger.info("Gateway stopped (total teardown %.2fs)", _phase_elapsed())
 
         self._stop_task = asyncio.create_task(_stop_impl())
@@ -13108,9 +13156,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _msg_config_ctx = None
                 if _msg_config_ctx is not None and isinstance(_msg_model_cfg, dict):
                     try:
-                        from hermes_cli.route_identity import should_clear_context_pin
+                        from hermes_cli.route_identity import should_clear_context_pin_async
 
-                        if should_clear_context_pin(
+                        if await should_clear_context_pin_async(
                             None,  # model match already checked above
                             None,
                             _msg_model_cfg.get("base_url"),
@@ -13703,9 +13751,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 if _hyg_config_context_length is not None:
                     try:
-                        from hermes_cli.route_identity import should_clear_context_pin
+                        from hermes_cli.route_identity import should_clear_context_pin_async
 
-                        if should_clear_context_pin(
+                        if await should_clear_context_pin_async(
                             _hyg_configured_model,
                             _hyg_model,
                             _hyg_configured_base_url,
@@ -24524,6 +24572,18 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+def _shutdown_gateway_health_export(runner: Any) -> None:
+    """Idempotently drain and detach Gateway Health OTLP export."""
+    runtime = getattr(runner, "_gateway_health_export_runtime", None)
+    if runtime is None:
+        return
+    runner._gateway_health_export_runtime = None
+    try:
+        runtime.shutdown()
+    except Exception:
+        logger.debug("gateway health OTLP export shutdown failed", exc_info=True)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -24982,8 +25042,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         logger.debug("MCP tool discovery failed: %s", e)
 
     # Start the gateway
-    success = await runner.start()
+    try:
+        success = await runner.start()
+    except BaseException:
+        _shutdown_gateway_health_export(runner)
+        raise
     if not success:
+        _shutdown_gateway_health_export(runner)
         return False
     # Recover any pending messages flushed during a previous shutdown (#72680).
     try:
@@ -24996,6 +25061,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
     if runner.should_exit_cleanly:
+        _shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         # A clean exit that carries an explicit exit code (e.g. a fatal
@@ -25011,19 +25077,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not runner._running:
         # Startup was intentionally aborted by restart/shutdown before entering
         # running mode; preserve that lifecycle path without starting cron.
-        await runner.wait_for_shutdown()
-        if runner.should_exit_with_failure:
-            if runner.exit_reason:
-                logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-            return False
         try:
-            from tools.mcp_tool import shutdown_mcp_servers
-            shutdown_mcp_servers()
-        except Exception:
-            pass
-        if runner.exit_code is not None:
-            raise SystemExit(runner.exit_code)
-        return True
+            await runner.wait_for_shutdown()
+            if runner.should_exit_with_failure:
+                if runner.exit_reason:
+                    logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+                return False
+            try:
+                from tools.mcp_tool import shutdown_mcp_servers
+                shutdown_mcp_servers()
+            except Exception:
+                pass
+            if runner.exit_code is not None:
+                raise SystemExit(runner.exit_code)
+            return True
+        finally:
+            _shutdown_gateway_health_export(runner)
 
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the

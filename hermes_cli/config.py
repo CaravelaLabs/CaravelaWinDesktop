@@ -2230,7 +2230,7 @@ DEFAULT_CONFIG = {
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
     },
-    
+
     # Text-to-speech configuration
     # Each provider supports an optional `max_text_length:` override for the
     # per-request input-character cap. Omit it to use the provider's documented
@@ -2372,9 +2372,11 @@ DEFAULT_CONFIG = {
         "auto_tts": False,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
         "beep_volume": 0.3,           # Beep amplitude multiplier (0.0-1.0, default keeps prior hardcoded value)
+        "thinking_sound": True,       # Calm ambient bubble sound while the agent works in voice chat (volume follows beep_volume)
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
         "barge_in": True,             # Stop TTS playback when the user starts talking
+        "barge_in_grace_seconds": 2.0,  # Delay before the barge mic opens so VAD calibrates against live TTS playback (0 disables)
         # Saying EXACTLY one of these phrases (and nothing else) ends the
         # voice chat instead of being sent to the agent. Case-insensitive,
         # surrounding punctuation ignored. Set [] to disable.
@@ -3209,6 +3211,44 @@ DEFAULT_CONFIG = {
         "force_ipv4": False,
     },
 
+    # Gateway monitoring — Service Health Monitoring plus redacted Operational
+    # Diagnostics for the gateway daemon, exported over OTLP to an
+    # operator-configured endpoint (OTEL Collector, DataDog, ...). Content-free
+    # by construction: no prompts, messages, tool args/results, session
+    # history, usage analytics, audit logs, or trajectories. Off by default;
+    # nothing is collected or sent until an operator enables it and sets an
+    # endpoint.
+    "monitoring": {
+        # Stable install identifier attached to exported health signals so an
+        # operator can tell instances apart in their collector. Empty string
+        # means "mint a fresh UUID on first use"; clear it to rotate. Carries
+        # no account identity.
+        "install_id": "",
+        # Gateway health & diagnostics export.
+        "gateway_health_export": {
+            "enabled": False,
+            "metrics_enabled": True,
+            "diagnostic_events_enabled": True,
+            "warning_error_events_enabled": True,
+            "export_interval_seconds": 60,
+            "logs_export_interval_seconds": 5,
+            "resource_attributes": {
+                "service.name": "hermes-gateway",
+                "deployment.environment.name": "production",
+            },
+        },
+        # OTLP destination. headers_env maps header names to ENVIRONMENT
+        # VARIABLE NAMES (never secret values); values are read from the
+        # environment at export time.
+        "export": {
+            "otlp": {
+                "enabled": False,
+                "endpoint": "",
+                "headers_env": {},
+            },
+        },
+    },
+
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
@@ -3577,6 +3617,14 @@ DEFAULT_CONFIG = {
         # ``"manual"`` — only use binaries already on PATH.
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
+
+        # Idle language servers are shut down automatically after this
+        # many seconds with no file activity, then respawned on demand.
+        # Prevents long-running gateway/CLI processes from accumulating
+        # stale pyright/gopls/tsserver children (hundreds of MB each,
+        # plus pipe FDs) as the agent moves across worktrees.  Set to 0
+        # to disable idle reaping and keep servers for process lifetime.
+        "idle_timeout": 600.0,
 
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,

@@ -234,6 +234,30 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
+# Import-time snapshot used by _default_db_path() to detect a deliberately
+# re-pointed DEFAULT_DB_PATH (tests monkeypatch the constant directly).
+_IMPORT_DEFAULT_DB_PATH = DEFAULT_DB_PATH
+
+
+def _default_db_path() -> Path:
+    """Resolve the default state DB path at call time.
+
+    ``DEFAULT_DB_PATH`` is computed when this module is first imported, which
+    freezes the developer's real ``~/.hermes`` even when a test fixture later
+    redirects ``HERMES_HOME`` — importing this module during collection was
+    enough to point every default ``SessionDB()`` at the real state.db.
+
+    Precedence:
+
+    1. A deliberately re-pointed ``DEFAULT_DB_PATH`` (differs from the
+       import-time snapshot — the established test escape hatch) wins.
+    2. Otherwise resolve ``get_hermes_home()`` fresh so a runtime
+       ``HERMES_HOME`` redirect takes effect regardless of import order.
+    """
+    if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH:
+        return DEFAULT_DB_PATH
+    return get_hermes_home() / "state.db"
+
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
 # ---------------------------------------------------------------------------
@@ -247,9 +271,13 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 # propagate that, every feature backed by state.db / kanban.db breaks
 # silently — /resume, /title, /history, /branch, kanban dispatcher, etc.
 #
+# ZFS is a separate case: its COW + mmap semantics can corrupt the WAL
+# shared-memory (-shm) file under concurrent connection bursts, presenting
+# as ``disk I/O error`` rather than ``locking protocol``.
+#
 # Instead, fall back to ``journal_mode=DELETE`` (the pre-WAL default) which
-# works on NFS.  Concurrency drops — concurrent readers are blocked during
-# a write — but the feature works.
+# works on NFS and ZFS.  Concurrency drops — concurrent readers are blocked
+# during a write — but the feature works.
 #
 # Separately, SQLite's WAL-reset bug can corrupt multi-process WAL databases
 # on unfixed library builds (issue #69784).  See:
@@ -262,6 +290,7 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 _WAL_INCOMPAT_MARKERS = (
     "locking protocol",       # SQLITE_PROTOCOL on NFS/SMB
     "not authorized",         # Some FUSE mounts block WAL pragma outright
+    "disk i/o error",         # ZFS SHM corruption under concurrent connections
 )
 
 # Last SessionDB() init error, per-process.  Surfaced in /resume and
@@ -386,7 +415,7 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
         return f"{prefix}."
     hint = ""
     if any(marker in cause.lower() for marker in _WAL_INCOMPAT_MARKERS):
-        hint = " (state.db may be on NFS/SMB/FUSE — see https://www.sqlite.org/wal.html)"
+        hint = " (state.db may be on NFS/SMB/FUSE/ZFS — see https://www.sqlite.org/wal.html)"
     return f"{prefix}: {cause}{hint}."
 
 
@@ -506,19 +535,64 @@ def sqlite_source_id() -> str:
     return str(row[0])
 
 
+def resolve_journal_mode() -> str:
+    """Return the configured journal mode (``wal`` or ``delete``).
+
+    ``database.journal_mode`` in config.yaml is the canonical operator
+    setting. ``wal`` remains the default; use ``delete`` when the backing
+    filesystem does not provide WAL-safe durability (for example macOS
+    virtiofs, NFS, or SMB). Invalid or malformed values fail safely to the
+    existing default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        database = config.get("database", {})
+        if not isinstance(database, dict):
+            return "wal"
+        raw = database.get("journal_mode", "wal")
+    except Exception:
+        return "wal"
+
+    if not isinstance(raw, str):
+        return "wal"
+    mode = raw.strip().lower()
+    return mode if mode in ("wal", "delete") else "wal"
+
+
+class WalUnsupportedError(sqlite3.OperationalError):
+    """Raised by :func:`apply_wal_with_fallback` when ``require_wal=True`` and
+    the filesystem cannot provide WAL journal mode.
+
+    Covers both shapes of WAL refusal on network filesystems (NFS / SMB / FUSE
+    / the AgentFS NFS overlay): SQLite *raising* ``SQLITE_PROTOCOL`` ("locking
+    protocol"), and the quieter macOS-NFS case where ``PRAGMA journal_mode=WAL``
+    silently returns the still-effective mode without raising.  Subclasses
+    ``sqlite3.OperationalError`` so existing ``except sqlite3.OperationalError``
+    DB-init handling still catches it, while callers that specifically mandate
+    WAL can catch this narrower type.
+    """
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
+    require_wal: bool = False,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
     Returns the journal mode actually set (``"wal"`` or ``"delete"``).
 
-    On WAL-incompatible filesystems (NFS, SMB, some FUSE), SQLite raises
-    ``OperationalError("locking protocol")`` when setting WAL.  We fall
-    back to DELETE mode — the pre-WAL default, which works on NFS — and
-    log one WARNING explaining why.
+    On WAL-incompatible filesystems (NFS, SMB, some FUSE, ZFS), SQLite either
+    raises ``OperationalError("locking protocol")`` /
+    ``OperationalError("disk I/O error")`` or — on macOS NFS / SMB /
+    the AgentFS NFS overlay — silently refuses the switch and leaves the DB in
+    DELETE.  Either way the degradation is logged at ERROR level (it is a real
+    loss of concurrency — a write blocks concurrent readers — not a cosmetic
+    warning) and, by default, the function falls back to DELETE (the pre-WAL
+    default, which works on NFS and ZFS) so the feature keeps working.
 
     On SQLite builds that still contain the WAL-reset corruption bug
     (issue #69784), refuse to enable WAL on fresh / non-WAL databases
@@ -536,11 +610,17 @@ def apply_wal_with_fallback(
     the WAL-reset bug as real through 3.51.2 with serious consequences.  Until
     a fixed runtime is delivered, keep new databases out of WAL.
 
-    The WARNING is deduplicated per ``db_label``: repeated connections
-    to the same underlying DB (e.g. kanban_db.connect() which is called
-    on every kanban operation) log once per process, not once per call.
-    Different db_labels log independently, so state.db and kanban.db
-    each get one warning on the same NFS mount.
+    Callers that genuinely require WAL concurrency (and would rather fail loudly
+    than run silently degraded) pass ``require_wal=True``; the function then
+    raises :class:`WalUnsupportedError` instead of returning ``"delete"``.  All
+    current callers deliberately keep the default ``require_wal=False`` so
+    NFS-homed installs keep working.
+
+    The ERROR is deduplicated per ``db_label``: repeated connections to the
+    same underlying DB (e.g. kanban_db.connect() which is called on every
+    kanban operation) log once per process, not once per call.  Different
+    db_labels log independently, so state.db and kanban.db each get one error
+    on the same NFS mount.
 
     Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
     both databases get identical fallback behavior.
@@ -549,9 +629,18 @@ def apply_wal_with_fallback(
     _on_disk_journal_mode.  That holds for both the NFS path and the
     WAL-reset vulnerability path.
     """
-    # Vulnerable SQLite: do not enable WAL on new/non-WAL files.
+    configured = resolve_journal_mode()
+
+    # Vulnerable SQLite: do not enable WAL on new/non-WAL files. Resolve the
+    # operator setting first so an explicit DELETE request still verifies that
+    # SQLite actually accepted DELETE rather than silently returning MEMORY or
+    # another connection-specific mode.
     if is_sqlite_wal_reset_vulnerable():
-        return _apply_delete_for_wal_reset_bug(conn, db_label=db_label)
+        return _apply_delete_for_wal_reset_bug(
+            conn,
+            db_label=db_label,
+            require_delete=configured == "delete",
+        )
 
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
@@ -564,20 +653,89 @@ def apply_wal_with_fallback(
     except sqlite3.OperationalError:
         pass
 
+    # #68545: honor the canonical database.journal_mode setting. Existing
+    # on-disk WAL databases were returned above and are never live-downgraded.
+    if configured == "delete":
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        actual = str(row[0]).lower() if row else ""
+        if actual != "delete":
+            raise sqlite3.OperationalError(
+                f"could not set configured journal_mode=delete (got {actual or 'no result'})"
+            )
+        return actual
+
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        _apply_macos_checkpoint_barrier(conn)
-        _enforce_macos_synchronous_full(conn)
-        return "wal"
+        # ``PRAGMA journal_mode=WAL`` is a query-that-sets: it RETURNS the
+        # resulting journal mode. Network filesystems that refuse WAL by
+        # *raising* SQLITE_PROTOCOL ("locking protocol") are handled in the
+        # except branch below. But macOS NFS — and SMB/CIFS, and the AgentFS
+        # NFS overlay — refuse the switch WITHOUT raising: the pragma simply
+        # returns the still-effective mode (e.g. ``delete``). Trust the
+        # returned row, not the mere absence of an exception; otherwise we
+        # report a false ``"wal"`` AND skip the fallback WARNING, leaving the
+        # DB silently in DELETE (reader-blocks-writer) with no signal.
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
+        if mode == "wal":
+            _apply_macos_checkpoint_barrier(conn)
+            _enforce_macos_synchronous_full(conn)
+            return "wal"
+        # Silent refusal (macOS NFS / SMB / AgentFS overlay): WAL was not
+        # honored, but nothing raised.
+        silent_exc = WalUnsupportedError(
+            f"journal_mode=WAL refused without raising (still {mode!r})"
+        )
+        if require_wal:
+            raise silent_exc
+        _log_wal_fallback_once(db_label, silent_exc)
+        return mode or "delete"
     except sqlite3.OperationalError as exc:
+        # The require_wal silent-refusal raise above is a WalUnsupportedError
+        # (an OperationalError subclass) and lands here — propagate it
+        # unchanged rather than re-running it through the marker logic.
+        if isinstance(exc, WalUnsupportedError):
+            raise
         msg = str(exc).lower()
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
             # Unrelated OperationalError — don't silently swallow.
             raise
+        # ``disk i/o error`` is ambiguous: on ZFS / APFS-CoW it is a
+        # deterministic WAL-incompatibility (SHM corruption under concurrent
+        # connection bursts — #55305, #71498), but it can also be a one-shot
+        # transient EIO (page-cache pressure, brief lock contention).
+        # Treating a transient EIO as a permanent downgrade signal produced
+        # the mixed-journal-mode corruption pattern fixed in 5c49cd0ed0
+        # (process A downgrades to DELETE while sibling processes set WAL).
+        # Disambiguate by retrying the pragma a couple of times: transient
+        # EIO clears and we return "wal"; the deterministic filesystem cases
+        # keep failing and fall through to the guarded DELETE fallback.
+        if "disk i/o error" in msg:
+            for _ in range(2):
+                time.sleep(0.05)
+                try:
+                    row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                except sqlite3.OperationalError as retry_exc:
+                    if "disk i/o error" not in str(retry_exc).lower():
+                        raise
+                    exc = retry_exc
+                    continue
+                mode = (
+                    str(row[0]).strip().lower()
+                    if row and row[0] is not None
+                    else ""
+                )
+                if mode == "wal":
+                    _apply_macos_checkpoint_barrier(conn)
+                    _enforce_macos_synchronous_full(conn)
+                    return "wal"
+                break
         # Don't downgrade if another process already set WAL on disk.
         existing = _on_disk_journal_mode(conn)
         if existing == "wal":
             raise
+        if require_wal:
+            # Caller mandates WAL — fail loudly instead of degrading to DELETE.
+            raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
         conn.execute("PRAGMA journal_mode=DELETE")
         return "delete"
@@ -587,11 +745,13 @@ def _apply_delete_for_wal_reset_bug(
     conn: sqlite3.Connection,
     *,
     db_label: str,
+    require_delete: bool = False,
 ) -> str:
     """Avoid enabling WAL when the linked SQLite has the WAL-reset bug.
 
     - Already-WAL on disk: leave WAL alone (no live downgrade) and warn.
     - Otherwise: set DELETE and warn.
+    - For an explicit operator request, verify SQLite accepted DELETE.
     """
     current = ""
     try:
@@ -609,11 +769,21 @@ def _apply_delete_for_wal_reset_bug(
         _enforce_macos_synchronous_full(conn)
         return "wal"
 
+    actual = ""
     try:
-        conn.execute("PRAGMA journal_mode=DELETE")
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        if row and row[0] is not None:
+            actual = str(row[0]).strip().lower()
     except sqlite3.OperationalError:
-        # Best-effort: DELETE is usually already the default for new files.
-        pass
+        if require_delete:
+            raise
+        # Best-effort for the automatic vulnerable-runtime fallback: DELETE is
+        # normally already the default for new file-backed databases.
+    if require_delete and actual != "delete":
+        raise sqlite3.OperationalError(
+            "could not set configured journal_mode=delete "
+            f"(got {actual or 'no result'})"
+        )
     _log_wal_reset_bug_once(db_label, kept_wal=False)
     return "delete"
 
@@ -648,25 +818,80 @@ def _log_wal_reset_bug_once(
 
 
 def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
-    """Log a single WARNING per (process, db_label) about WAL fallback.
+    """Log a single ERROR per (process, db_label) about WAL fallback.
+
+    ERROR (not WARNING): a DB silently dropped to DELETE means a real loss of
+    concurrency — under the kanban dispatcher + workers a write blocks readers,
+    surfacing as SQLITE_BUSY/lock contention — so it must be loud, not cosmetic.
 
     Without this dedup, NFS users running kanban (which opens a fresh
     connection on every operation — see hermes_cli/kanban_db.py) would
-    fill errors.log with hundreds of identical warnings per hour.
+    fill errors.log with hundreds of identical errors per hour.
     """
     with _wal_fallback_warned_lock:
         if db_label in _wal_fallback_warned_paths:
             return
         _wal_fallback_warned_paths.add(db_label)
-    logger.warning(
+    logger.error(
         "%s: WAL journal_mode unsupported on this filesystem (%s) — "
         "falling back to journal_mode=DELETE (slower rollback-journal "
-        "mode; reduces concurrency but works on NFS/SMB/FUSE). See "
-        "https://www.sqlite.org/wal.html for details. This warning "
+        "mode; reduces concurrency but works on NFS/SMB/FUSE/ZFS). See "
+        "https://www.sqlite.org/wal.html for details. This message "
         "fires once per process per database.",
         db_label,
         exc,
     )
+
+
+# ---------------------------------------------------------------------------
+# Config-driven database pragmas
+# ---------------------------------------------------------------------------
+def apply_database_pragmas(
+    conn: sqlite3.Connection,
+    *,
+    db_label: str = "state.db",
+) -> None:
+    """Apply optional WAL-sizing PRAGMAs from ``config.yaml``.
+
+    Reads the ``database:`` section and applies ``wal_autocheckpoint``
+    and ``journal_size_limit`` when set to integer values.  The journal
+    mode itself is NOT handled here — ``database.journal_mode`` is owned
+    by :func:`resolve_journal_mode` inside :func:`apply_wal_with_fallback`,
+    which layers the operator setting under all the safety guards
+    (never live-downgrading an on-disk WAL DB, filesystem fallback,
+    WAL-reset-bug gating).  Keeping a single owner prevents a second,
+    unguarded journal-mode switch path.
+
+    Best-effort: config load or pragma failures are ignored so DB init
+    never breaks on a malformed ``database:`` section.
+    """
+    try:
+        # Local import avoids a circular import with hermes_cli.config.
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        cfg = load_config_readonly()
+    except Exception:
+        return
+
+    for pragma_name in ("wal_autocheckpoint", "journal_size_limit"):
+        raw_value = cfg_get(cfg, "database", pragma_name, default=None)
+        if raw_value is None:
+            continue
+        try:
+            value = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s: ignoring non-integer database.%s=%r",
+                db_label,
+                pragma_name,
+                raw_value,
+            )
+            continue
+        try:
+            conn.execute(f"PRAGMA {pragma_name}={value}")
+        except sqlite3.OperationalError:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Malformed-schema recovery
@@ -1509,9 +1734,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Instead, we keep the SQLite timeout short (1s) and handle retries at the
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
-    _WRITE_MAX_RETRIES = 15
+    #
+    # Patience is TIME-based, not attempt-based.  A shared state.db is
+    # legitimately held for multi-second stretches by sibling Hermes
+    # processes: a TRUNCATE checkpoint at close on a large WAL, VACUUM after
+    # an auto-prune, offline recovery, or an older still-running process
+    # whose FTS maintenance predates the bounded-merge protocol (every
+    # `hermes update` leaves mixed-version processes sharing the DB until
+    # the old ones exit).  An attempt-counted budget (~15s incidental worst
+    # case) silently loses that race and surfaces as
+    # session_persistence_failed — a destroyed turn — even though the store
+    # is healthy and merely busy (#74478).
+    #
+    # Two budgets: routine writes give up after _WRITE_PATIENCE_S so
+    # background/UI callers don't stall excessively, while transcript
+    # writes (append_message / session-row creation — the ones whose
+    # failure aborts the user's turn) ride out anything shorter than
+    # _TRANSCRIPT_WRITE_PATIENCE_S.  Jitter stays small for the first
+    # _WRITE_RETRY_SLOW_AFTER_S (fast reclaim on millisecond contention),
+    # then backs off so a long hold isn't hammered with BEGIN IMMEDIATE
+    # attempts.
+    _WRITE_PATIENCE_S = 20.0
+    _TRANSCRIPT_WRITE_PATIENCE_S = 60.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _WRITE_RETRY_SLOW_AFTER_S = 2.0
+    _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
+    _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -1540,7 +1789,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or _default_db_path()
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -1663,12 +1912,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._wal_active = (
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
                 )
+                apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
 
+            def _connect_and_init_with_lock_patience():
+                # Lock contention during open: _init_schema's DDL/reconcile
+                # statements run on a 1s-timeout connection with no retry, so
+                # a sibling process holding the write lock (VACUUM, TRUNCATE
+                # checkpoint at close, a long FTS pass from an older
+                # still-running install) used to fail the ENTIRE open —
+                # callers then disable persistence for the whole run
+                # ("Failed to initialize SessionDB ... database is locked",
+                # #74478). The store is healthy; wait it out with the same
+                # jittered patience the write path uses. Non-lock errors
+                # (including the malformed class) propagate immediately.
+                deadline = time.monotonic() + self._WRITE_PATIENCE_S
+                while True:
+                    try:
+                        _connect_and_init()
+                        return
+                    except sqlite3.OperationalError as exc:
+                        err = str(exc).lower()
+                        if "locked" not in err and "busy" not in err:
+                            raise
+                        try:
+                            if self._conn is not None:
+                                self._conn.close()
+                        except Exception:
+                            pass
+                        now = time.monotonic()
+                        if now >= deadline:
+                            raise
+                        time.sleep(
+                            min(
+                                random.uniform(
+                                    self._WRITE_RETRY_SLOW_MIN_S,
+                                    self._WRITE_RETRY_SLOW_MAX_S,
+                                ),
+                                max(deadline - now, 0.001),
+                            )
+                        )
+
             try:
-                _connect_and_init()
+                _connect_and_init_with_lock_patience()
             except sqlite3.DatabaseError as exc:
                 # The malformed-schema class (e.g. a duplicate sqlite_master
                 # row for messages_fts) fails on the very first statement —
@@ -1691,7 +1979,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 report = repair_state_db_schema(self.db_path)
                 if not report.get("repaired"):
                     raise
-                _connect_and_init()
+                _connect_and_init_with_lock_patience()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -2029,6 +2317,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
+        patience_s: Optional[float] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -2039,13 +2328,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         BEGIN IMMEDIATE acquires the WAL write lock at transaction start
         (not at commit time), so lock contention surfaces immediately.
         On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
+        random jitter, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
+
+        *patience_s* is the total time budget for lock retries (default
+        ``_WRITE_PATIENCE_S``).  Transcript-critical writes pass
+        ``_TRANSCRIPT_WRITE_PATIENCE_S`` so a sibling process holding the
+        lock for a legitimate long operation (VACUUM, TRUNCATE checkpoint,
+        pre-bounded-merge FTS optimize from an older still-running
+        install) exhausts routine writers' patience without destroying a
+        user turn.  Jitter starts small (20-150ms) for fast reclaim on
+        millisecond contention and backs off to 250ms-1s once the lock has
+        been held longer than ``_WRITE_RETRY_SLOW_AFTER_S``.
 
         Returns whatever *fn* returns.
         """
-        last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        deadline = time.monotonic() + patience_s
+        while True:
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -2068,15 +2369,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
-                    last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
-                        jitter = random.uniform(
-                            self._WRITE_RETRY_MIN_S,
-                            self._WRITE_RETRY_MAX_S,
-                        )
-                        time.sleep(jitter)
+                    now = time.monotonic()
+                    if now < deadline:
+                        elapsed = now - (deadline - patience_s)
+                        if elapsed >= self._WRITE_RETRY_SLOW_AFTER_S:
+                            jitter = random.uniform(
+                                self._WRITE_RETRY_SLOW_MIN_S,
+                                self._WRITE_RETRY_SLOW_MAX_S,
+                            )
+                        else:
+                            jitter = random.uniform(
+                                self._WRITE_RETRY_MIN_S,
+                                self._WRITE_RETRY_MAX_S,
+                            )
+                        # Never overshoot the deadline by a full slow-jitter.
+                        time.sleep(min(jitter, max(deadline - now, 0.001)))
                         continue
-                # Non-lock error or retries exhausted — propagate.
+                    # Patience exhausted — say what actually happened so the
+                    # surfaced error doesn't read as disk/permission damage.
+                    raise sqlite3.OperationalError(
+                        f"database is locked (another Hermes process held the "
+                        f"state.db write lock for over {patience_s:.0f}s — "
+                        "likely a long maintenance operation such as VACUUM, "
+                        "a large WAL checkpoint, or an older pre-update "
+                        "process; the database itself is healthy)"
+                    ) from exc
+                # Non-lock error — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
                 # Corrupt FTS shadow tables make every write raise the
@@ -2091,10 +2409,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
-        # Retries exhausted (shouldn't normally reach here).
-        raise last_err or sqlite3.OperationalError(
-            "database is locked after max retries"
-        )
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
@@ -2452,7 +2766,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
-        self._execute_write(_do)
+        # Session-row creation is transcript-critical: if it fails, the
+        # first flush of a new session fails and the turn is aborted as
+        # session_persistence_failed. Ride out long sibling holds.
+        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -5287,7 +5604,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return msg_id
 
-        return self._execute_write(_do)
+        # Transcript append is THE critical write: its failure aborts the
+        # user's turn (session_persistence_failed). Use the long patience so
+        # a sibling process legitimately holding the write lock for seconds
+        # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
+        # process's FTS optimize) can't destroy a healthy turn (#74478).
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,

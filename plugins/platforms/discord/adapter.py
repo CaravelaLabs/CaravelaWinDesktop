@@ -2952,6 +2952,36 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    @staticmethod
+    def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":
+        """ids-built reply reference — no fetch_message round trip.
+
+        Discord resolves message_reference from the ids alone, and
+        fail_if_not_exists=False keeps sends to deleted targets working
+        exactly as the fetched form did (a dead target degrades to the
+        send-side 10008 retry instead of a fetch failure).
+        """
+        return discord.MessageReference(
+            message_id=int(message_id),
+            channel_id=getattr(channel, "id", None),
+            guild_id=getattr(getattr(channel, "guild", None), "id", None),
+            fail_if_not_exists=False,
+        )
+
+    def _reply_reference_for_send(self, reply_to, channel):
+        """Reply anchor for send paths, honoring reply_to_mode.
+
+        Mirrors telegram's _reply_to_message_id_for_send: raw reply_to in,
+        platform send-time anchor out, ``off`` mode suppressed.
+        """
+        if not reply_to or self._reply_to_mode == "off":
+            return None
+        try:
+            return self._message_reference_from_ids(reply_to, channel)
+        except (ValueError, TypeError) as e:
+            logger.debug("Could not build reply-to reference: %s", e)
+            return None
+
     async def send(
         self,
         chat_id: str,
@@ -3010,17 +3040,8 @@ class DiscordAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
-            reference = None
-
-            if reply_to and self._reply_to_mode != "off":
-                try:
-                    ref_msg = await channel.fetch_message(int(reply_to))
-                    if hasattr(ref_msg, "to_reference"):
-                        reference = ref_msg.to_reference(fail_if_not_exists=False)
-                    else:
-                        reference = ref_msg
-                except Exception as e:
-                    logger.debug("Could not fetch reply-to message: %s", e)
+            # Build the reference from ids — no fetch_message round trip.
+            reference = self._reply_reference_for_send(reply_to, channel)
 
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
@@ -3261,7 +3282,7 @@ class DiscordAdapter(BasePlatformAdapter):
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
-            msg = await channel.fetch_message(int(message_id))
+            msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
 
             _preview_key = (str(chat_id), str(message_id))
@@ -3401,6 +3422,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     reference = prev_msg.to_reference(fail_if_not_exists=False)
                 except Exception:
                     reference = None
+            elif getattr(prev_msg, "id", None):
+                # Duck-typed prior message without to_reference (real
+                # discord.py PartialMessage HAS to_reference, so this is
+                # belt-and-suspenders): build the reference from ids so
+                # overflow continuations stay threaded.
+                reference = self._message_reference_from_ids(prev_msg.id, channel)
             try:
                 sent = await channel.send(content=chunk, reference=reference)
             except Exception as send_err:
@@ -3696,16 +3723,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
             filename = os.path.basename(audio_path)
 
-            reference = None
-            if reply_to and self._reply_to_mode != "off":
-                try:
-                    ref_msg = await channel.fetch_message(int(reply_to))
-                    if hasattr(ref_msg, "to_reference"):
-                        reference = ref_msg.to_reference(fail_if_not_exists=False)
-                    else:
-                        reference = ref_msg
-                except Exception as e:
-                    logger.debug("Could not fetch voice reply-to message: %s", e)
+            # ids-only reference — same no-fetch rationale as the text path.
+            reference = self._reply_reference_for_send(reply_to, channel)
 
             with open(audio_path, "rb") as f:
                 file_data = f.read()

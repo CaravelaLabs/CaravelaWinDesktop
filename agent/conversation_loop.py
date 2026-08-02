@@ -738,6 +738,92 @@ _CONTENT_POLICY_RECOVERY_HINT = (
 )
 
 
+# Memo for the send-path tool-call argument canonicalization inside
+# run_conversation().  That pass re-canonicalizes the arguments string of
+# EVERY historical tool call on EVERY API-call iteration (quadratic in
+# session tool-call count), and the api_messages copies share the exact
+# argument string objects with the persisted history, so the same strings
+# come through unchanged iteration after iteration.
+#
+# Soundness: canonicalization is a pure, deterministic function of the
+# input string (fixed separators, sort_keys=True), so a value-keyed memo
+# is exact — equal inputs always produce the canonical form computed the
+# first time.  Malformed strings raise out of json.loads BEFORE anything
+# is stored, so the repair fallback below is never memoized and reruns on
+# every occurrence, exactly as before.  Bounded FIFO eviction mirrors the
+# _MSG_TOKENS_CACHE idiom in agent/model_metadata.py.
+_CANON_ARGS_CACHE: Dict[str, str] = {}
+_CANON_ARGS_CACHE_MAX = 4096
+# Count bound alone doesn't bound MEMORY: write_file/patch argument strings
+# run 100KB+, so 4096 entries could pin ~800MB in a long-lived gateway
+# process. The byte budget keeps the memo effective for the common case
+# (args ~0.5-2KB) while bounding the worst case.
+_CANON_ARGS_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_canon_args_cache_bytes = 0
+
+
+def _canonicalize_tool_call_arguments(arg_str: str) -> str:
+    """Return the canonical wire form of a tool-call arguments JSON string.
+
+    Raises whatever ``json.loads`` raises on malformed input; the caller
+    falls back to ``_repair_tool_call_arguments``, exactly as before.
+    """
+    global _canon_args_cache_bytes
+    cached = _CANON_ARGS_CACHE.get(arg_str)
+    if cached is not None:
+        return cached
+    canonical = json.dumps(
+        json.loads(arg_str), separators=(",", ":"), sort_keys=True,
+    )
+    _CANON_ARGS_CACHE[arg_str] = canonical
+    _canon_args_cache_bytes += len(arg_str) + len(canonical)
+    while len(_CANON_ARGS_CACHE) > _CANON_ARGS_CACHE_MAX or (
+        _canon_args_cache_bytes > _CANON_ARGS_CACHE_MAX_BYTES
+        and len(_CANON_ARGS_CACHE) > 1
+    ):
+        try:
+            evicted_key = next(iter(_CANON_ARGS_CACHE))
+            evicted_val = _CANON_ARGS_CACHE.pop(evicted_key)
+            _canon_args_cache_bytes -= len(evicted_key) + len(evicted_val)
+        except (StopIteration, KeyError, RuntimeError):
+            break
+    return canonical
+
+
+def _canonicalize_api_tool_calls(api_messages) -> None:
+    """Canonicalize tool-call argument JSON on the send-path message copy.
+
+    Rewrites each message's ``tool_calls`` in place (copy-on-write for the
+    tool-call dicts it canonicalizes; the persisted history is untouched).
+    The pass still traverses every message and tool call each iteration;
+    the memo above bounds the JSON parse/serialize work to one round-trip
+    per UNIQUE argument string instead of one per string per iteration —
+    the quadratic part of the cost. The remaining traversal is pointer
+    chasing and dict copies, cheap next to a json.loads + json.dumps.
+    """
+    for am in api_messages:
+        tcs = am.get("tool_calls")
+        if not tcs:
+            continue
+        new_tcs = []
+        for tc in tcs:
+            if isinstance(tc, dict) and "function" in tc:
+                try:
+                    tc = {**tc, "function": {
+                        **tc["function"],
+                        "arguments": _canonicalize_tool_call_arguments(
+                            tc["function"]["arguments"]
+                        ),
+                    }}
+                except Exception:
+                    tc["function"]["arguments"] = _repair_tool_call_arguments(
+                        tc["function"]["arguments"],
+                        tc["function"].get("name", "?"),
+                    )
+            new_tcs.append(tc)
+        am["tool_calls"] = new_tcs
+
+
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     """Error-result content for a tool call whose name isn't a real tool.
 
@@ -1719,29 +1805,7 @@ def run_conversation(
         for am in api_messages:
             if isinstance(am.get("content"), str):
                 am["content"] = am["content"].strip()
-        for am in api_messages:
-            tcs = am.get("tool_calls")
-            if not tcs:
-                continue
-            new_tcs = []
-            for tc in tcs:
-                if isinstance(tc, dict) and "function" in tc:
-                    try:
-                        args_obj = json.loads(tc["function"]["arguments"])
-                        tc = {**tc, "function": {
-                            **tc["function"],
-                            "arguments": json.dumps(
-                                args_obj, separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                        }}
-                    except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
-                        )
-                new_tcs.append(tc)
-            am["tool_calls"] = new_tcs
+        _canonicalize_api_tool_calls(api_messages)
 
         # Proactively strip any surrogate characters before the API call.
         # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return

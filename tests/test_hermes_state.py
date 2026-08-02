@@ -78,6 +78,110 @@ def db(tmp_path):
 
 
 # =========================================================================
+# Connection lifecycle
+# =========================================================================
+
+
+class TestConnectionLifecycle:
+    def test_read_only_close_never_requests_wal_checkpoint(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        writable = SessionDB(db_path=db_path)
+        writable.create_session("s1", source="cli")
+        writable.close()
+
+        executed = []
+        read_only = SessionDB(db_path=db_path, read_only=True)
+        read_only._conn.set_trace_callback(executed.append)
+        read_only.close()
+
+        assert not any("wal_checkpoint" in sql.lower() for sql in executed)
+
+    def test_writable_close_retains_truncate_checkpoint(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        writable = SessionDB(db_path=db_path)
+        executed = []
+        writable._conn.set_trace_callback(executed.append)
+
+        writable.close()
+
+        assert any(
+            "pragma wal_checkpoint(truncate)" == " ".join(sql.lower().split())
+            for sql in executed
+        )
+
+    def test_read_only_connection_keeps_fts_search_available(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        writable = SessionDB(db_path=db_path)
+        writable.create_session("fts-read-only", source="cli")
+        writable.append_message(
+            "fts-read-only",
+            role="user",
+            content="readonlywoodpecker 大别山项目",
+        )
+        writable.close()
+
+        read_only = SessionDB(db_path=db_path, read_only=True)
+        try:
+            base_matches = read_only.search_messages("readonlywoodpecker")
+            trigram_matches = read_only.search_messages("大别山")
+        finally:
+            read_only.close()
+
+        assert [match["session_id"] for match in base_matches] == [
+            "fts-read-only"
+        ]
+        assert [match["session_id"] for match in trigram_matches] == [
+            "fts-read-only"
+        ]
+
+    def test_failed_read_only_open_does_not_leak_tracked_connection(
+        self, tmp_path
+    ):
+        """A malformed store makes the RO FTS probe raise DatabaseError.
+        The connection must be closed on that failure path: a leaked tracked
+        connection blocks _backup_db_file's raw-copy for the process
+        lifetime, so the writable heal that follows would repair WITHOUT its
+        forensic backup."""
+        import sqlite3
+
+        from hermes_cli.sqlite_safe_read import has_live_connection
+
+        db_path = tmp_path / "state.db"
+        writable = SessionDB(db_path=db_path)
+        writable.create_session("s1", source="cli")
+        writable.append_message("s1", role="user", content="leak probe")
+        writable.close()
+
+        # Corrupt sqlite_master: duplicate messages_fts definition. Any
+        # statement on a fresh connection then raises "malformed database
+        # schema" (DatabaseError, not the OperationalError the probe eats).
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn.execute("PRAGMA writable_schema=ON")
+        row = conn.execute(
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master "
+            "WHERE name='messages_fts'"
+        ).fetchone()
+        assert row is not None
+        conn.execute(
+            "INSERT INTO sqlite_master (type,name,tbl_name,rootpage,sql) "
+            "VALUES (?,?,?,?,?)",
+            row,
+        )
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.close()
+
+        with pytest.raises(sqlite3.DatabaseError):
+            SessionDB(db_path=db_path, read_only=True)
+
+        assert has_live_connection(db_path) is False
+
+        # The writable heal must still take its forensic backup.
+        healed = SessionDB(db_path=db_path, read_only=False)
+        healed.close()
+        assert list(tmp_path.glob("*malformed-backup*"))
+
+
+# =========================================================================
 # Session lifecycle
 # =========================================================================
 
@@ -1744,6 +1848,67 @@ class TestVacuum:
         # Should not raise, even though there's nothing significant to reclaim.
         db.vacuum()
 
+    def test_auto_maintenance_records_successful_vacuum(self, db, monkeypatch):
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert result["vacuumed"] is True
+        assert vacuum_calls == [True]
+        assert db.get_meta("last_vacuum") is not None
+
+    def test_auto_maintenance_skips_recent_vacuum(self, db, monkeypatch):
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        db.set_meta("last_vacuum", str(time.time()))
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(
+            min_interval_hours=0,
+            min_vacuum_interval_days=30,
+        )
+
+        assert result["vacuumed"] is False
+        assert vacuum_calls == []
+
+    def test_auto_maintenance_retries_after_vacuum_interval(self, db, monkeypatch):
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        db.set_meta("last_vacuum", str(time.time() - 31 * 86400))
+        vacuum_calls = []
+        monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
+
+        result = db.maybe_auto_prune_and_vacuum(
+            min_interval_hours=0,
+            min_vacuum_interval_days=30,
+        )
+
+        assert result["vacuumed"] is True
+        assert vacuum_calls == [True]
+
+    def test_auto_maintenance_retries_after_failed_vacuum(self, db, monkeypatch):
+        monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
+        vacuum_calls = []
+
+        def fail_first_vacuum():
+            vacuum_calls.append(True)
+            if len(vacuum_calls) == 1:
+                raise RuntimeError("vacuum failed")
+
+        monkeypatch.setattr(db, "vacuum", fail_first_vacuum)
+
+        first = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert first["vacuumed"] is False
+        assert db.get_meta("last_vacuum") is None
+
+        second = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
+
+        assert second["vacuumed"] is True
+        assert vacuum_calls == [True, True]
+        assert db.get_meta("last_vacuum") is not None
+
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
@@ -2153,6 +2318,319 @@ class TestFTSExternalContentMigration:
 
 
 
+
+    def _simulate_pre_fix_demote_crash_window(self, db):
+        """Replay the pre-fix demote crash window: trash + empty v23 schema,
+        no rebuild markers (executescript committed mid-demote before markers).
+
+        Mirrors what happened when ``_ensure_fts_schema`` ran inside
+        ``_execute_write`` and the process died before the marker writes.
+        """
+        from hermes_state import FTS_SQL, FTS_TRIGRAM_SQL
+
+        conn = db._conn
+        db._drop_fts_triggers(conn)
+        conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+        had = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('messages_fts', 'messages_fts_trigram') "
+            "AND sql LIKE 'CREATE VIRTUAL TABLE%' LIMIT 1"
+        ).fetchone())
+        assert had, "sanity: expected legacy/virtual FTS tables to demote"
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "DELETE FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('messages_fts', 'messages_fts_trigram') "
+            "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+        )
+        conn.execute("PRAGMA writable_schema=RESET")
+        shadows = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND (name LIKE 'messages_fts_%' ESCAPE '\\' "
+                "OR name LIKE 'messages_fts_trigram_%' ESCAPE '\\')"
+            ).fetchall()
+        ]
+        for sh in shadows:
+            conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
+        # executescript commits — empty v23 tables without markers.
+        conn.executescript(FTS_SQL)
+        try:
+            conn.executescript(FTS_TRIGRAM_SQL)
+        except sqlite3.OperationalError:
+            pass
+        # Intentionally leave fts_rebuild_* unset (the crash window).
+
+    def test_optimize_resume_after_demote_crash_window_restores_search(
+        self, tmp_path
+    ):
+        """Pre-fix: demote crash left trash + empty v23 index, no markers.
+        Re-run tore down trash and stamped optimized with docsize=0 — permanent
+        search loss for historical rows. Re-run must backfill and restore."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            assert len(db.search_messages("deployment")) == 1
+            self._simulate_pre_fix_demote_crash_window(db)
+            # Crash window shape: no markers, trash present, empty index.
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.get_meta("fts_rebuild_progress") is None
+            assert db._has_fts_trash(db._conn) is True
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_docsize"
+            ).fetchone()[0] == 0
+            assert len(db.search_messages("deployment")) == 0
+
+            # Still offered (trash and/or empty-index heal).
+            assert db.fts_optimize_available() is True
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.fts_rebuild_status() is None
+            assert db.fts_optimize_available() is False
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_v22_trash%'"
+            ).fetchall() == []
+            # Historical rows searchable again; index fully populated.
+            assert len(db.search_messages("deployment")) == 1
+            assert len(db.search_messages("TOOLBLOB")) == 1
+            n_msg = db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            n_fts = db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_docsize"
+            ).fetchone()[0]
+            assert n_fts == n_msg
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
+    def test_optimize_heals_premature_stamp_with_empty_index(self, tmp_path):
+        """Pre-fix settle could stamp fts_storage_version after tearing down
+        trash with an empty index and no markers. Re-run must clear the stamp,
+        backfill, and re-earn the layout version."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            self._simulate_pre_fix_demote_crash_window(db)
+            # Simulate the bad resume: trash already gone, empty index stamped.
+            trash = [
+                r[0] for r in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\'"
+                ).fetchall()
+            ]
+            for tbl in trash:
+                db._conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            db._conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES "
+                "('fts_storage_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(hermes_state.FTS_STORAGE_VERSION),),
+            )
+            db._conn.commit()
+
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db._has_fts_trash(db._conn) is False
+            assert db._fts_external_index_empty_with_messages(db._conn) is True
+            # Must still be offered despite the premature stamp.
+            assert db.fts_optimize_available() is True
+            assert len(db.search_messages("deployment")) == 0
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert len(db.search_messages("deployment")) == 1
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            assert db.fts_optimize_available() is False
+        finally:
+            db.close()
+
+    def test_optimize_heals_high_water_without_progress(self, tmp_path):
+        """high_water without progress used to make fts_rebuild_step return
+        False immediately (treated as finished by another process), then
+        settle stamped success while the marker remained. Re-seed progress
+        and complete the empty-index backfill."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+        db = SessionDB(db_path=db_path)
+        try:
+            self._simulate_pre_fix_demote_crash_window(db)
+            hw = db._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()[0]
+            # Orphan shape: high_water alone on an empty external index.
+            db.set_meta("fts_rebuild_high_water", str(hw))
+            db._conn.execute(
+                "DELETE FROM state_meta WHERE key = ?", ("fts_rebuild_progress",)
+            )
+            db._conn.commit()
+            assert db.get_meta("fts_rebuild_progress") is None
+            assert db.fts_optimize_available() is True
+            # Empty index: base FTS MATCH finds nothing (gap LIKE may still
+            # supplement when high_water is set — that is intentional).
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_docsize"
+            ).fetchone()[0] == 0
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.get_meta("fts_rebuild_progress") is None
+            n_msg = db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            n_fts = db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_docsize"
+            ).fetchone()[0]
+            assert n_fts == n_msg
+            assert len(db.search_messages("deployment")) == 1
+            assert db.fts_optimize_available() is False
+        finally:
+            db.close()
+
+    def test_repair_rebuilds_partial_index_without_duplicates(self, tmp_path):
+        """high_water without progress on a PARTIALLY indexed DB must not
+        replay the backfill from zero on top of surviving rows: the chunk
+        worker inserts its whole id range with no anti-join, so replay
+        duplicates every already-indexed row. Recovery must reset the index
+        to a known-empty surface first, then rebuild."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+        db = SessionDB(db_path=db_path)
+        try:
+            self._simulate_pre_fix_demote_crash_window(db)
+            hw = db._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()[0]
+            db.set_meta("fts_rebuild_high_water", str(hw))
+            db._conn.execute(
+                "DELETE FROM state_meta WHERE key = ?", ("fts_rebuild_progress",)
+            )
+            # Partial index: one row survived from an interrupted backfill.
+            db._conn.execute(
+                "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
+                "SELECT id, content, tool_name, tool_calls FROM messages "
+                "WHERE id = 1"
+            )
+            db._conn.commit()
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_docsize"
+            ).fetchone()[0] == 1
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            n_msg = db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            n_fts = db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_docsize"
+            ).fetchone()[0]
+            # Exactly one index entry per message: no replay duplicates.
+            assert n_fts == n_msg
+            assert len(db.search_messages("deployment")) == 1
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
+    def test_repair_bookkeeping_reseeds_missing_progress(self, tmp_path):
+        """Unit: high_water without progress gets progress='0' without
+        forcing a full marker reset when a real backfill is already claimed."""
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="bookkeeping needle")
+            db.set_meta("fts_rebuild_high_water", "42")
+            db._conn.execute(
+                "DELETE FROM state_meta WHERE key = ?", ("fts_rebuild_progress",)
+            )
+            db._conn.commit()
+            db._repair_optimize_bookkeeping()
+            assert db.get_meta("fts_rebuild_high_water") == "42"
+            assert db.get_meta("fts_rebuild_progress") == "0"
+        finally:
+            db.close()
+
+    def test_demote_writes_markers_before_empty_schema(self, tmp_path):
+        """Demote must commit rebuild markers before createscript builds the
+        empty v23 tables — so a crash between stage and ensure still leaves
+        a resumable claim rather than an unmarked empty index."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+        db = SessionDB(db_path=db_path)
+        try:
+            # Patch ensure to fail *after* the staged write commits, simulating
+            # death mid schema-create. Markers must already be durable.
+            orig_ensure = db._ensure_fts_schema
+            calls = {"n": 0}
+
+            def boom(cursor, table_name, ddl):
+                calls["n"] += 1
+                if table_name == "messages_fts":
+                    # Markers must already be on disk from the staged write.
+                    row = db._conn.execute(
+                        "SELECT value FROM state_meta "
+                        "WHERE key = 'fts_rebuild_high_water'"
+                    ).fetchone()
+                    assert row is not None, (
+                        "markers must be committed before empty v23 schema create"
+                    )
+                    progress = db._conn.execute(
+                        "SELECT value FROM state_meta "
+                        "WHERE key = 'fts_rebuild_progress'"
+                    ).fetchone()
+                    assert progress is not None and progress[0] == "0"
+                    raise sqlite3.OperationalError("simulated crash mid-ensure")
+                return orig_ensure(cursor, table_name, ddl)
+
+            db._ensure_fts_schema = boom  # type: ignore[method-assign]
+            try:
+                db._demote_legacy_fts_to_trash()
+                raise AssertionError("demote should have raised")
+            except sqlite3.OperationalError as exc:
+                assert "simulated crash" in str(exc)
+
+            # Staged demote survived: markers + trash, no successful stamp.
+            assert db.get_meta("fts_rebuild_high_water") is not None
+            assert db.get_meta("fts_rebuild_progress") == "0"
+            assert db._has_fts_trash(db._conn) is True
+            assert db.get_meta("fts_storage_version") is None
+
+            # Restore ensure and resume — full optimize completes.
+            db._ensure_fts_schema = orig_ensure  # type: ignore[method-assign]
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert len(db.search_messages("deployment")) == 1
+            assert db.fts_optimize_available() is False
+        finally:
+            db.close()
+
+    def test_optimize_settle_refuses_pending_backfill(self, tmp_path):
+        """Settle must not stamp while high_water markers remain."""
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="settle guard needle")
+            # Plant markers without going through demote.
+            db.set_meta("fts_rebuild_high_water", "1")
+            db.set_meta("fts_rebuild_progress", "0")
+            # The public contract: optimize returns ok=False when still
+            # pending. Simulate an unfinishable backfill by stubbing the
+            # chunk step to a no-op while markers stay.
+            db.fts_rebuild_step = lambda: False  # type: ignore[method-assign]
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is False
+            assert result.get("reason") == "backfill_incomplete"
+            assert db.get_meta("fts_storage_version") is None
+            assert db.get_meta("fts_rebuild_high_water") is not None
+        finally:
+            db.close()
 
     def test_v23_fresh_db_born_optimized(self, tmp_path):
         """A brand-new DB is born on v23 — no legacy layout, no opt-in flag,

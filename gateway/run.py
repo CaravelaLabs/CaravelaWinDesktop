@@ -59,6 +59,7 @@ from agent.conversation_compression import (
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -2204,6 +2205,7 @@ from gateway.config import (
     _BUILTIN_PLATFORM_VALUES,
     GatewayConfig,
     PlatformConfig,
+    _getenv,
     load_gateway_config,
 )
 from gateway.session import (
@@ -2293,11 +2295,11 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         extra = getattr(platform_config, "extra", None) or {}
         dm_policy = str(
             extra.get("dm_policy")
-            or (os.getenv(dm_env, "pairing") if dm_env else "pairing")
+            or (_getenv(dm_env, "pairing") if dm_env else "pairing")
         ).strip().lower()
         group_policy = str(
             extra.get("group_policy")
-            or (os.getenv(group_env, "pairing") if group_env else "pairing")
+            or (_getenv(group_env, "pairing") if group_env else "pairing")
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
@@ -2306,7 +2308,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         ).lower() in {"true", "1", "yes"}
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and os.getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and _getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue
@@ -2779,9 +2781,9 @@ def _abandon_timed_out_gateway_turn(
         timeout_fired.set()
 
     agent = agent_holder[0] if agent_holder else None
-    if agent is not None and hasattr(agent, "interrupt"):
+    if agent is not None:
         try:
-            agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+            request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT)
         except Exception:
             logger.debug("Timed-out agent interrupt failed", exc_info=True)
 
@@ -6001,6 +6003,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._session_db._db.maybe_auto_prune_and_vacuum(
                         retention_days=int(_sess_cfg.get("retention_days", 90)),
                         min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                        min_vacuum_interval_days=int(
+                            _sess_cfg.get("min_vacuum_interval_days", 30)
+                        ),
                         vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
                         sessions_dir=self.config.sessions_dir,
                     )
@@ -9041,7 +9046,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
-                agent.interrupt(reason)
+                request_hard_interrupt(agent, reason)
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
@@ -11512,9 +11517,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             dest_chat_type = "dm"
             dest_user_id = home_chat_id if is_telegram_private_chat else "system:handoff"
 
+        # Discord thread destinations must key on the thread's OWN id, not the
+        # parent channel's, because the Discord adapter builds organic in-thread
+        # messages with ``chat_id == thread id`` — so ``build_session_key``
+        # yields ``…:thread:{thread}:{thread}``. If the handoff keys on the
+        # parent channel (``…:thread:{parent}:{thread}``) the next real user
+        # reply in the thread resolves to a DIFFERENT session_key and spawns a
+        # fresh session instead of continuing the handed-off one.
+        #
+        # This is Discord-specific: Slack and Telegram adapters key organic
+        # thread messages with ``chat_id == parent_channel`` and the thread
+        #/topic id only in ``thread_id``, so for those platforms the parent
+        # channel is correct (and the deeper chat_type normalization — handoff
+        # uses "thread" but Slack organic uses "group" — is a separate issue).
+        if platform == Platform.DISCORD and dest_chat_type == "thread" and effective_thread_id:
+            dest_chat_id = str(effective_thread_id)
+        else:
+            dest_chat_id = home_chat_id
         dest_source = SessionSource(
             platform=platform,
-            chat_id=home_chat_id,
+            chat_id=dest_chat_id,
             chat_name=home.name,
             chat_type=dest_chat_type,
             user_id=dest_user_id,
@@ -19057,14 +19079,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         not exist at ingest, so no markers can be present and the native lane
         check never matches on the relay title turn (staging repro
         2026-07-29: initial titles fine, semantic renames never happened).
-        The connector reports where the reply actually landed on the send
-        result (contract §SendResult thread_id/auto_thread_name); the relay
-        adapter caches it per chat and this reads it back.
+
+        Preferred path: the connector stamps ``prospective_thread_id`` on the
+        inbound (the anchor message id, which IS the id of the thread it will
+        auto-create). It's deterministic and per-message, so it identifies the
+        EXACT thread even when several auto-threads spawn from one channel —
+        unlike the send-result cache below, which held a single slot per parent
+        chat and so only the FIRST thread in a channel ever renamed (staging
+        repro 2026-08-02: thread A renamed, sibling thread B stuck at raw
+        text). The connector's own created-name guard (prefer_connector_created)
+        enforces no-clobber, so no initial name is needed here.
+
+        Fallback: the connector reports where the reply actually landed on the
+        send result (contract §SendResult thread_id/auto_thread_name); the
+        relay adapter caches it per chat and this reads it back — kept for
+        older connectors that don't stamp prospective_thread_id.
         """
         if source.platform != Platform.DISCORD or not source.chat_id:
             return None
         if not getattr(source, "delivered_via_upstream_relay", False):
             return None
+        prospective = getattr(source, "prospective_thread_id", None)
+        if prospective:
+            # Deterministic per-thread identity; the empty initial-name marker
+            # signals the caller to rely on the connector-side no-clobber guard.
+            return (str(prospective), "")
         adapter = self._adapter_for_source(source)
         info_fn = getattr(adapter, "auto_thread_info_for_chat", None)
         if not callable(info_fn):
@@ -20577,6 +20616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            cron_session="",
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -22286,7 +22326,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _process_task_id = ""
         _process_baseline = None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            running_agent.interrupt(interrupt_reason)
+            request_hard_interrupt(running_agent, interrupt_reason)
             _process_task_id = getattr(
                 running_agent, "_gateway_turn_process_task_id", ""
             )
@@ -23069,7 +23109,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "tools": [],
             }
 
-        proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        # Scope-aware read: the proxy key is a per-profile credential; under
+        # multiplex honor the installed scope's verdict (Slack pattern for
+        # the unscoped default-profile loop).
+        try:
+            from agent.secret_scope import UnscopedSecretError, get_secret
+
+            try:
+                proxy_key = (get_secret("GATEWAY_PROXY_KEY") or "").strip()
+            except UnscopedSecretError:
+                proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        except Exception:
+            proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -24526,8 +24577,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
-                if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
-                    _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                if _timed_out_agent:
+                    request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT)
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
@@ -25302,6 +25353,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
     AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
+    MEMORY_TRIM_EVERY = 1    # shared helper cooldown bounds actual allocator work
 
     # Every platform media cache prunes on the same hourly cadence — one loop
     # over (name, cleanup_fn), not a copy-pasted try/except per cache.
@@ -25409,6 +25461,25 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                         _adb.close()
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
+
+        # This is the long-lived messaging-gateway counterpart to the TUI idle
+        # reaper. The helper is config-gated and rate-limited, so calling it on
+        # the 60s housekeeping cadence does not create a trim storm.
+        if tick_count % MEMORY_TRIM_EVERY == 0:
+            try:
+                from hermes_cli.mem_trim import trim_memory
+
+                trim_memory(reason="messaging gateway housekeeping")
+            except Exception as exc:
+                # debug, not warning: sibling housekeeping branches all log
+                # failures at debug, and a persistent failure (e.g. broken
+                # import after a partial update) would otherwise warn every
+                # 60s forever.
+                logger.debug(
+                    "gateway housekeeping memory trim failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
 
         stop_event.wait(timeout=interval)
     logger.info("Gateway housekeeping stopped")

@@ -838,34 +838,37 @@ class VoiceReceiver:
     @staticmethod
     def pcm_to_wav(pcm_data: bytes, output_path: str,
                    src_rate: int = 48000, src_channels: int = 2):
-        """Convert raw PCM to 16kHz mono WAV via ffmpeg."""
-        with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as f:
-            f.write(pcm_data)
-            pcm_path = f.name
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+        """Convert raw PCM to 16kHz mono WAV via ffmpeg.
 
-            subprocess.run(
-                [
-                    resolve_ffmpeg_executable(), "-y", "-loglevel", "error",
-                    "-f", "s16le",
-                    "-ar", str(src_rate),
-                    "-ac", str(src_channels),
-                    "-i", pcm_path,
-                    "-ar", "16000",
-                    "-ac", "1",
-                    output_path,
-                ],
-                check=True,
-                timeout=10,
-                stdin=subprocess.DEVNULL,
-                creationflags=windows_hide_flags(),
-            )
-        finally:
-            try:
-                os.unlink(pcm_path)
-            except OSError:
-                pass
+        The PCM is fed straight to ffmpeg's stdin, which avoids staging it in a
+        temp file on every utterance. The WAV is still written to *output_path*
+        rather than captured from stdout: ffmpeg cannot seek on a pipe, so a
+        piped WAV carries placeholder (0xFFFFFFFF) RIFF/data sizes that make
+        strict readers misreport the length.
+        """
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        subprocess.run(
+            [
+                resolve_ffmpeg_executable(), "-y", "-loglevel", "error",
+                "-f", "s16le",
+                "-ar", str(src_rate),
+                "-ac", str(src_channels),
+                "-i", "pipe:0",
+                "-ar", "16000",
+                "-ac", "1",
+                output_path,
+            ],
+            input=pcm_data,
+            check=True,
+            timeout=10,
+            # Capture ffmpeg's -loglevel error output so a failure's
+            # CalledProcessError carries the actual message (parity with
+            # tools/transcription_tools' ffmpeg call sites) instead of
+            # "returned non-zero exit status N" with stderr detached.
+            stderr=subprocess.PIPE,
+            creationflags=windows_hide_flags(),
+        )
 
 
 def _read_dm_role_auth_guild() -> Optional[int]:
@@ -4481,7 +4484,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     transcript=transcript,
                 )
         except Exception as e:
-            logger.warning("Voice input processing failed: %s", e, exc_info=True)
+            # CalledProcessError from pcm_to_wav carries ffmpeg's captured
+            # stderr — surface it, or the log only says "exit status N".
+            _ff_err = getattr(e, "stderr", None)
+            if _ff_err:
+                if isinstance(_ff_err, bytes):
+                    _ff_err = _ff_err.decode("utf-8", "replace")
+                logger.warning(
+                    "Voice input processing failed: %s (ffmpeg: %s)",
+                    e, _ff_err.strip(), exc_info=True,
+                )
+            else:
+                logger.warning("Voice input processing failed: %s", e, exc_info=True)
         finally:
             try:
                 os.unlink(wav_path)
@@ -9486,7 +9500,14 @@ async def _standalone_send(
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
 
-    token = (getattr(pconfig, "token", None) or os.getenv("DISCORD_BOT_TOKEN", "")).strip()
+    token = (getattr(pconfig, "token", None) or "").strip()
+    if not token:
+        # Profile-scoped read: under multiplex the process env may hold a
+        # different profile's bot token, so honor the secret scope's verdict
+        # (scoped miss ⇒ no token; unscoped multiplex ⇒ UnscopedSecretError).
+        from agent.secret_scope import get_secret
+
+        token = (get_secret("DISCORD_BOT_TOKEN", "") or "").strip()
     if not token:
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
 

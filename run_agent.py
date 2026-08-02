@@ -115,6 +115,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent.interrupt_compat import request_hard_interrupt
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -2976,7 +2977,7 @@ class AIAgent:
                 logging.warning(f"Failed to save session log: {e}")
 
 
-    def interrupt(self, message: str = None) -> None:
+    def interrupt(self, message: Optional[str] = None, *, hard_cancel: bool = False) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
         
@@ -2989,6 +2990,9 @@ class AIAgent:
         Args:
             message: Optional new message that triggered the interrupt.
                      If provided, the agent will include this in its response context.
+            hard_cancel: Mark this as an explicit stop rather than a redirect or
+                         incoming-message interrupt. Compression may honor this
+                         atomic signal even while ordinary interrupts are masked.
         
         Example (CLI):
             # In a separate input thread:
@@ -3002,15 +3006,41 @@ class AIAgent:
         """
         # A hard stop and redirect share one lock so /stop cannot race with an
         # accepted correction and accidentally turn itself into a retry.
+        def _admit_hard_cancel() -> None:
+            event = getattr(self, "_hard_interrupt_requested", None)
+            if event is None:
+                return
+            fence = vars(self).get("_active_compression_commit_fence")
+            cancel_before_commit = getattr(
+                type(fence), "cancel_before_commit", None
+            )
+            if callable(cancel_before_commit):
+                try:
+                    # This sets the Event while holding the same lock used by
+                    # begin_commit(). If commit already won, it waits for that
+                    # tracked mutation to finish before publishing the stop.
+                    cancel_before_commit(fence, event)
+                    return
+                except Exception:
+                    logger.debug(
+                        "Compression hard-cancel fence admission failed",
+                        exc_info=True,
+                    )
+            event.set()
+
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
                 self._interrupt_requested = True
                 self._interrupt_message = message
+                if hard_cancel:
+                    _admit_hard_cancel()
                 self._pending_redirect = None
         else:
             self._interrupt_requested = True
             self._interrupt_message = message
+            if hard_cancel:
+                _admit_hard_cancel()
             self._pending_redirect = None
 
         # Codex app-server owns its model/tool loop and watches a private
@@ -3073,11 +3103,25 @@ class AIAgent:
             children_copy = list(self._active_children)
         for child in children_copy:
             try:
-                child.interrupt(message)
+                if hard_cancel:
+                    request_hard_interrupt(child, message)
+                else:
+                    child.interrupt(message)
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
+
+    def hard_interrupt(self, message: Optional[str] = None) -> None:
+        """Request an explicit stop while preserving ``interrupt()`` ABI.
+
+        Frontends can feature-detect this method and fall back to the legacy
+        ``interrupt()`` signature for synthetic or third-party agents.
+        """
+        # Deliberately bypass dynamic dispatch: subclasses written against the
+        # legacy interrupt(message=None) ABI may override interrupt without the
+        # newer keyword-only hard_cancel argument.
+        AIAgent.interrupt(self, message, hard_cancel=True)
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
@@ -3093,6 +3137,7 @@ class AIAgent:
                     return False
                 self._interrupt_requested = False
                 self._interrupt_message = None
+                getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
                 if not preserve_redirect:
                     self._pending_redirect = None
         else:
@@ -3100,6 +3145,7 @@ class AIAgent:
                 return False
             self._interrupt_requested = False
             self._interrupt_message = None
+            getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None
         self._interrupt_thread_signal_pending = False
@@ -4082,6 +4128,15 @@ class AIAgent:
         # still holds the closed agent (e.g. a draining background task).
         try:
             self._session_messages = []
+        except Exception:
+            pass
+
+        # The references above are now gone; on Linux/glibc, return their free
+        # heap pages immediately instead of retaining the process RSS high-water
+        # mark until exit.  This helper is a safe no-op on other allocators.
+        try:
+            from hermes_cli.mem_trim import trim_memory
+            trim_memory(force=True, reason="agent close")
         except Exception:
             pass
 
@@ -5075,10 +5130,12 @@ class AIAgent:
             if self.provider == "openai-codex":
                 from hermes_cli.auth import resolve_codex_runtime_credentials
 
+                old_key = str(self.api_key or "").strip()
                 creds = resolve_codex_runtime_credentials(force_refresh=force)
             else:
                 from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
+                old_key = str(self.api_key or "").strip()
                 creds = resolve_xai_oauth_runtime_credentials(force_refresh=force)
         except Exception as exc:
             logger.debug("%s credential refresh failed: %s", self.provider, exc)
@@ -5089,6 +5146,19 @@ class AIAgent:
         if not isinstance(api_key, str) or not api_key.strip():
             return False
         if not isinstance(base_url, str) or not base_url.strip():
+            return False
+
+        # Defect 2 fix: return False when no NEW token was actually minted.
+        # resolve_codex_runtime_credentials returns the same stale token
+        # when the underlying refresh fails (failure is debug-only).
+        # Comparing the access token (api_key) before/after detects this.
+        new_key = api_key.strip()
+        if old_key and new_key == old_key:
+            logger.debug(
+                "%s credential refresh returned the same token; "
+                "refresh likely failed silently",
+                self.provider,
+            )
             return False
 
         self.api_key = api_key.strip()
@@ -6907,7 +6977,10 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
-        from agent.conversation_compression import compress_context
+        from agent.conversation_compression import (
+            CompressionCommitFence,
+            compress_context,
+        )
         from agent.portal_tags import (
             get_conversation_context,
             reset_conversation_context,
@@ -6932,19 +7005,39 @@ class AIAgent:
             root = self._conversation_root_id()
             if root:
                 token = set_conversation_context(root)
-        try:
-            return compress_context(
-                self, messages, system_message,
-                approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
-                force=force,
-                defer_context_engine_notification=defer_context_engine_notification,
-                commit_fence=commit_fence,
+        # Every AIAgent compression has a fence, including ordinary in-turn and
+        # manual paths. hard_interrupt() uses this exact instance to serialize
+        # cancel admission against begin_commit().
+        active_fence = commit_fence or CompressionCommitFence()
+        # A single agent can receive overlapping automatic/manual entrypoints.
+        # Serialize fence publication so a waiter cannot replace the fence of
+        # the attempt currently generating/committing a summary.
+        fence_registration_lock = vars(self).setdefault(
+            "_compression_commit_fence_lock", threading.RLock()
+        )
+        with fence_registration_lock:
+            missing_fence = object()
+            previous_fence = vars(self).get(
+                "_active_compression_commit_fence", missing_fence
             )
-        finally:
-            # Restore whatever the caller had, so a compaction never leaks its
-            # tag into the surrounding scope.
-            if token is not None:
-                reset_conversation_context(token)
+            self._active_compression_commit_fence = active_fence
+            try:
+                return compress_context(
+                    self, messages, system_message,
+                    approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
+                    force=force,
+                    defer_context_engine_notification=defer_context_engine_notification,
+                    commit_fence=active_fence,
+                )
+            finally:
+                if previous_fence is missing_fence:
+                    vars(self).pop("_active_compression_commit_fence", None)
+                else:
+                    self._active_compression_commit_fence = previous_fence
+                # Restore whatever the caller had, so a compaction never leaks its
+                # tag into the surrounding scope.
+                if token is not None:
+                    reset_conversation_context(token)
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""

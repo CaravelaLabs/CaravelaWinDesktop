@@ -159,10 +159,12 @@ def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
         )
         return False
 
-    has_oidc = bool(os.getenv("VERCEL_OIDC_TOKEN"))
-    has_token = bool(os.getenv("VERCEL_TOKEN"))
-    has_project = bool(os.getenv("VERCEL_PROJECT_ID"))
-    has_team = bool(os.getenv("VERCEL_TEAM_ID"))
+    from agent.secret_scope import get_secret
+
+    has_oidc = bool(get_secret("VERCEL_OIDC_TOKEN"))
+    has_token = bool(get_secret("VERCEL_TOKEN"))
+    has_project = bool(get_secret("VERCEL_PROJECT_ID"))
+    has_team = bool(get_secret("VERCEL_TEAM_ID"))
 
     if has_oidc:
         return True
@@ -187,8 +189,24 @@ def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
     return False
 
 
+# Cache for disk usage warning to avoid full rglob scan on every call.
+# The check is advisory-only — staleness for up to 5 minutes is acceptable.
+_disk_usage_cache: dict = {"timestamp": 0.0, "result": False}
+_DISK_USAGE_CACHE_TTL = 300.0  # seconds
+
+
 def _check_disk_usage_warning():
-    """Check if total disk usage exceeds warning threshold."""
+    """Check if total disk usage exceeds warning threshold.
+
+    Result is cached for :data:`_DISK_USAGE_CACHE_TTL` seconds (default:
+    5 minutes) to avoid an expensive recursive filesystem scan on every
+    terminal command.  The check is advisory-only so a stale result is
+    harmless.
+    """
+    import time as _time_mod
+    now = _time_mod.monotonic()
+    if now - _disk_usage_cache["timestamp"] < _DISK_USAGE_CACHE_TTL:
+        return _disk_usage_cache["result"]
     try:
         scratch_dir = _get_scratch_dir()
 
@@ -205,14 +223,16 @@ def _check_disk_usage_warning():
         
         total_gb = total_bytes / (1024 ** 3)
         
-        if total_gb > DISK_USAGE_WARNING_THRESHOLD_GB:
+        exceeded = total_gb > DISK_USAGE_WARNING_THRESHOLD_GB
+        if exceeded:
             logger.warning("Disk usage (%.1fGB) exceeds threshold (%.0fGB). Consider running cleanup_all_environments().",
                            total_gb, DISK_USAGE_WARNING_THRESHOLD_GB)
-            return True
-        
-        return False
+        _disk_usage_cache["timestamp"] = _time_mod.monotonic()
+        _disk_usage_cache["result"] = exceeded
+        return exceeded
     except Exception as e:
         logger.debug("Disk usage warning check failed: %s", e, exc_info=True)
+        # Don't update cache on error so the next call retries.
         return False
 
 
@@ -977,9 +997,21 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     if sudo_count == 0:
         return command, None
 
-    has_configured_password = "SUDO_PASSWORD" in os.environ
+    # Scope-aware read (Slack pattern): under multiplex the process env may
+    # hold another profile's SUDO_PASSWORD, so honor the installed scope's
+    # verdict; unscoped callers keep the legacy os.environ read.
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
+
+        try:
+            _configured_password = get_secret("SUDO_PASSWORD")
+        except UnscopedSecretError:
+            _configured_password = os.environ.get("SUDO_PASSWORD")
+    except Exception:
+        _configured_password = os.environ.get("SUDO_PASSWORD")
+    has_configured_password = _configured_password is not None
     sudo_password = (
-        os.environ.get("SUDO_PASSWORD", "")
+        _configured_password
         if has_configured_password
         else _get_cached_sudo_password()
     )
@@ -3177,7 +3209,8 @@ def check_terminal_requirements() -> bool:
 
         elif env_type == "daytona":
             from daytona import Daytona  # noqa: F401 — SDK presence check
-            return os.getenv("DAYTONA_API_KEY") is not None
+            from agent.secret_scope import get_secret
+            return get_secret("DAYTONA_API_KEY") is not None
 
         else:
             logger.error(

@@ -884,6 +884,17 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
+            # Undecodable bytes: the terminal env decodes stdout with
+            # errors="replace", so any non-UTF-8 byte arrives here already
+            # turned into U+FFFD. That char is "printable" (ord 65533), so the
+            # non-printable ratio below never catches it — and returning the
+            # lossy text would let a read→edit→write round-trip silently
+            # overwrite the original bytes with mojibake. Treat a file whose
+            # sample carries the replacement char as binary (read-only) so the
+            # agent can't corrupt it. Legitimate UTF-8 text effectively never
+            # contains U+FFFD.
+            if "\ufffd" in content_sample[:1000]:
+                return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
@@ -1005,7 +1016,16 @@ class ShellFileOperations(FileOperations):
         #  - `chmod --reference` is GNU-only, so we read the octal mode with
         #    `stat` (GNU `-c%a` or BSD `-f%Lp`) and `chmod` it explicitly;
         #    silent best-effort — a perms-copy failure must not abort the
-        #    write, the file still lands with default umask perms.
+        #    write (the file then lands at mktemp's 0600, same as pre-fix).
+        #  - brand-new targets get `chmod "=rw"` — the POSIX who-less
+        #    symbolic form, which sets rw minus the process umask (e.g.
+        #    0644 under umask 022) instead of mktemp's hardcoded 0600
+        #    (#70856).  Deliberately NOT shell arithmetic on `$(umask)`:
+        #    zsh (reachable via _find_bash's $SHELL fallback) parses
+        #    leading-zero constants as decimal and silently computes a
+        #    garbage mode, while `chmod "=rw"` is spec-identical in
+        #    bash/dash/ash/zsh and degrades to 0600 (pre-fix behavior)
+        #    if an exotic chmod rejects it.
         #  - `trap ... EXIT` guarantees the temp is removed on every error
         #    path (cat failure, mv failure, signal) but NOT after a
         #    successful mv (the temp no longer exists by then).
@@ -1013,17 +1033,31 @@ class ShellFileOperations(FileOperations):
         script = (
             "set -e; "
             f"d={q_parent}; t={q_path}; "
+            # Follow a symlink target so we edit the file the link points at,
+            # rather than replacing the symlink itself with a plain file (which
+            # orphans the real target and destroys the link). Recompute the
+            # temp dir from the RESOLVED target so `mv` stays same-filesystem
+            # atomic. Best-effort: a broken link or missing readlink/realpath
+            # falls back to the original path (pre-fix behavior, no regression).
+            'if [ -L "$t" ]; then '
+            'rt="$(readlink -f "$t" 2>/dev/null || realpath "$t" 2>/dev/null || true)"; '
+            '[ -n "$rt" ] && { t="$rt"; d="$(dirname "$t")"; }; '
+            "fi; "
             'tmp="$(mktemp -p "$d" ' + tmpl + ' 2>/dev/null '
             '|| mktemp "$d/.hermes-tmp.$$.XXXXXX" 2>/dev/null '
             '|| { tmp="$d/.hermes-tmp.$$"; : > "$tmp" && echo "$tmp"; })"; '
             '[ -n "$tmp" ] || { echo "atomic write: could not create temp file" >&2; exit 1; }; '
-            "trap 'rm -f \"$tmp\"' EXIT; "
+            "trap 'rm -f \\\"$tmp\\\"' EXIT; "
             # preserve mode of an existing target (best-effort, never fatal)
             'if [ -e "$t" ]; then '
             'm="$(stat -c%a "$t" 2>/dev/null || stat -f%Lp "$t" 2>/dev/null || true)"; '
             '[ -n "$m" ] && chmod "$m" "$tmp" 2>/dev/null || true; '
             "fi; "
             'cat > "$tmp"; '
+            # new file: umask-default perms instead of mktemp's 0600 (#70856).
+            # Runs AFTER cat so a write-masking umask can't EACCES the stream;
+            # quoted "=rw" so zsh doesn't =word-expand it.
+            'if [ ! -e "$t" ]; then chmod "=rw" "$tmp" 2>/dev/null || true; fi; '
             'mv -f "$tmp" "$t"; '
             "trap - EXIT"
         )

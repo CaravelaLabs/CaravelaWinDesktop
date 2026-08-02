@@ -339,6 +339,7 @@ export interface HermesConfig {
   }
   terminal?: {
     cwd?: string
+    font_family?: string
   }
   stt?: {
     enabled?: boolean
@@ -524,6 +525,15 @@ export type TimelineDisplayMetadata =
       failed_count?: number
       duration_seconds?: number
     }
+  | { reactions: MessageReaction[] }
+
+/** One emoji reaction on a message. One per author, iOS-Tapback style. */
+export interface MessageReaction {
+  emoji: string
+  author: 'agent' | 'user'
+  /** Epoch seconds. */
+  at: number
+}
 
 export interface SessionMessage {
   codex_reasoning_items?: unknown
@@ -540,6 +550,17 @@ export interface SessionMessage {
    */
   display_metadata?: string | TimelineDisplayMetadata
   role: 'assistant' | 'system' | 'tool' | 'user'
+  /**
+   * Durable `messages.id` from the backend. The renderer's own message ids are
+   * ephemeral (derived from timestamp+index, and a different shape for live vs
+   * rehydrated vs optimistic rows), so anything addressing a specific persisted
+   * message — reactions — keys off this. Absent on a backend older than this app.
+   *
+   * The gateway resume path names it `row_id`; the REST transcript path
+   * (`SELECT *`) ships the same value as a numeric `id`. Read both.
+   */
+  row_id?: number
+  id?: number
   text?: unknown
   timestamp?: number
   tool_call_id?: null | string

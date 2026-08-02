@@ -1,16 +1,16 @@
 import { memo, useState } from 'react'
 
+import { composerFloatingPill } from '@/components/chat/composer-dock'
 import { Codicon } from '@/components/ui/codicon'
+import { useSessionSlice } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import type { ComposerAction } from '@/store/composer-actions'
+import { $composerActionsBySession, type ComposerAction } from '@/store/composer-actions'
 import { notifyError } from '@/store/notifications'
 
 /**
- * Floating pill — the treatment the thread's jump/approval button uses for a
- * control that sits over scrolling content: full radius, hairline border, the
- * shared composer fill behind a blur so thread text never bleeds through.
- * Sized against the composer's own control height so a row of pills lines up
- * with the chrome it floats above.
+ * Floating pill — the shared treatment for a control that sits over the
+ * composer (`composerFloatingPill`), plus this strip's own width cap and
+ * disabled state.
  *
  * NEVER `pointer-events-none`, not even when disabled. The pop-out drag region
  * is an `absolute` sibling behind these pills, so a pill that stops taking
@@ -18,10 +18,8 @@ import { notifyError } from '@/store/notifications'
  * becomes a grab handle that floats the composer.
  */
 const PILL = cn(
-  'inline-flex h-(--composer-control-size) max-w-56 shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-2.5',
-  'border border-border/65 bg-(--composer-fill) backdrop-blur-[0.75rem] [-webkit-backdrop-filter:blur(0.75rem)]',
-  'text-xs font-normal text-(--ui-text-secondary) transition-colors',
-  'hover:bg-(--chrome-action-hover) hover:text-foreground',
+  composerFloatingPill,
+  'max-w-56',
   'disabled:cursor-default disabled:opacity-50 disabled:hover:bg-(--composer-fill)',
   'focus-visible:outline-none focus-visible:ring-[0.1875rem] focus-visible:ring-ring/50'
 )
@@ -31,19 +29,14 @@ const PILL = cn(
  * (`composerFloatingStrip`), this owns only the pills, so the strip above the
  * surface and the `composer.underside` strip below it can't drift apart.
  */
-export const ActionBadges = memo(function ActionBadges({
-  actions,
-  sessionId
-}: {
-  actions: ComposerAction[]
-  sessionId: string
-}) {
+export const ActionBadges = memo(function ActionBadges({ sessionId }: { sessionId: null | string }) {
+  const actions = useSessionSlice($composerActionsBySession, sessionId)
   // A pill can kick off async work (a gateway call, a submit). Track which one
   // is in flight so it can spin and lock instead of double-firing.
   const [runningId, setRunningId] = useState<null | string>(null)
 
   const run = async (action: ComposerAction) => {
-    if (runningId) {
+    if (runningId || !sessionId) {
       return
     }
 

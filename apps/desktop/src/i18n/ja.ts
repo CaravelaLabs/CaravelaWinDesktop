@@ -133,6 +133,7 @@ export const ja = defineLocale({
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT には ELEVENLABS_API_KEY が必要です。',
       elevenLabsRejectedKey: 'ElevenLabs が API キーを拒否しました (401)。',
+      diskFull: 'ディスク容量不足です — 空きを作ってからもう一度お試しください。',
       gatewayAuthFailed: 'ゲートウェイ認証に失敗しました — API_SERVER_KEY を確認してください。',
       methodNotAllowed:
         'デスクトップバックエンドがそのリクエストを拒否しました (405 Method Not Allowed)。Caravela Desktop を再起動してください。',
@@ -314,10 +315,19 @@ export const ja = defineLocale({
       uiScaleTitle: 'UI スケール',
       uiScaleDesc: (percent: number) =>
         `アプリ全体の文字と UI を拡大縮小します。Cmd/Ctrl と +、-、0 でも変更できます。現在: ${percent}%`,
+      terminalFontTitle: 'ターミナルフォント',
+      terminalFontDesc:
+        'Desktop のターミナルで使用するインストール済みフォントを選びます。Nerd Font は Powerlevel10k とシェルアイコンを表示できます。空欄では内蔵の JetBrains Mono を使用します。',
+      terminalFontPlaceholder: 'MesloLGS NF または CSS フォントスタック',
+      terminalFontPreview: 'グリフのプレビュー',
+      terminalFontReset: '既定値を使用',
       translucencyTitle: 'ウィンドウの透過',
       translucencyDesc: 'ウィンドウ全体を透過させてデスクトップを表示します。macOS と Windows のみ。',
       backdropTitle: 'チャット背景',
       backdropDesc: '会話の背後に表示される淡い彫像の画像。',
+      reactionsTitle: 'メッセージリアクション',
+      reactionsDesc:
+        'iMessage風の絵文字タップバック — メッセージにリアクションでき、Hermesもあなたのメッセージにリアクションします。',
       embedsTitle: 'インライン埋め込み',
       embedsDesc:
         'リッチプレビューは第三者サイト（YouTube、X など）から読み込まれます。確認は許可するまでプレースホルダーを表示し、常には自動で読み込み、オフはリンクのままにします。',
@@ -778,6 +788,8 @@ export const ja = defineLocale({
       sshHermesPathTitle: 'Caravela パス（任意）',
       sshHermesPathDesc: 'リモートの hermes バイナリへのフルパス。空欄 = 自動検出。',
       sshHermesPathPlaceholder: '自動検出',
+      sshRemoteProfileTitle: 'リモートプロファイル（任意）',
+      sshRemoteProfileDesc: 'リモートホスト上のプロファイル名。空欄 = Desktop のプロファイル名を使用。',
       sshTestConnection: 'SSH をテスト',
       sshConnect: '接続',
       sshButtonsHint: '「保存」は次回起動時に適用され、「接続」は今すぐ再接続します。',
@@ -1021,7 +1033,7 @@ export const ja = defineLocale({
     visionModelLink: '設定 → モデル でビジョンモデルを選択',
     toolsetsEnabled: (enabled, total) => `${enabled}/${total} ツールセットが有効`,
     configureToolset: label => `${label} を設定`,
-    toggleToolset: label => `${label} ツールセットを切り替え`,
+    toggleToolset: (label, enabled) => `${label} ツールセットを${enabled ? 'オン' : 'オフ'}にする`,
     skillsLoadFailed: 'スキルの読み込みに失敗しました',
     toolsetsRefreshFailed: 'ツールセットの更新に失敗しました',
     skillEnabled: 'スキルを有効にしました',
@@ -1128,7 +1140,7 @@ export const ja = defineLocale({
       installed: 'インストール済み',
       generatedTag: '生成',
       adoptFailed: 'ペットを採用できませんでした。',
-      toggleFailed: 'ペットを切り替えできませんでした。',
+      toggleFailed: enabled => `ペットを${enabled ? 'オン' : 'オフ'}にできませんでした。`,
       noneAvailable: '利用可能なペットがありません。'
     },
     generatePet: {
@@ -1805,6 +1817,7 @@ export const ja = defineLocale({
       '調整または続行'
     ],
     startVoice: '音声会話を開始',
+    openDirective: '開く',
     queueMessage: 'メッセージをキューに入れる',
     stop: '停止',
     send: '送信',
@@ -2480,17 +2493,11 @@ export const ja = defineLocale({
     closeToRight: '右側を閉じる',
     closeAll: 'すべて閉じる',
     newSessionTab: '新しいセッションタブ',
-    split: dir => `${dir}に分割`,
-    move: dir => `${dir}へ移動`,
-    dirUp: '上',
-    dirDown: '下',
-    dirLeft: '左',
-    dirRight: '右',
     pluginDisabled: pluginId => `プラグイン「${pluginId}」を無効化しました`,
     pluginDisabledBody: '設定 → プラグイン で再有効化するとペインが戻ります。',
     missingPane: paneId => `ペインが見つかりません: ${paneId}`,
     editTitle: 'レイアウト',
-    editHint: 'レイアウトを選ぶか、ペインをゾーン間へドラッグ。ゾーンを右クリックで分割。',
+    editHint: 'レイアウトを選ぶか、ペインをゾーン間へドラッグ。',
     reset: 'リセット',
     templates: 'テンプレート',
     custom: 'カスタム',
@@ -2533,7 +2540,10 @@ export const ja = defineLocale({
       refresh: '更新',
       moreActions: 'その他のアクション',
       branchNewChat: '新しいチャットでブランチ',
+      react: 'リアクション',
       dismissError: 'エラーを閉じる',
+      filesChanged: count => `${count} 件のファイルを変更`,
+      reviewChanges: 'レビュー',
       readAloudFailed: '読み上げに失敗しました',
       preparingAudio: '音声を準備中...',
       stopReading: '読み上げを停止',
@@ -2796,7 +2806,7 @@ export const ja = defineLocale({
     sidebar: {
       title: 'サイドバー',
       description: 'モバイルサイドバーを表示します。',
-      toggle: 'サイドバーを切り替え'
+      toggle: open => `サイドバーを${open ? '表示' : '非表示'}`
     }
   }
 })

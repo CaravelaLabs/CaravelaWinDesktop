@@ -1,7 +1,6 @@
 import { FitAddon } from '@xterm/addon-fit'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
-import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -16,6 +15,7 @@ import { $terminalInjection } from '../store'
 
 import { makeTerminalReader, registerTerminalReader } from './buffer'
 import { mirrorSelection, terminalClipboardIntent } from './clipboard'
+import { terminalLinkHandler, terminalWebLinksAddon } from './links'
 import {
   isAddSelectionShortcut,
   isMacPlatform,
@@ -24,7 +24,9 @@ import {
   terminalSelectionLabel,
   terminalTheme
 } from './selection'
+import { prepareTerminalFontFamily } from './terminal-font'
 import { closeTerminal, updateTerminalRestoreCwd, updateTerminalReviveBuffer } from './terminals'
+import { useTerminalFontController } from './use-terminal-font'
 
 // How many scrollback lines to serialize for relaunch restore. Mirrors VS Code's
 // terminal.integrated.persistentSessionScrollback default; the store caps the
@@ -419,6 +421,7 @@ export function useTerminalSession({
   // Re-fit on activation: a tab hidden via display:none has a 0×0 host, so its
   // last fit is stale by the time it's shown again.
   const fitRef = useRef<(() => void) | null>(null)
+  const { latestFontFamilyRef, mountedRef } = useTerminalFontController({ fitRef, termRef, webglRef })
   const [status, setStatus] = useState<TerminalStatus>('starting')
   const [selection, setSelection] = useState('')
   const [selectionStyle, setSelectionStyle] = useState<CSSProperties | null>(null)
@@ -499,6 +502,11 @@ export function useTerminalSession({
 
     const term = new Terminal({
       allowProposedApi: true,
+      // ⌥-drag is our force-selection gesture (below), and xterm's default
+      // alt-click-moves-cursor claims the same click, emitting one cursor
+      // left/right escape per column of travel — shells that don't consume them
+      // echo the raw `^[[D` burst into the buffer. One gesture, one meaning.
+      altClickMovesCursor: false,
       // Opaque canvas = WebGL's crisp fast-path. allowTransparency instead bakes
       // glyphs as grayscale-alpha for compositing over a see-through canvas, which
       // reads soft on every platform; VS Code keeps it off and our surface
@@ -506,7 +514,7 @@ export function useTerminalSession({
       allowTransparency: false,
       convertEol: true,
       cursorBlink: true,
-      fontFamily: "'JetBrains Mono', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace",
+      fontFamily: latestFontFamilyRef.current,
       fontSize: 11,
       // VS Code's terminal renders 'normal'/'bold' (400/700); we were using Medium
       // (500) as the base, which reads a touch heavy at this size.
@@ -514,6 +522,10 @@ export function useTerminalSession({
       fontWeightBold: 'bold',
       letterSpacing: 0,
       lineHeight: 1.12,
+      // OSC 8 hyperlinks (gh, cargo, npm, ls --hyperlink) activate through this
+      // handler; without it xterm shows a raw confirm() and then a window.open
+      // Electron denies.
+      linkHandler: terminalLinkHandler,
       // Full-screen TUIs (hermes --tui, vim) grab the mouse, so a plain drag
       // can't select — ⌥-drag (macOS) / Shift-drag (else) forces a native
       // selection over mouse-mode apps, which ⌘/Ctrl+L then sends to chat.
@@ -536,7 +548,7 @@ export function useTerminalSession({
     term.loadAddon(fit)
     term.loadAddon(serialize)
     term.loadAddon(new Unicode11Addon())
-    term.loadAddon(new WebLinksAddon())
+    term.loadAddon(terminalWebLinksAddon())
     term.unicode.activeVersion = '11'
 
     // Replay last session's scrollback before the fresh shell boots. The process
@@ -909,6 +921,7 @@ export function useTerminalSession({
       }
 
       term.open(host)
+      mountedRef.current = true
       term.focus()
 
       // WebGL renderer matches the dashboard ChatPage path; xterm's default DOM
@@ -929,18 +942,21 @@ export function useTerminalSession({
       startSession()
     }
 
-    // fonts.ready settles only already-requested faces; the regular (400),
-    // bold (700) and italic aren't asked for until styled output paints (past
-    // atlas init), so warm them up front — otherwise the WebGL atlas bakes a
-    // fallback face and the terminal renders thin until a repaint.
-    const warm = document.fonts?.load
-      ? Promise.allSettled(['400', '700', 'italic 400'].map(v => document.fonts.load(`${v} 11px 'JetBrains Mono'`)))
-      : Promise.resolve()
+    void prepareTerminalFontFamily(
+      () => latestFontFamilyRef.current,
+      () => !disposed && host.isConnected
+    ).then(fontFamily => {
+      if (!fontFamily) {
+        return
+      }
 
-    void warm.then(mount, mount)
+      term.options.fontFamily = fontFamily
+      mount()
+    })
 
     return () => {
       disposed = true
+      mountedRef.current = false
       cleanup.forEach(run => run())
       fitRef.current = null
 
@@ -961,7 +977,7 @@ export function useTerminalSession({
     // `id` is stable for the instance's life (keyed by tab id), so listing it
     // doesn't re-create the shell — it just satisfies the deps check for the
     // closeTerminal(id) call in onExit.
-  }, [addSelectionToChat, cwd, id])
+  }, [addSelectionToChat, cwd, id, latestFontFamilyRef, mountedRef])
 
   useEffect(() => {
     const term = termRef.current

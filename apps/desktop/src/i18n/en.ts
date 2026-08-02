@@ -132,6 +132,7 @@ export const en: Translations = {
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT needs ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'ElevenLabs rejected the API key (401).',
+      diskFull: 'Disk full — free some space, then try again.',
       gatewayAuthFailed: 'Gateway authentication failed — check your API_SERVER_KEY.',
       methodNotAllowed:
         'The desktop backend rejected that request (405 Method Not Allowed). Try restarting Caravela Desktop.',
@@ -251,6 +252,7 @@ export const en: Translations = {
       'session.focusSearch': 'Search sessions',
       'session.togglePin': 'Pin / unpin current session',
       'workspace.newWorktree': 'New worktree',
+      'workspace.openFolder': 'Open folder as project',
       'composer.focus': 'Focus composer',
       'composer.modelPicker': 'Open model picker',
       'composer.voice': 'Start / stop voice conversation',
@@ -437,10 +439,18 @@ export const en: Translations = {
       uiScaleTitle: 'UI Scale',
       uiScaleDesc: (percent: number) =>
         `Scales text and controls across the whole app. Cmd/Ctrl with +, - and 0 also works. Current: ${percent}%.`,
+      terminalFontTitle: 'Terminal Font',
+      terminalFontDesc:
+        'Choose an installed font for Desktop terminals. Nerd Fonts render Powerlevel10k and shell icons; leave blank to use bundled JetBrains Mono.',
+      terminalFontPlaceholder: 'MesloLGS NF or a CSS font stack',
+      terminalFontPreview: 'Glyph preview',
+      terminalFontReset: 'Use default',
       translucencyTitle: 'Window Translucency',
       translucencyDesc: 'See your desktop through the whole window. macOS and Windows only.',
       backdropTitle: 'Chat Backdrop',
       backdropDesc: 'The faint statue image behind the conversation.',
+      reactionsTitle: 'Message Reactions',
+      reactionsDesc: 'iMessage-style emoji tapbacks — react to messages, and Hermes can react to yours.',
       embedsTitle: 'Inline Embeds',
       embedsDesc:
         'Rich previews load from third-party sites (YouTube, X, …). Ask shows a placeholder until you allow each one; Always loads them automatically; Off keeps plain links.',
@@ -709,6 +719,8 @@ export const en: Translations = {
       sshHermesPathTitle: 'Caravela path (optional)',
       sshHermesPathDesc: 'Full path to the remote hermes binary. Blank = auto-detect.',
       sshHermesPathPlaceholder: 'auto-detect',
+      sshRemoteProfileTitle: 'Remote profile (optional)',
+      sshRemoteProfileDesc: 'Profile name on the remote host. Blank = use the Desktop profile name.',
       sshTestConnection: 'Test SSH',
       sshConnect: 'Connect',
       sshButtonsHint: 'Save applies on the next launch. Connect reconnects now.',
@@ -767,7 +779,7 @@ export const en: Translations = {
       disableServer: name => `Disable ${name}`,
       serverEnabled: name => `${name} enabled — applies to new sessions.`,
       serverDisabled: name => `${name} disabled — applies to new sessions.`,
-      toggleFailed: name => `Failed to toggle ${name}`,
+      toggleFailed: (name, enabled) => `Failed to turn ${name} ${enabled ? 'on' : 'off'}`,
       tabServers: 'Servers',
       tabCatalog: 'Catalog',
       catalogLoading: 'Loading MCP catalog...',
@@ -993,7 +1005,7 @@ export const en: Translations = {
     visionModelLink: 'Choose vision model in Settings → Models',
     toolsetsEnabled: (enabled, total) => `${enabled}/${total} toolsets enabled`,
     configureToolset: label => `Configure ${label}`,
-    toggleToolset: label => `Toggle ${label} toolset`,
+    toggleToolset: (label, enabled) => `Turn ${label} toolset ${enabled ? 'on' : 'off'}`,
     skillsLoadFailed: 'Skills failed to load',
     toolsetsRefreshFailed: 'Toolsets failed to refresh',
     skillEnabled: 'Skill enabled',
@@ -1143,6 +1155,10 @@ export const en: Translations = {
     goTo: 'Go to',
     goToSession: 'Go to session',
     branches: 'Branches',
+    projects: 'Projects',
+    openFolder: 'Open folder as project…',
+    openFolderAt: path => `Open folder as project — ${path}`,
+    newSessionInProject: project => `New session in ${project}`,
     commands: 'Commands',
     startInBranch: branch => `New conversation in ${branch}`,
     commandCenter: 'Command Center',
@@ -1162,7 +1178,7 @@ export const en: Translations = {
       installed: 'Installed',
       generatedTag: 'Generated',
       adoptFailed: 'Could not adopt that pet.',
-      toggleFailed: 'Could not toggle the pet.',
+      toggleFailed: enabled => `Could not turn the pet ${enabled ? 'on' : 'off'}.`,
       noneAvailable: 'No pets available — pick one below to install.'
     },
     generatePet: {
@@ -1492,7 +1508,7 @@ export const en: Translations = {
     deleteDescPrefix: 'This will permanently remove ',
     deleteDescSuffix: '. This cannot be undone.',
     deleteFailed: (name: string) => `Failed to delete "${name}"`,
-    toggleFailed: (name: string) => `Failed to update "${name}"`,
+    toggleFailed: (name, enabled) => `Failed to turn "${name}" ${enabled ? 'on' : 'off'}`,
     newSubscription: 'New subscription',
     restarting: 'Gateway restarting...',
     restartNeeded: 'Webhooks are enabled, but the gateway still needs a restart before the receiver can come online.',
@@ -1890,7 +1906,7 @@ export const en: Translations = {
       forceRemove: 'Force remove',
       enter: label => `Open ${label}`,
       reorder: label => `Reorder ${label}`,
-      toggle: label => `Toggle ${label} sessions`,
+      toggle: (label, open) => `${open ? 'Show' : 'Hide'} ${label} sessions`,
       back: 'All projects'
     },
     newSessionIn: label => `New session in ${label}`,
@@ -1964,6 +1980,7 @@ export const en: Translations = {
       'Adjust or continue'
     ],
     startVoice: 'Start voice conversation',
+    openDirective: 'Open',
     queueMessage: 'Queue message',
     steer: 'Steer the current run',
     stop: 'Stop',
@@ -2650,17 +2667,11 @@ export const en: Translations = {
     closeToRight: 'Close to the right',
     closeAll: 'Close all',
     newSessionTab: 'New session tab',
-    split: dir => `Split ${dir}`,
-    move: dir => `Move ${dir}`,
-    dirUp: 'up',
-    dirDown: 'down',
-    dirLeft: 'left',
-    dirRight: 'right',
     pluginDisabled: pluginId => `Plugin "${pluginId}" disabled`,
     pluginDisabledBody: 'Re-enable it in Settings → Plugins to bring the pane back.',
     missingPane: paneId => `missing pane: ${paneId}`,
     editTitle: 'Layouts',
-    editHint: 'Pick a layout, or drag panes between zones. Right-click a zone to split.',
+    editHint: 'Pick a layout, or drag panes between zones.',
     reset: 'Reset',
     templates: 'Templates',
     custom: 'Custom',
@@ -2703,7 +2714,10 @@ export const en: Translations = {
       refresh: 'Refresh',
       moreActions: 'More actions',
       branchNewChat: 'Branch in new chat',
+      react: 'React',
       dismissError: 'Dismiss error',
+      filesChanged: count => (count === 1 ? '1 file changed' : `${count} files changed`),
+      reviewChanges: 'Review',
       readAloudFailed: 'Read aloud failed',
       preparingAudio: 'Preparing audio...',
       stopReading: 'Stop reading',
@@ -2947,7 +2961,7 @@ export const en: Translations = {
     sidebar: {
       title: 'Sidebar',
       description: 'Displays the mobile sidebar.',
-      toggle: 'Toggle Sidebar'
+      toggle: open => `${open ? 'Show' : 'Hide'} sidebar`
     }
   }
 }

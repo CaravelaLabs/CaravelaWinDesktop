@@ -944,21 +944,15 @@ def _termux_should_prefetch_update_check() -> bool:
 
 
 def _relative_time(ts) -> str:
-    """Format a timestamp as relative time (e.g., '2h ago', 'yesterday')."""
-    if not ts:
-        return "?"
-    delta = _time.time() - ts
-    if delta < 60:
-        return "just now"
-    if delta < 3600:
-        return f"{int(delta / 60)}m ago"
-    if delta < 86400:
-        return f"{int(delta / 3600)}h ago"
-    if delta < 172800:
-        return "yesterday"
-    if delta < 604800:
-        return f"{int(delta / 86400)}d ago"
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    """Format a timestamp as relative time (e.g., '2h ago', 'yesterday').
+
+    Thin wrapper kept for backward compatibility; the implementation lives
+    in :mod:`hermes_cli.timefmt` so lightweight consumers don't have to
+    import the whole CLI surface.
+    """
+    from hermes_cli.timefmt import relative_time
+
+    return relative_time(ts)
 
 
 def _has_any_provider_configured() -> bool:
@@ -5716,7 +5710,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         return _run_npm_install_deterministic(
             npm,
             npm_cwd,
-            extra_args=(*npm_workspace_args, "--silent") if silent else npm_workspace_args,
+            extra_args=(*npm_workspace_args, "--silent", "--prefer-offline") if silent else (*npm_workspace_args, "--prefer-offline"),
             env=build_env,
         )
 
@@ -10806,7 +10800,14 @@ def _prepare_agent_startup(args) -> None:
         from hermes_cli.config import load_config
         from agent.shell_hooks import register_from_config
 
-        register_from_config(load_config(), accept_hooks=_accept_hooks)
+        _hooks_cfg = load_config()
+        register_from_config(_hooks_cfg, accept_hooks=_accept_hooks)
+
+        from agent.outbound_webhooks import (
+            register_from_config as register_outbound_webhooks,
+        )
+
+        register_outbound_webhooks(_hooks_cfg)
     except Exception:
         logger.debug(
             "shell-hook registration failed at CLI startup",

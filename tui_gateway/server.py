@@ -946,14 +946,69 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     return session.get("transport") is _detached_ws_transport
 
 
-def _session_has_active_delegations(sid: str) -> bool:
-    """True when UI session ``sid`` still owns live background work."""
-    if not sid:
+def _session_owns_durable_lifecycle(session_id: str | None) -> bool:
+    """Whether this TUI/desktop session may end its durable DB row by key."""
+    if not session_id:
+        return True
+    try:
+        db = _get_db()
+        if db is None:
+            return True
+        # Don't end gateway-originated sessions — the gateway owns their
+        # lifecycle. The TUI is only a viewer there (#60609).
+        row = db.get_session(session_id)
+        source = (row or {}).get("source", "")
+        return not _is_gateway_owned_source(source)
+    except Exception:
+        return True
+
+
+def _session_async_delegation_selectors(
+    session: dict | None, *, sid_hint: str = ""
+) -> tuple[str, str]:
+    """Ownership selectors for async background work tied to one UI session."""
+    if not session:
+        return "", ""
+    own_sid = str(sid_hint or session.get("_sid") or "")
+    if not own_sid:
+        try:
+            with _sessions_lock:
+                for _cand_sid, _cand in _sessions.items():
+                    if _cand is session:
+                        own_sid = _cand_sid
+                        break
+        except Exception:
+            own_sid = ""
+    agent = session.get("agent")
+    session_key = str(session.get("session_key") or "")
+    session_id = getattr(agent, "session_id", None) or session_key
+    owned_session_key = session_key if _session_owns_durable_lifecycle(session_id) else ""
+    return own_sid, owned_session_key
+
+
+def _session_has_active_delegations(sid: str, session: dict | None = None) -> bool:
+    """True when UI session ``sid`` still owns live background work.
+
+    Matches by the live UI sid AND — when the TUI owns the durable lifecycle
+    (never for gateway-viewer tabs, #60609) — by the durable session_key, so a
+    delegation dispatched from an earlier tab of the same resumed session still
+    keeps it alive.
+    """
+    if session is None:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+    own_sid, owned_session_key = _session_async_delegation_selectors(
+        session, sid_hint=sid
+    )
+    if not own_sid and not owned_session_key:
         return False
     try:
-        from tools.async_delegation import active_for_session
+        from tools.async_delegation import has_live_for_session
 
-        return active_for_session(sid) > 0
+        return has_live_for_session(
+            session_key=owned_session_key,
+            origin_ui_session_id=own_sid,
+        )
     except Exception:
         logger.debug(
             "Failed to query active delegations for UI session %s",
@@ -993,7 +1048,7 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
             current = _sessions.get(sid)
             if not _ws_session_is_orphaned(current):
                 return
-            if _session_has_active_delegations(sid):
+            if _session_has_active_delegations(sid, current):
                 reschedule = True
             else:
                 session = _pop_session_by_id(sid)
@@ -1079,7 +1134,7 @@ def _transport_is_dead(transport) -> bool:
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     if session.get("running") or _session_pending_kind(sid):
         return False
-    if _session_has_active_delegations(sid):
+    if _session_has_active_delegations(sid, session):
         return False
     ready = session.get("agent_ready")
     # Lazy watch sessions (subagent spectator windows) never start a build,
@@ -1172,7 +1227,7 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # moment it loses its client.
     if session.get("running") or _session_pending_kind(sid):
         return False
-    if _session_has_active_delegations(sid):
+    if _session_has_active_delegations(sid, session):
         return False
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set() and not session.get("lazy"):
@@ -2694,16 +2749,26 @@ def _persist_branch_seed(session: dict) -> None:
         if db is None:
             return
         try:
-            for msg in seed:
-                db.append_message(
-                    session_id=key,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    # Preserve the parent's original message timestamps —
-                    # append_message would otherwise stamp time.time() and the
-                    # branch's copied history would all appear authored "now".
-                    timestamp=msg.get("timestamp"),
-                )
+            # Bounded-chunk transactions (see #23254): a branch seed can be
+            # hundreds of rows; chunking keeps each BEGIN IMMEDIATE short so
+            # concurrent writers aren't starved. Recovery semantics match the
+            # old per-row loop (mid-copy failure leaves a partial seed with
+            # _branch_seed_persisted unset).
+            db.append_messages_batch(
+                key,
+                [
+                    {
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content"),
+                        # Preserve the parent's original message timestamps —
+                        # append_message would otherwise stamp time.time() and the
+                        # branch's copied history would all appear authored "now".
+                        "timestamp": msg.get("timestamp"),
+                    }
+                    for msg in seed
+                ],
+                chunk_rows=500,
+            )
             session["_branch_seed_persisted"] = True
         except Exception as exc:
             from hermes_state import is_disk_full_error
@@ -7858,6 +7923,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    omit_messages: bool = False,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -7875,11 +7941,16 @@ def _live_session_payload(
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript; the DB has its own
     # lock, so read it outside the session history lock.
-    history = _live_visible_history(session, _get_db(), in_memory_history)
+    history = (
+        in_memory_history
+        if omit_messages
+        else _live_visible_history(session, _get_db(), in_memory_history)
+    )
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": [] if omit_messages else _history_to_messages(history),
+        "messages_omitted": omit_messages,
         "running": running,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
@@ -8849,6 +8920,20 @@ def _collect_kanban_notifications(session: dict) -> list:
         if resolved in seen_db_paths:
             continue
         seen_db_paths.add(resolved)
+        # A poller runs per live TUI/Desktop session. Avoid opening this board
+        # writable unless it has a subscription owned by this exact session;
+        # subscriptions for gateways or other sessions are not actionable here.
+        try:
+            if _kb.count_notify_subs(
+                board=slug,
+                platform="tui",
+                chat_id=session_key,
+            ) == 0:
+                continue
+        except Exception:
+            # Preserve delivery if the read-only probe cannot inspect a
+            # locked, corrupt, or otherwise unusual database.
+            pass
         try:
             conn = _kb.connect(board=slug)
         except Exception:
@@ -9268,8 +9353,6 @@ def _run_prompt_submit(
         ):
             session["running"] = False
             return
-        history = list(session["history"])
-        history_version = int(session.get("history_version", 0))
         if image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
@@ -9349,6 +9432,11 @@ def _run_prompt_submit(
                 # config sync so an explicit pick wins over a config.yaml change.
                 _apply_pending_model_switch(sid, session)
                 _sync_agent_model_with_config(sid, session)
+            # Snapshot after turn-start model sync. A deferred switch mutates
+            # history and its version; that mutation belongs to this turn.
+            with session["history_lock"]:
+                history = list(session["history"])
+                history_version = int(session.get("history_version", 0))
             cwd = _session_cwd(session)
             _register_session_cwd(session)
             cols = session.get("cols", 80)
@@ -9631,24 +9719,59 @@ def _run_prompt_submit(
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
                         else:
-                            # History mutated externally during the turn
-                            # (undo/compress/retry/rollback now guard on
-                            # session.running, but this is the defensive
-                            # backstop for any path that slips past).
-                            # Surface the desync rather than silently
-                            # dropping the agent's output — the UI can
-                            # show the response and warn that it was
-                            # not persisted.
-                            print(
-                                f"[tui_gateway] prompt.submit: history_version mismatch "
-                                f"(expected={history_version} current={current_version}) — "
-                                f"agent output NOT written to session history",
-                                file=sys.stderr,
+                            # History mutated externally during the turn.
+                            # Check if the only mutation was a model-switch
+                            # marker inserted mid-turn (#76870).  If so the
+                            # agent output is still valid — merge it into the
+                            # current history that now contains the marker.
+                            #
+                            # _append_model_switch_marker strips prior markers
+                            # in-place then appends a new one, so the delta
+                            # is NOT a simple tail-slice — we must compare
+                            # content, not indices.
+                            current_history = list(session["history"])
+                            history_no_markers = [
+                                e for e in history if not _is_model_switch_marker(e)
+                            ]
+                            current_no_markers = [
+                                e for e in current_history if not _is_model_switch_marker(e)
+                            ]
+                            model_switch_only = (
+                                current_no_markers == history_no_markers
+                                and any(
+                                    _is_model_switch_marker(e)
+                                    for e in current_history
+                                )
                             )
-                            status_note = (
-                                "History changed during this turn — the response above is visible "
-                                "but was not saved to session history."
-                            )
+                            if model_switch_only:
+                                # The agent's new messages start after the
+                                # turn-start history.  Guard against
+                                # auto-compression making result["messages"]
+                                # shorter than history (#77274 review).
+                                if len(result["messages"]) > len(history):
+                                    new_messages = result["messages"][len(history):]
+                                else:
+                                    # Compression rebound the messages list —
+                                    # use the full result as the base.
+                                    new_messages = list(result["messages"])
+                                session["history"] = current_history + new_messages
+                                session["history_version"] = current_version + 1
+                            else:
+                                # Genuine desync (undo/compress/retry/rollback).
+                                # Surface the desync rather than silently
+                                # dropping the agent's output — the UI can
+                                # show the response and warn that it was
+                                # not persisted.
+                                print(
+                                    f"[tui_gateway] prompt.submit: history_version mismatch "
+                                    f"(expected={history_version} current={current_version}) — "
+                                    f"agent output NOT written to session history",
+                                    file=sys.stderr,
+                                )
+                                status_note = (
+                                    "History changed during this turn — the response above is visible "
+                                    "but was not saved to session history."
+                                )
 
                 # If auto-compression fired inside run_conversation(), agent.session_id
                 # may have rotated. Sync session_key before downstream title/goal/finalize

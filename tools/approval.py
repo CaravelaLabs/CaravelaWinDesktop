@@ -585,19 +585,89 @@ def _user_deny_block_result(pattern: str) -> dict:
     }
 
 
-def _hardline_block_result(description: str) -> dict:
+def _save_blocked_payload(command: str) -> Optional[str]:
+    """Persist a parser-limit-blocked command as a runnable script.
+
+    The parser-limit block fires on payload SIZE/shape, not on the
+    operation — the command itself is usually a legitimate script the
+    model inlined (heredoc, giant one-liner). Materialize it to a file so
+    the recovery is one turn (`bash <file>`) instead of two (re-author via
+    write_file, then run). Saving is strictly safer than the hint-only
+    path: the file goes through the same execution pipeline as any other
+    script (including the referenced-script content guard), and nothing
+    is executed here.
+
+    Returns the saved path, or None on any failure (the hint then falls
+    back to the manual write_file recipe).
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        import time as _time
+        import uuid as _uuid
+        script_dir = get_hermes_home() / "cache" / "blocked-scripts"
+        script_dir.mkdir(parents=True, exist_ok=True)
+        # Opportunistic cleanup: blocked payloads older than 7 days.
+        cutoff = _time.time() - 7 * 86400
+        for old in script_dir.glob("blocked-*.sh"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+        path = script_dir / f"blocked-{int(_time.time())}-{_uuid.uuid4().hex[:8]}.sh"
+        path.write_text(
+            "#!/bin/bash\n"
+            "# Auto-saved by Hermes: this command exceeded the inline command\n"
+            "# parser limit and was blocked from direct execution. Review it,\n"
+            "# then run it via: bash " + str(path) + "\n"
+            + command
+            + ("\n" if not command.endswith("\n") else ""),
+            encoding="utf-8", errors="replace",
+        )
+        return str(path)
+    except Exception:
+        logger.debug("failed to save blocked payload", exc_info=True)
+        return None
+
+
+def _hardline_block_result(description: str, command: str = "") -> dict:
     """Build the standard block result for a hardline match."""
+    message = (
+        f"BLOCKED (hardline): {description}. "
+        "This command is on the unconditional blocklist and cannot "
+        "be executed via the agent — not even with --yolo, /yolo, "
+        "approvals.mode=off, or cron approve mode. If you genuinely "
+        "need to run it, run it yourself in a terminal outside the "
+        "agent."
+    )
+    # The parser-limit block is almost always a giant inline payload
+    # (heredoc script, base64 blob, one-line python -c program) — not a
+    # genuinely forbidden operation. 198 occurrences in a 250k-call
+    # production window, typically followed by blind rephrase retries.
+    # Auto-save the payload as a runnable script and point at it; fall
+    # back to the manual write_file recipe when saving fails.
+    if description in (_PARSER_LIMIT_DESCRIPTION, _MALFORMED_EXEC_DESCRIPTION):
+        saved = _save_blocked_payload(command) if command else None
+        if saved:
+            message += (
+                " RECOVERY: this block fires on oversized/unparseable inline "
+                "command payloads (heredocs, giant one-liners), not on the "
+                f"operation itself. Your command was saved to {saved} — "
+                f"review it, then run: terminal(command=\"bash {saved}\"). "
+                "Do not retry inline."
+            )
+        else:
+            message += (
+                " RECOVERY: this block fires on oversized/unparseable inline "
+                "command payloads (heredocs, giant one-liners), not on the "
+                "operation itself. Write the script to a file with write_file, "
+                "then run it: terminal(command=\"bash /path/script.sh\") or "
+                "\"python3 /path/script.py\". Do not retry inline."
+            )
     return {
         "approved": False,
         "hardline": True,
-        "message": (
-            f"BLOCKED (hardline): {description}. "
-            "This command is on the unconditional blocklist and cannot "
-            "be executed via the agent — not even with --yolo, /yolo, "
-            "approvals.mode=off, or cron approve mode. If you genuinely "
-            "need to run it, run it yourself in a terminal outside the "
-            "agent."
-        ),
+        "message": message,
     }
 
 
@@ -1934,6 +2004,54 @@ def _mark_command_starts(command: str) -> str:
     return "".join(parts)
 
 
+def _mask_quoted_newlines(command: str) -> str:
+    """Replace raw newlines inside single/double quotes with a space.
+
+    Detection-only rewrite. A newline inside a quoted string is DATA to the
+    shell — part of the argument, not a command separator — yet the flat
+    ``_CMDPOS`` start-position class treats every raw ``\\n`` as a command
+    start. That made any multi-line quoted argument (``hermes send`` message
+    bodies, ``git commit -m`` messages, heredoc text) trip the hardline
+    blocklist when a data line began with e.g. ``sudo reboot``.
+
+    Quote tracking mirrors ``_iter_shell_command_starts``: single quotes are
+    literal until the closing quote; inside double quotes a backslash escapes
+    the next character. Real command boundaries are unaffected: unquoted
+    newlines pass through untouched, ``$(``/backtick remain ``_CMDPOS``
+    anchors independent of newlines, and ``_mark_command_starts`` still
+    re-inserts newlines at every genuine quote-aware command start. An
+    unclosed quote absorbs following newlines exactly as the shell would
+    (the quoted word continues across the line break), so masking them
+    cannot hide a runnable command.
+    """
+    if "\n" not in command:
+        return command
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                out.append(command[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            out.append(" " if ch == "\n" else ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "\\" and i + 1 < len(command):
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _iter_shell_command_word_spans(command: str):
     """Yield command-position words that may be executable names."""
     for command_start in _iter_shell_command_starts(command):
@@ -1977,7 +2095,13 @@ def _iter_shell_command_word_spans(command: str):
 
 
 def _command_detection_variants(command: str):
-    normalized = _normalize_command_for_detection(command)
+    # Mask quoted newlines BEFORE normalization: normalization strips
+    # backslash-escapes (\" -> ") and empty-string pairs (""), which would
+    # corrupt quote tracking — e.g. `echo "a\""` normalizes to `echo "a` (an
+    # unterminated quote), so masking the normalized text could swallow a
+    # REAL unquoted newline separator that follows. The raw command carries
+    # faithful shell quote state.
+    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -2453,7 +2577,10 @@ def prompt_dangerous_approval(command: str, description: str,
             smart_denied=False) -> str. Legacy callback signatures remain
             supported when ``smart_denied`` is false.
 
-    Returns: 'once', 'session', 'always', or 'deny'
+    Returns: 'once', 'session', 'always', 'deny', or 'timeout'.
+        'timeout' means the prompt expired without a user response — the
+        action must still be blocked (fail-closed), but callers should
+        report it as "no response" rather than an explicit user denial.
     """
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
@@ -2542,7 +2669,10 @@ def prompt_dangerous_approval(command: str, description: str,
 
             if thread.is_alive():
                 print("\n" + t("approval.timeout"))
-                return "deny"
+                # Distinct from an explicit deny: the user never answered.
+                # Callers still block (fail-closed) but tell the agent the
+                # prompt timed out instead of claiming the user refused.
+                return "timeout"
 
             choice = result["choice"]
             if smart_denied:
@@ -3043,6 +3173,21 @@ def _run_approval_gate(
     choice = prompt_dangerous_approval(display_target, description,
                                        approval_callback=approval_callback)
 
+    if choice == "timeout":
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: Action timed out without user response. The user "
+                f"has NOT consented to this action. Do NOT retry it, do NOT "
+                f"rephrase it, and do NOT attempt the same outcome via a "
+                f"different path. Silence is not consent."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "timeout",
+            "user_consent": False,
+        }
+
     if choice == "deny":
         return {
             "approved": False,
@@ -3053,6 +3198,8 @@ def _run_approval_gate(
             ),
             "pattern_key": pattern_key,
             "description": description,
+            "outcome": "denied",
+            "user_consent": False,
         }
 
     if choice == "session":
@@ -3108,7 +3255,7 @@ def check_dangerous_command(command: str, env_type: str,
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc)
+        return _hardline_block_result(hardline_desc, command)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
@@ -3408,7 +3555,7 @@ def check_all_command_guards(command: str, env_type: str,
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc)
+        return _hardline_block_result(hardline_desc, command)
 
     # == Sudo stdin guard ==
     # Like the hardline floor above, this is unconditional: there is never a
@@ -3817,6 +3964,25 @@ def check_all_command_guards(command: str, env_type: str,
         choice=choice,
     )
 
+    if choice == "timeout":
+        breaker_addendum = _denial_breaker_addendum(session_key)
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Command timed out without user response. The user "
+                "has NOT consented to this action. Do NOT retry this "
+                "command, do NOT rephrase it, and do NOT attempt the same "
+                "outcome via a different command. Stop the current workflow "
+                "and wait for the user to respond before taking any further "
+                "destructive or irreversible action. Silence is not "
+                f"consent.{breaker_addendum}"
+            ),
+            "pattern_key": primary_key,
+            "description": combined_desc,
+            "outcome": "timeout",
+            "user_consent": False,
+        }
+
     if choice == "deny":
         breaker_addendum = _denial_breaker_addendum(session_key)
         return {
@@ -4174,6 +4340,10 @@ def request_elicitation_consent(
 
     if choice in ("once", "session", "always"):
         return "accept"
+    if choice == "timeout":
+        # Prompt expired without a user response — mirror the gateway's
+        # unresolved outcome ("cancel") rather than an explicit decline.
+        return "cancel"
     return "decline"
 
 

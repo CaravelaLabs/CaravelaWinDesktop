@@ -1534,6 +1534,36 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _validate_job_mode_invariants(
+    monitor_script: Optional[str],
+    monitor_url: Optional[str],
+    no_agent: bool,
+    script: Optional[str],
+) -> None:
+    """Shared create/update validation for job execution-mode invariants.
+
+    ONE owner for the class: create_job and update_job both call this so an
+    invariant enforced at create time cannot be violated through the update
+    door (monitor jobs silently degrading when no_agent is flipped on, etc.).
+    """
+    if monitor_script and monitor_url:
+        raise ValueError(
+            "monitor_script and monitor_url are mutually exclusive — a job "
+            "can only have one monitor source."
+        )
+    if (monitor_script or monitor_url) and no_agent:
+        raise ValueError(
+            "monitor_script/monitor_url cannot be combined with no_agent=True — "
+            "the whole point of a monitor job is to suppress or wake the AGENT "
+            "based on source changes. Use a plain no_agent script job instead."
+        )
+    if no_agent and not script:
+        raise ValueError(
+            "no_agent=True requires a script — with no agent and no script "
+            "there is nothing for the job to run."
+        )
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1650,26 +1680,16 @@ def create_job(
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
-    if normalized_monitor_script and normalized_monitor_url:
-        raise ValueError(
-            "monitor_script and monitor_url are mutually exclusive — a job "
-            "can only have one monitor source."
-        )
-    if (normalized_monitor_script or normalized_monitor_url) and normalized_no_agent:
-        raise ValueError(
-            "monitor_script/monitor_url cannot be combined with no_agent=True — "
-            "the whole point of a monitor job is to suppress or wake the AGENT "
-            "based on source changes. Use a plain no_agent script job instead."
-        )
-
     # no_agent jobs are meaningless without a script — the script IS the job.
-    # Surface this as a clear ValueError at create time so bad configs never
-    # reach the scheduler.
-    if normalized_no_agent and not normalized_script:
-        raise ValueError(
-            "no_agent=True requires a script — with no agent and no script "
-            "there is nothing for the job to run."
-        )
+    # Surface these as clear ValueErrors at create time so bad configs never
+    # reach the scheduler (shared with update_job, see
+    # _validate_job_mode_invariants).
+    _validate_job_mode_invariants(
+        normalized_monitor_script,
+        normalized_monitor_url,
+        normalized_no_agent,
+        normalized_script,
+    )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1859,8 +1879,33 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            # Normalize monitor fields the same way create_job does (empty
+            # string clears the field).
+            for _mon_field in ("monitor_script", "monitor_url"):
+                if _mon_field in updates:
+                    _mv = updates[_mon_field]
+                    _mv = str(_mv).strip() if isinstance(_mv, str) else None
+                    updates[_mon_field] = _mv or None
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+
+            # Re-check execution-mode invariants on the MERGED record when
+            # any participating field changes, so create-time invariants
+            # can't be violated through the update door (e.g. flipping
+            # no_agent=True on a monitor job would silently disable the
+            # monitor: the scheduler's no_agent short-circuit runs before
+            # the monitor gate). Scoped to changed fields so legacy records
+            # untouched by this update keep loading.
+            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+                _upd_script = updated.get("script")
+                _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
+                _validate_job_mode_invariants(
+                    updated.get("monitor_script") or None,
+                    updated.get("monitor_url") or None,
+                    bool(updated.get("no_agent")),
+                    _upd_script or None,
+                )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -2011,6 +2056,17 @@ def remove_job(job_id: str) -> bool:
             # Clean up output directory to prevent orphaned dirs accumulating
             if job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
+            # Clean up the job's durable notepad (cron/notepad.db) — without
+            # this, removed jobs orphan their KV rows forever. Best effort:
+            # a notepad failure must never block the removal itself.
+            try:
+                from cron.notepad import clear_notepad
+                clear_notepad(canonical_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear notepad for removed job %s",
+                    canonical_id, exc_info=True,
+                )
             return True
     return False
 
@@ -3022,6 +3078,33 @@ def save_job_output(job_id: str, output: str):
 # Skill reference rewriting (curator integration)
 # =============================================================================
 
+def _canonical_skill_ref(raw: Any) -> str:
+    """Reduce one job skill reference to the bare name the curator matches on.
+
+    A job may store an absolute path under ``HERMES_HOME/skills`` or an
+    external skills dir; the scheduler resolves those through
+    ``normalize_skill_lookup_name`` before handing them to ``skill_view``.
+    The curator compares this set against bare skill names, so it has to
+    resolve them the same way — otherwise a path-referencing job's skill
+    looks unreferenced and gets archived out from under it.
+
+    Best-effort: if the resolver is unavailable or rejects the value, fall
+    back to the plain cleanup so a broken import can never lose a name.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    try:
+        from agent.skill_utils import normalize_skill_lookup_name
+        value = normalize_skill_lookup_name(value) or value
+    except Exception:
+        logger.debug(
+            "referenced_skill_names: could not normalize skill ref %r", raw,
+            exc_info=True,
+        )
+    return value.strip().lstrip("/")
+
+
 def referenced_skill_names() -> Set[str]:
     """Return the set of skill names referenced by ANY cron job.
 
@@ -3030,6 +3113,9 @@ def referenced_skill_names() -> Set[str]:
     resuming it must still find its skills present. The curator uses this
     set to protect referenced skills from inactivity archival — a skill a
     live job depends on is "in use" regardless of when it was last loaded.
+
+    Names are canonicalized the way the scheduler resolves them at load
+    time, so a job that stores an absolute skill path is protected too.
 
     Best-effort: a corrupt/unreadable jobs store returns an empty set
     rather than raising, so a cron issue can never break the curator.
@@ -3045,7 +3131,7 @@ def referenced_skill_names() -> Set[str]:
         if not isinstance(job, dict):
             continue
         for name in _normalize_skill_list(job.get("skill"), job.get("skills")):
-            cleaned = str(name).strip().lstrip("/")
+            cleaned = _canonical_skill_ref(name)
             if cleaned:
                 names.add(cleaned)
     return names

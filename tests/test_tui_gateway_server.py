@@ -896,24 +896,65 @@ class _BrokenStdout:
 
 
 def test_write_json_serializes_concurrent_writes(monkeypatch):
-    out = _ChunkyStdout()
-    monkeypatch.setattr(server, "_real_stdout", out)
+    """Assert StdioTransport holds _stdout_lock across the full stream.write.
 
-    threads = [
-        threading.Thread(target=server.write_json, args=({"seq": i, "text": "x" * 24},))
-        for i in range(8)
-    ]
+    The old char-by-char sleep mock made this test take long enough that
+    leftover background write_json calls from earlier cases in this file
+    could append an extra line (intermittent ``assert 9 == 8`` on CI/main).
+    Match the WS concurrent-send check: count in-flight writes, and only
+    assert on frames that carry this test's marker payload.
+    """
+    marker = "x" * 24
+    active = 0
+    max_active = 0
+    gate = threading.Lock()
+    frames: list[str] = []
 
+    class RecordingStdout:
+        def write(self, text: str) -> int:
+            nonlocal active, max_active
+            with gate:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                # Release the GIL while "in write" so a missing outer lock
+                # would let another thread bump max_active above 1.
+                time.sleep(0.01)
+                frames.append(text)
+            finally:
+                with gate:
+                    active -= 1
+            return len(text)
+
+        def flush(self) -> None:
+            return None
+
+    monkeypatch.setattr(server, "_real_stdout", RecordingStdout())
+
+    barrier = threading.Barrier(8)
+
+    def _worker(seq: int) -> None:
+        barrier.wait(timeout=5)
+        server.write_json({"seq": seq, "text": marker})
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
-
     for t in threads:
-        t.join()
+        t.join(timeout=10)
+        assert not t.is_alive()
 
-    lines = "".join(out.parts).splitlines()
+    assert max_active == 1
 
-    assert len(lines) == 8
-    assert {json.loads(line)["seq"] for line in lines} == set(range(8))
+    ours = []
+    for frame in frames:
+        assert frame.endswith("\n"), frame
+        obj = json.loads(frame)
+        if obj.get("text") == marker and "seq" in obj:
+            ours.append(obj)
+
+    assert {obj["seq"] for obj in ours} == set(range(8))
+    assert len(ours) == 8
 
 
 def test_write_json_returns_false_on_broken_pipe(monkeypatch):
@@ -8048,15 +8089,20 @@ def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(monkeypatch):
 
 
 def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp_path):
-    """Remote case: client path doesn't exist on gateway → decode data_url bytes."""
+    """Remote case: client path doesn't exist on gateway → decode data_url bytes.
+
+    Staged into the session home's ``attachments/`` dir (bind-mounted into
+    container backends) rather than the workspace (#76577).
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    home = tmp_path / "home"
     fake_cli = types.ModuleType("cli")
     fake_cli._detect_file_drop = lambda raw: None
     fake_cli._split_path_input = lambda raw: (raw, "")
     fake_cli._resolve_attachment_path = lambda raw: None
 
-    server._sessions["sid"] = _session(cwd=str(workspace))
+    server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(home))
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
 
     try:
@@ -8073,11 +8119,11 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
+        stored = home / "attachments" / "report.txt"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
         assert resp["result"]["path"] == str(stored)
-        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report.txt"
+        assert resp["result"]["ref_text"] == f"@file:{stored}"
         assert stored.read_text(encoding="utf-8") == "hello world"
     finally:
         server._sessions.pop("sid", None)
@@ -8087,6 +8133,7 @@ def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, 
     """Local case: gateway can see the file but it's outside the workspace → copy in."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    home = tmp_path / "home"
     source = tmp_path / "outside.txt"
     source.write_text("outside workspace", encoding="utf-8")
     fake_cli = types.ModuleType("cli")
@@ -8094,7 +8141,7 @@ def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, 
     fake_cli._split_path_input = lambda raw: (raw, "")
     fake_cli._resolve_attachment_path = lambda raw: source
 
-    server._sessions["sid"] = _session(cwd=str(workspace))
+    server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(home))
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
 
     try:
@@ -8106,10 +8153,10 @@ def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, 
             }
         )
 
-        stored = workspace / ".hermes" / "desktop-attachments" / "outside.txt"
+        stored = home / "attachments" / "outside.txt"
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
-        assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/outside.txt"
+        assert resp["result"]["ref_text"] == f"@file:{stored}"
         assert stored.read_text(encoding="utf-8") == "outside workspace"
     finally:
         server._sessions.pop("sid", None)
@@ -8141,8 +8188,10 @@ def test_file_attach_uses_in_workspace_file_without_copying(monkeypatch, tmp_pat
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is False
         assert resp["result"]["ref_text"] == "@file:data/exam.csv"
-        # No copy: nothing staged under desktop-attachments.
+        # No copy: nothing staged under desktop-attachments or the home
+        # attachments dir.
         assert not (workspace / ".hermes" / "desktop-attachments").exists()
+        assert not (tmp_path / "home" / "attachments").exists()
     finally:
         server._sessions.pop("sid", None)
 
@@ -8183,7 +8232,7 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
     fake_cli._split_path_input = lambda raw: (raw, "")
     fake_cli._resolve_attachment_path = lambda raw: None
 
-    server._sessions["sid"] = _session(cwd=str(workspace))
+    server._sessions["sid"] = _session(cwd=str(workspace), profile_home=str(tmp_path / "home"))
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
 
     try:
@@ -8199,8 +8248,10 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
             }
         )
 
+        stored = tmp_path / "home" / "attachments" / "my exam schedule.csv"
         assert resp["result"]["attached"] is True
-        assert resp["result"]["ref_text"] == "@file:`.hermes/desktop-attachments/my exam schedule.csv`"
+        assert resp["result"]["ref_text"] == f"@file:`{stored}`"
+        assert stored.read_text(encoding="utf-8") == "a,b\n"
     finally:
         server._sessions.pop("sid", None)
 

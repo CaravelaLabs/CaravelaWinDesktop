@@ -1026,7 +1026,7 @@ def _has_any_provider_configured() -> bool:
         try:
             import json
 
-            auth = json.loads(auth_file.read_text(encoding="utf-8"))
+            auth = json.loads(auth_file.read_text(encoding="utf-8-sig"))
             active = auth.get("active_provider")
             if active:
                 status = get_auth_status(active)
@@ -10210,7 +10210,7 @@ def _read_ssh_session_token_file(path: str) -> str:
         if hasattr(os, "getuid") and (file_stat.st_mode & 0o777) & ~0o600:
             raise SystemExit("--ssh-session-token-file has unsafe permissions")
 
-        with os.fdopen(file_fd, "r") as token_stream:
+        with os.fdopen(file_fd, "r", encoding="utf-8") as token_stream:
             file_fd = -1
             token = token_stream.read(65)
 

@@ -367,6 +367,7 @@ export const zh: Translations = {
         search: '搜索插件…',
         noMatches: '没有匹配的插件。',
         toggleFailed: (name: string) => `无法切换 ${name}`,
+        updateBackendToManage: '请更新 Hermes 后端以便在桌面端管理此插件。',
         sources: { bundled: '内置', user: '用户', git: 'git', project: '项目', entrypoint: 'pip' }
       }
     },
@@ -2062,6 +2063,7 @@ export const zh: Translations = {
     noWorkspace: '无工作区',
     projectEmpty: '暂无会话',
     noSessions: '暂无会话',
+    noFilterMatches: '没有会话符合这些筛选条件',
     projects: {
       sectionLabel: '项目',
       home: '主页',
@@ -2178,6 +2180,10 @@ export const zh: Translations = {
       thisWeek: '本周',
       lastWeek: '上周',
       thisMonth: '本月'
+    },
+    statusDivider: {
+      working: '进行中',
+      done: '已完成'
     }
   },
 

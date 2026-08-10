@@ -462,6 +462,9 @@ export interface SidebarSessionSlice {
   /** Per-profile "the window came back full, more rows exist on disk" flags —
    *  what pagination needs, without a COUNT(*) per profile DB per refresh. */
   profiles_truncated?: Record<string, boolean>
+  /** Per-profile tokens and spend over every session, not just this window.
+   *  Absent from the legacy per-slice endpoint, which has no aggregate. */
+  profiles_usage?: Record<string, { cost_usd: number; tokens: number }>
 }
 
 /** Which profiles filled their per-profile window in a returned page. The
@@ -559,6 +562,23 @@ async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<S
     messaging: { sessions: messaging.sessions },
     ...(errors.length ? { errors } : {})
   }
+}
+
+/** The PR each of these sessions opened, recovered from its own transcript —
+ *  for sessions whose recorded branch can't answer (they started on trunk and
+ *  did the work in a worktree). Also returns every id it looked at, so the
+ *  caller can remember a miss and never ask again. */
+export function scanSessionPullRequests(
+  ids: string[]
+): Promise<{ pull_requests: Record<string, { number: number; url: string }>; scanned: string[] }> {
+  return window.hermesDesktop.api<{
+    pull_requests: Record<string, { number: number; url: string }>
+    scanned: string[]
+  }>({
+    path: '/api/profiles/sessions/pull-requests',
+    method: 'POST',
+    body: { ids }
+  })
 }
 
 export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {

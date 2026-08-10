@@ -105,6 +105,7 @@ import {
   reviewCreatePr,
   reviewDiff,
   reviewList,
+  reviewPrList,
   reviewPush,
   reviewRevert,
   reviewRevParse,
@@ -136,6 +137,8 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
+import { snapHudBounds } from './hud-snap'
+import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
@@ -4342,7 +4345,7 @@ function fetchJson(url, token, options: any = {}) {
         method: options.method || 'GET',
         headers: {
           'Content-Type': contentType,
-          'X-Caravela-Session-Token': token,
+          'X-Hermes-Session-Token': token,
           // RFC 8252 native flow authenticates the gated gateway with a bearer
           // token instead of the loopback session-token header. When
           // ``options.bearer`` is set we send Authorization: Bearer <token>;
@@ -4414,7 +4417,7 @@ function fetchJson(url, token, options: any = {}) {
 function fetchPublicJson(url, options: any = {}) {
   // Credential-free JSON GET/POST for public gateway endpoints
   // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
-  // NO ``X-Caravela-Session-Token`` header — used by the auth-mode probe before
+  // NO ``X-Hermes-Session-Token`` header — used by the auth-mode probe before
   // any credentials exist, and any time we must not leak a token to an
   // endpoint that doesn't need one.
   return new Promise((resolve, reject) => {
@@ -5248,12 +5251,18 @@ async function waitForHermes(baseUrl, token, signal?, authMode?) {
   })
 }
 
-function getWindowButtonPosition() {
+function getWindowButtonPosition(win = mainWindow) {
   if (!IS_MAC) {
     return null
   }
 
-  return mainWindow?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
+  // Fullscreen hides the traffic lights — treat as no left-side controls so the
+  // renderer drops the traffic-light dodge inset and Y nudge.
+  if (win?.isFullScreen?.()) {
+    return null
+  }
+
+  return win?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
 }
 
 function getNativeOverlayWidth() {
@@ -5266,7 +5275,8 @@ function getWindowState(win = mainWindow) {
     isMinimized: Boolean(win?.isMinimized?.()),
     isVisible: Boolean(win?.isVisible?.()),
     nativeOverlayWidth: getNativeOverlayWidth(),
-    windowButtonPosition: getWindowButtonPosition()
+    windowButtonPosition: getWindowButtonPosition(win),
+    darwinMajor: IS_MAC ? DARWIN_MAJOR : 0
   }
 }
 
@@ -9210,6 +9220,46 @@ const schedulePersistHudState = debounce(persistHudState, 250)
 // and, when the answer has not changed, nothing else.
 const HUD_CURSOR_POLL_MS = 60
 
+// Snap-to-pointer — global ⌘⇧G while the HUD is open (tap, not hold).
+const HUD_SNAP_ANCHOR_Y = 48
+
+function applyHudSnapToPointer() {
+  if (!hudWindow || hudWindow.isDestroyed()) {
+    return
+  }
+
+  const cursor = screen.getCursorScreenPoint()
+  const bounds = hudWindow.getBounds()
+  const display = screen.getDisplayNearestPoint(cursor)
+  const workArea = display?.workArea ?? bounds
+  const anchor = { x: Math.round(bounds.width / 2), y: HUD_SNAP_ANCHOR_Y }
+
+  const origin = snapHudBounds(
+    cursor,
+    anchor,
+    { width: bounds.width, height: bounds.height },
+    hudWindow.webContents.getZoomFactor(),
+    workArea
+  )
+
+  // setBounds — NOT setPosition alone: on Windows, a transparent frameless
+  // window silently grows ~1px per setPosition call (see move-by handler).
+  hudWindow.setBounds({
+    x: origin.x,
+    y: origin.y,
+    width: bounds.width,
+    height: bounds.height
+  })
+}
+
+const hudSnapShortcut = createHudSnapShortcut(globalShortcut, applyHudSnapToPointer)
+
+function registerHudSnapShortcut() {
+  if (!hudSnapShortcut.register()) {
+    rememberLog('[hud] snap shortcut unavailable — CommandOrControl+Shift+G may be owned by another app')
+  }
+}
+
 /**
  * Feed the HUD renderer the cursor position on Linux.
  *
@@ -9329,7 +9379,15 @@ function spawnHudWindow(sessionId, profile) {
     minHeight: 160,
     frame: false,
     transparent: true,
-    resizable: true,
+    // NOT resizable. A transparent frameless window on Windows keeps a
+    // system-level edge resize hot-zone while `resizable` is on — the OS
+    // interprets pointer capture near the edge as a resize gesture, so the
+    // window grows a few px every drag (worse at >100% DPI scaling). The
+    // composer drag calls setPosition, which must move the window, not resize
+    // it. Resizing is done by the renderer's corner handle through
+    // `hermes:hud:set-bounds`, which flips resizable on for the call — the
+    // same pattern the pet overlay uses for its wheel-scale.
+    resizable: false,
     movable: true,
     minimizable: false,
     maximizable: false,
@@ -9441,6 +9499,7 @@ function openHudWindow(sessionId, profile) {
       hudProfile = profileKey
       hudWindow = spawnHudWindow(sessionId, profileKey)
       broadcastHudState(true)
+      registerHudSnapShortcut()
 
       return hudWindow
     }
@@ -9466,11 +9525,14 @@ function openHudWindow(sessionId, profile) {
   hudProfile = profileKey
   hudWindow = spawnHudWindow(sessionId, profileKey)
   broadcastHudState(true)
+  registerHudSnapShortcut()
 
   return hudWindow
 }
 
 function closeHudWindow() {
+  hudSnapShortcut.dispose()
+
   const win = hudWindow
   hudWindow = null
 
@@ -10200,14 +10262,52 @@ ipcMain.on('hermes:hud:move-by', (event, delta) => {
 
   const dx = Number(delta?.x)
   const dy = Number(delta?.y)
+  const width = Number(delta?.width)
+  const height = Number(delta?.height)
 
-  if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(width) || !Number.isFinite(height)) {
     return
   }
 
   const [x, y] = hudWindow.getPosition()
 
-  hudWindow.setPosition(Math.round(x + dx), Math.round(y + dy))
+  // setBounds — NOT setPosition: on Windows, a transparent frameless window
+  // silently grows ~1px per setPosition call (worse at >100% DPI). The renderer
+  // snapshots outerWidth/outerHeight when the composer drag arms and re-pins
+  // to that size on every moveBy (same pattern as the pet overlay drag).
+  hudWindow.setBounds({
+    x: Math.round(x + dx),
+    y: Math.round(y + dy),
+    width: Math.round(width),
+    height: Math.round(height)
+  })
+})
+
+// Resize from the HUD's corner handle. The window is created non-resizable
+// (see spawnHudWindow — a transparent frameless window must not expose a
+// system resize hot-zone, or dragging grows it), which on Windows/Linux also
+// blocks programmatic setBounds sizing — so briefly flip resizable on while
+// the size actually changes, exactly like the pet overlay's wheel-scale does.
+ipcMain.on('hermes:hud:set-bounds', (event, bounds) => {
+  if (!hudWindow || hudWindow.isDestroyed() || event.sender !== hudWindow.webContents || !bounds) {
+    return
+  }
+
+  const win = hudWindow
+  const width = Math.max(380, Math.round(Number(bounds.width)))
+  const height = Math.max(160, Math.round(Number(bounds.height)))
+  const [curW, curH] = win.getSize()
+  const resizing = width !== curW || height !== curH
+
+  if (resizing && !win.isResizable()) {
+    win.setResizable(true)
+  }
+
+  win.setBounds({ x: Math.round(Number(bounds.x)), y: Math.round(Number(bounds.y)), width, height })
+
+  if (resizing) {
+    win.setResizable(false)
+  }
 })
 
 // The HUD renderer reporting which session it is on, so the close broadcast
@@ -10217,6 +10317,7 @@ ipcMain.on('hermes:hud:session', (event, sessionId) => {
     hudSessionId = typeof sessionId === 'string' && sessionId ? sessionId : null
   }
 })
+
 ipcMain.handle('hermes:hud:close', async () => {
   closeHudWindow()
 
@@ -11817,6 +11918,9 @@ ipcMain.handle('hermes:git:review:commitContext', async (_event, repoPath) =>
 )
 ipcMain.handle('hermes:git:review:push', async (_event, repoPath) => reviewPush(repoPath, resolveGitBinary()))
 ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) => reviewShipInfo(repoPath, resolveGhBinary()))
+ipcMain.handle('hermes:git:review:prList', async (_event, repoPath, branches, numbers) =>
+  reviewPrList(repoPath, resolveGhBinary(), branches, numbers)
+)
 ipcMain.handle('hermes:git:review:createPr', async (_event, repoPath) =>
   reviewCreatePr(repoPath, resolveGitBinary(), resolveGhBinary())
 )
@@ -12544,6 +12648,8 @@ app.on('before-quit', event => {
   // floating composer with nothing behind it. Close it directly rather than via
   // closeHudWindow(): that also re-shows the main window, which is wrong on the
   // way out (and `hudRestoreMainWindow` may still be armed from entering HUD).
+  hudSnapShortcut.dispose()
+
   if (hudWindow && !hudWindow.isDestroyed()) {
     hudWindow.removeAllListeners('closed')
     hudWindow.destroy()

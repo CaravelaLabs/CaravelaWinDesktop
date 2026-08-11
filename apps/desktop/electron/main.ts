@@ -173,6 +173,7 @@ import {
   revalidatePooledRemoteBackends,
   revalidateRemoteConnection
 } from './remote-liveness'
+import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -218,6 +219,7 @@ import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { readWindowBelow } from './window-below'
+import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
   bindGeometryPersistence,
@@ -676,6 +678,7 @@ const BOOT_FAKE_STEP_MS = (() => {
 })()
 
 const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Caravela'
+const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 
@@ -1085,13 +1088,15 @@ const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDL
 // killing one to honor the soft cap would abort a running agent.
 const POOL_KEEPALIVE_FRESH_MS = 90_000
 let poolIdleReaper = null
-// Auto-reload budget for renderer crashes. A deterministic startup crash would
-// otherwise loop forever (reload → crash → reload), pinning CPU and spamming
-// logs. Allow a few reloads per rolling window, then stop and leave the dead
-// window so the user can read the error / quit.
+// Auto-reload budget for renderer crashes, shared by EVERY window (primary,
+// secondary session, instance) so a crash loop anywhere is suppressed after
+// the same budget instead of reloading per-window forever. A deterministic
+// startup crash would otherwise loop forever (reload → crash → reload),
+// pinning CPU and spamming logs. Allow a few reloads per rolling window, then
+// stop and leave the dead window so the user can read the error / quit.
 const RENDERER_RELOAD_WINDOW_MS = 60_000
 const RENDERER_RELOAD_MAX = 3
-let rendererReloadTimes = []
+const rendererReloadTimesRef: { current: number[] } = { current: [] }
 // Latched bootstrap failure: when the first-launch install fails, we hold
 // onto the error so subsequent startHermes() calls (e.g. the renderer's
 // ensureGatewayOpen retrying after the WS won't open) return the same error
@@ -6205,6 +6210,10 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
     win.webContents.on('did-navigate', () => void checkCookie())
     win.webContents.on('did-redirect-navigation', () => void checkCookie())
     win.webContents.on('did-frame-navigate', () => void checkCookie())
+    // Log-only lifecycle diagnostics: a crashed sign-in renderer is invisible
+    // to the window's promise path (it never settles), so without this the
+    // failure leaves no trace in desktop.log (#81290 follow-up).
+    installWindowRendererLifecycle(win, { kind: 'oauth', callbacks: { log: rememberLog } })
     pollTimer = setInterval(() => void checkCookie(), 750)
 
     // Silent-mode reveal fallback: if the cascade hasn't settled shortly, the
@@ -6698,6 +6707,11 @@ function openPortalLoginWindow() {
     win.webContents.on('did-navigate', () => void checkCookie())
     win.webContents.on('did-redirect-navigation', () => void checkCookie())
     win.webContents.on('did-frame-navigate', () => void checkCookie())
+    // Log-only lifecycle diagnostics, same rationale as the OAuth window:
+    // a crashed portal sign-in renderer never settles the promise, so the
+    // failure would otherwise leave no trace in desktop.log (#81290
+    // follow-up).
+    installWindowRendererLifecycle(win, { kind: 'portal', callbacks: { log: rememberLog } })
     pollTimer = setInterval(() => void checkCookie(), 750)
 
     win.on('closed', () => {
@@ -8070,6 +8084,14 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
       try {
         if (IS_WINDOWS && Number.isInteger(child.pid)) {
           forceKillProcessTree(child.pid)
+        } else if (Number.isInteger(child.pid)) {
+          // POSIX: SIGKILL the whole group (pgid==pid, start_new_session) so
+          // MCP grandchildren die with the backend. Fall back to the child.
+          try {
+            process.kill(-child.pid, 'SIGKILL')
+          } catch {
+            child.kill('SIGKILL')
+          }
         } else {
           child.kill('SIGKILL')
         }
@@ -8297,6 +8319,11 @@ async function spawnPoolBackend(profile, entry) {
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
+        // Our PID so the backend's parent-death watchdog self-exits if we die
+        // uncleanly (crash / SIGKILL / update handoff) instead of leaking a
+        // serving backend + its MCP child subtree. See web_server.py
+        // _start_parent_death_watchdog.
+        HERMES_PARENT_PID: String(process.pid),
         HERMES_WEB_DIST: webDist,
         ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
       },
@@ -8590,6 +8617,11 @@ async function startHermes() {
           // Marks this dashboard backend as desktop-spawned so it runs the cron
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',
+          // Our PID so the backend's parent-death watchdog self-exits if we die
+          // uncleanly (crash / SIGKILL / update handoff) instead of leaking a
+          // serving backend + its MCP child subtree. See web_server.py
+          // _start_parent_death_watchdog.
+          HERMES_PARENT_PID: String(process.pid),
           HERMES_WEB_DIST: webDist,
           ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
         },
@@ -8897,6 +8929,24 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 
   streamThrottle.register(win)
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
+  attachRendererConsoleCapture(win, 'session-window', rememberLog)
+
+  // Renderer lifecycle diagnostics + recovery (#81290): a dead session-window
+  // renderer used to log nothing and stay black; now it logs with its window
+  // kind and reloads under the shared crash-loop budget, exactly like the
+  // primary window, without touching any other window.
+  installWindowRendererLifecycle(win, {
+    kind: 'secondary',
+    callbacks: {
+      log: rememberLog,
+      reload: () => {
+        win.webContents.reload()
+      }
+    },
+    reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
+    reloadMax: RENDERER_RELOAD_MAX,
+    recentReloadTimesRef: rendererReloadTimesRef
+  })
 
   loadWindowUrl(
     win,
@@ -8978,10 +9028,27 @@ function createInstanceWindow() {
   streamThrottle.register(win)
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
 
+  // Renderer lifecycle diagnostics + recovery (#81290), same policy as the
+  // primary and session windows: a crashed instance renderer logs with its
+  // window kind and reloads under the shared crash-loop budget.
+  installWindowRendererLifecycle(win, {
+    kind: 'instance',
+    callbacks: {
+      log: rememberLog,
+      reload: () => {
+        win.webContents.reload()
+      }
+    },
+    reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
+    reloadMax: RENDERER_RELOAD_MAX,
+    recentReloadTimesRef: rendererReloadTimesRef
+  })
+
   win.on('closed', () => {
     instanceWindows.delete(win)
   })
 
+  attachRendererConsoleCapture(win, 'instance', rememberLog)
   loadWindowUrl(win, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Instance window')
 
   return win
@@ -8993,6 +9060,7 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   devServer: DEV_SERVER,
   isMac: IS_MAC,
   loadWindowUrl,
+  log: rememberLog,
   preloadPath: PRELOAD_PATH,
   rendererIndex: resolveRendererIndex,
   wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
@@ -9088,6 +9156,10 @@ function spawnPetOverlayWindow(bounds) {
 
   wireWindowReveal(win, { show: () => win.showInactive() })
 
+  // Log-only renderer lifecycle (#81290): a dead overlay must never resurrect
+  // itself over the app, but its loss belongs in desktop.log.
+  installWindowRendererLifecycle(win, { kind: 'overlay', callbacks: { log: rememberLog } })
+
   win.on('closed', () => {
     if (petOverlayWindow === win) {
       petOverlayWindow = null
@@ -9101,6 +9173,7 @@ function spawnPetOverlayWindow(bounds) {
     }
   })
 
+  attachRendererConsoleCapture(win, 'pet-overlay', rememberLog)
   loadWindowUrl(win, petOverlayUrl(), 'Pet overlay')
 
   return win
@@ -9377,6 +9450,7 @@ function spawnHudWindow(sessionId, profile) {
     ...hudBounds(),
     minWidth: 380,
     minHeight: 160,
+    title: HUD_WINDOW_TITLE,
     frame: false,
     transparent: true,
     // NOT resizable. A transparent frameless window on Windows keeps a
@@ -9463,6 +9537,10 @@ function spawnHudWindow(sessionId, profile) {
     broadcastHudState(false)
   })
 
+  attachRendererConsoleCapture(win, 'hud', rememberLog)
+  // Log-only lifecycle (#81290): the HUD is a compact auxiliary surface the
+  // user can re-toggle; a dead renderer should be diagnosable, not resurrected.
+  installWindowRendererLifecycle(win, { kind: 'hud', callbacks: { log: rememberLog } })
   loadWindowUrl(win, hudUrl(sessionId, profile), 'HUD')
 
   return win
@@ -9645,6 +9723,10 @@ function spawnQuickEntryWindow() {
   // its own OS window and a zoomed composer would overflow it.
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('quickEntry'))
 
+  // Log-only renderer lifecycle (#81290): a dead quick-entry window must never
+  // resurrect itself over the app, but its loss belongs in desktop.log.
+  installWindowRendererLifecycle(win, { kind: 'quick', callbacks: { log: rememberLog } })
+
   // Hide on blur. The window must never hold the user's focus captive — losing
   // focus is the cheapest, least surprising dismiss (matches Spotlight).
   win.on('blur', () => {
@@ -9668,6 +9750,7 @@ function spawnQuickEntryWindow() {
     }
   })
 
+  attachRendererConsoleCapture(win, 'quick-entry', rememberLog)
   loadWindowUrl(win, quickEntryUrl(), 'Quick entry')
 
   return win
@@ -9882,89 +9965,67 @@ function createWindow() {
   streamThrottle.register(mainWindow)
   wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
 
-  mainWindow.webContents.on('render-process-gone', (_event, details) => {
-    rememberLog(`[renderer] render-process-gone reason=${details?.reason} exitCode=${details?.exitCode}`)
-
-    if (details?.reason === 'crashed' || details?.reason === 'oom') {
-      const now = Date.now()
-      rendererReloadTimes = rendererReloadTimes.filter(t => now - t < RENDERER_RELOAD_WINDOW_MS)
-
-      if (rendererReloadTimes.length >= RENDERER_RELOAD_MAX) {
-        rememberLog(
-          `[renderer] suppressing reload: ${rendererReloadTimes.length} crashes within ${RENDERER_RELOAD_WINDOW_MS}ms (likely a crash loop)`
-        )
-
+  // Per-window renderer lifecycle diagnostics + recovery (#81290). The reload
+  // policy (crashed/oom → bounded reload via the shared rolling budget, then
+  // the #38216 Windows sandbox relaunch check on suppression) is the same
+  // policy this window used before it moved into the shared helper, so a
+  // crashed peer renderer now logs and recovers exactly like the primary one.
+  installWindowRendererLifecycle(mainWindow, {
+    kind: 'main',
+    callbacks: {
+      log: rememberLog,
+      reload: () => {
+        mainWindow.webContents.reload()
+      },
+      onCrashLoopSuppressed: details => {
         // #38216 renderer flavor (same recovery as #56726, credit @Sahil-SS9):
         // a deterministic Windows renderer crash loop with the sandbox
         // breakpoint signature gets one --no-sandbox relaunch instead of a
         // dead window. Gated on the exit code so unrelated crash loops don't
         // silently drop the sandbox.
         if (
-          shouldRelaunchForRendererSandboxCrashLoop({
+          !shouldRelaunchForRendererSandboxCrashLoop({
             reason: details?.reason,
             exitCode: details?.exitCode,
             alreadyNoSandbox: windowsSandboxFallbackActive || alreadyHasNoSandbox(process.argv, process.env),
             relaunchAttempted: windowsNoSandboxRelaunchAttempted
           })
         ) {
-          windowsNoSandboxRelaunchAttempted = true
-          windowsSandboxFallbackActive = true
-          windowsSandboxFallbackSticky = true
-          windowsSandboxFallbackReason = 'renderer-crash-loop'
-
-          try {
-            writeSandboxMarker(app.getPath('userData'), fallbackMarker('renderer-crash-loop', app.getVersion()))
-          } catch {
-            void 0
-          }
-
-          rememberLog('[renderer] Windows sandbox crash loop detected; relaunching once with --no-sandbox (#38216)')
-
-          try {
-            app.relaunch({ args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
-            app.exit(0)
-          } catch (err) {
-            rememberLog(`[renderer] --no-sandbox relaunch failed: ${err?.message || err}`)
-          }
-        }
-
-        return
-      }
-
-      rendererReloadTimes.push(now)
-      setImmediate(() => {
-        if (!mainWindow || mainWindow.isDestroyed()) {
           return
         }
 
-        try {
-          mainWindow.webContents.reload()
-        } catch (err) {
-          rememberLog(`[renderer] reload after crash failed: ${err?.message || err}`)
-        }
-      })
-    }
-  })
+        windowsNoSandboxRelaunchAttempted = true
+        windowsSandboxFallbackActive = true
+        windowsSandboxFallbackSticky = true
+        windowsSandboxFallbackReason = 'renderer-crash-loop'
 
-  mainWindow.webContents.on('unresponsive', () => rememberLog('[renderer] webContents became unresponsive'))
+        try {
+          writeSandboxMarker(app.getPath('userData'), fallbackMarker('renderer-crash-loop', app.getVersion()))
+        } catch {
+          void 0
+        }
+
+        rememberLog('[renderer] Windows sandbox crash loop detected; relaunching once with --no-sandbox (#38216)')
+
+        try {
+          app.relaunch({ args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
+          app.exit(0)
+        } catch (err) {
+          rememberLog(`[renderer] --no-sandbox relaunch failed: ${err?.message || err}`)
+        }
+      }
+    },
+    reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
+    reloadMax: RENDERER_RELOAD_MAX,
+    recentReloadTimesRef: rendererReloadTimesRef
+  })
 
   // Electron always passes the event first. The canonical (Electron 36+) shape
   // is (event, messageDetails); the deprecated positional shape is
-  // (event, level, message, line, sourceId). Handle both. `level` is numeric
-  // (0..3), where 3 === error.
-  mainWindow.webContents.on('console-message', (_event, detailsOrLevel, message, line, sourceId) => {
-    const details = detailsOrLevel && typeof detailsOrLevel === 'object' ? detailsOrLevel : null
-    const level = details ? details.level : detailsOrLevel
-
-    if (level !== 3) {
-      return
-    }
-
-    const text = details ? details.message : message
-    const src = details ? details.sourceUrl : sourceId
-    const lineNo = details ? details.lineNumber : line
-    rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
-  })
+  // (event, level, message, line, sourceId). Handled in renderer-log.ts, which
+  // every renderer-content window shares (#79428: crashes in secondary/HUD/
+  // quick-entry windows used to vanish without a trace).
+  attachRendererConsoleCapture(mainWindow, 'main', rememberLog)
 
   loadWindowUrl(mainWindow, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Renderer')
 
@@ -11528,6 +11589,17 @@ ipcMain.handle('hermes:logs:reveal', async () => {
 })
 
 ipcMain.handle('hermes:logs:recent', async () => ({ path: DESKTOP_LOG_PATH, lines: hermesLog.slice(-200) }))
+
+// Renderer error-boundary catches (#79428 defect B): the component stack only
+// exists in renderer memory, so the boundary posts it here and we persist it
+// via the desktop.log pipeline. `on`, not `handle` — the sender may be mid-
+// crash and must not await. Flush immediately: a crashing window can be gone
+// before the debounced flush timer fires.
+ipcMain.on('hermes:logs:renderer-error', (_event, report) => {
+  const { label, boundary, message, componentStack } = report && typeof report === 'object' ? report : {}
+  rememberLog(formatRendererBoundaryReport(label, boundary, message, componentStack))
+  flushDesktopLogBufferSync()
+})
 
 function isExecutableFile(filePath) {
   if (!filePath || !path.isAbsolute(filePath)) {

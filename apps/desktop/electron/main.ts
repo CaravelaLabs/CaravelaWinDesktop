@@ -46,7 +46,12 @@ import {
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
-import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
+import {
+  detectRemoteDisplay,
+  isWindowsBinaryPathInWsl,
+  isWslEnvironment,
+  resolveLinuxPasswordStore
+} from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -104,6 +109,7 @@ import {
   reviewCommitContext,
   reviewCreatePr,
   reviewDiff,
+  reviewFetchPrComment,
   reviewList,
   reviewPrList,
   reviewPush,
@@ -129,12 +135,17 @@ import {
   DATA_URL_READ_DEFAULT_MAX_MB,
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
+  enableBasicPasswordStoreEncryption,
   encryptDesktopSecret as encryptDesktopSecretStrict,
   readFileDataUrlForIpc,
+  resolvePersistedRemoteToken,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
-  TEXT_PREVIEW_SOURCE_MAX_BYTES
+  SAFE_STORAGE_ENCODING,
+  TEXT_PREVIEW_SOURCE_MAX_BYTES,
+  tightenSecretFileMode,
+  writeSecretFileAtomic
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
 import { snapHudBounds } from './hud-snap'
@@ -173,6 +184,7 @@ import {
   revalidatePooledRemoteBackends,
   revalidateRemoteConnection
 } from './remote-liveness'
+import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import {
   buildSessionWindowUrl,
@@ -330,6 +342,22 @@ if (IS_WSL && !REMOTE_DISPLAY_REASON && fs.existsSync('/dev/dxg')) {
   app.commandLine.appendSwitch('enable-gpu-rasterization')
   app.commandLine.appendSwitch('enable-zero-copy')
   console.log('[hermes] WSL GPU passthrough (/dev/dxg) detected; enabling GPU acceleration')
+}
+
+// Linux: point Chromium at the session's keychain backend so safeStorage can
+// encrypt remote gateway tokens (hardening.ts refuses to persist them without
+// it). The value arrives via HERMES_DESKTOP_PASSWORD_STORE, bridged by the
+// `hermes desktop` launcher from detection or `desktop.password_store` in
+// config.yaml. Must run before app `ready` — the switch only applies pre-launch.
+const PASSWORD_STORE = resolveLinuxPasswordStore()
+
+if (PASSWORD_STORE.warning) {
+  console.warn(`[hermes] ${PASSWORD_STORE.warning}`)
+}
+
+if (PASSWORD_STORE.store) {
+  app.commandLine.appendSwitch('password-store', PASSWORD_STORE.store)
+  console.log(`[hermes] using password-store backend: ${PASSWORD_STORE.store}`)
 }
 
 // Windows sandbox / GPU breakpoint crash recovery (#38216).
@@ -3539,10 +3567,39 @@ function resolveWebDist() {
 
 function resolveRendererIndex() {
   const candidates = [path.join(APP_ROOT, 'dist', 'index.html'), path.join(resolveWebDist(), 'index.html')]
-  const found = candidates.find(fileExists)
+  const present = candidates.filter(fileExists)
 
-  if (found) {
-    return found
+  // index.html and the hashed chunks it names are one generation. An update
+  // that replaces only one of the two shipped copies (app.asar vs
+  // app.asar.unpacked) leaves a TORN copy: the window loads, then dies on the
+  // first lazy import with "Failed to fetch dynamically imported module" and
+  // every restart reloads the same torn copy. Prefer a copy whose modules are
+  // all present, so the intact generation heals the boot by itself.
+  for (const candidate of present) {
+    const missing = missingRendererAssets(candidate)
+
+    if (missing.length === 0) {
+      return candidate
+    }
+
+    rememberLog(
+      `[renderer] skipping torn renderer bundle at ${candidate}: ` +
+        `${missing.length} module file(s) named by index.html are missing ` +
+        `(${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''})`
+    )
+  }
+
+  if (present.length > 0) {
+    // Every copy is torn. Load the first one anyway — the boundary's error is
+    // still better than a blank window — but say what is wrong and how to fix
+    // it, because no amount of restarting repairs a torn bundle.
+    rememberLog(
+      `[renderer] every renderer bundle is incomplete (${present.join(', ')}). ` +
+        `The last update replaced the app while its files were locked. ` +
+        `Repair with: hermes desktop --force-build`
+    )
+
+    return present[0]
   }
 
   // Nothing on disk. A packaged build with no renderer bundle blank-pages with
@@ -6637,8 +6694,8 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
   return { baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
 }
 
-function encryptDesktopSecret(value) {
-  return encryptDesktopSecretStrict(value, safeStorage)
+function encryptDesktopSecret(value, options = {}) {
+  return encryptDesktopSecretStrict(value, safeStorage, options)
 }
 
 function decryptDesktopSecret(secret) {
@@ -6652,7 +6709,7 @@ function decryptDesktopSecret(secret) {
     return ''
   }
 
-  if (secret.encoding === 'safeStorage') {
+  if (secret.encoding === SAFE_STORAGE_ENCODING) {
     try {
       return safeStorage.decryptString(Buffer.from(value, 'base64'))
     } catch {
@@ -6660,6 +6717,10 @@ function decryptDesktopSecret(secret) {
     }
   }
 
+  // Any other encoding (a hand-edited config, or one written by a pre-release
+  // build) is returned verbatim on purpose: this fallback is what lets such a
+  // config connect at all. Not a plaintext-writing path — nothing in this file
+  // persists a token this way.
   return value
 }
 
@@ -6763,7 +6824,31 @@ function readDesktopConnectionConfig() {
 
   try {
     const raw = fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8')
+    // Tighten an install written before this file was owner-only. Every write
+    // now goes out at 0600, but a file already on disk keeps its old 0644 bits
+    // until something chmods it, and waiting for the user's next Settings save
+    // would leave it group/other-readable indefinitely. Runs on a cache miss
+    // only (once per launch, plus after an external edit); chmod moves ctime,
+    // not mtime, so it cannot invalidate the cache it sits inside.
+    //
+    // Deliberately BEFORE JSON.parse, not after: a truncated or hand-mangled
+    // connection.json still contains the token bytes, and parse throws into the
+    // catch below, which swallows the error and falls back to local mode. With
+    // the tighten after the parse, exactly the file that is both corrupt AND
+    // world-readable would be the one file never tightened — and nothing would
+    // ever retry it, because the fallback config is not written back. The chmod
+    // needs only the path, so it has no reason to wait for valid JSON.
+    tightenSecretFileMode(DESKTOP_CONNECTION_CONFIG_PATH)
+
     const parsed = JSON.parse(raw)
+
+    // NOT done here: migrating a legacy non-safeStorage token payload to
+    // ciphertext at rest. Deferred deliberately — it has to honor the opt-in
+    // plaintext choice PR #62319 adds (re-encrypting it converts a portable
+    // credential into a keychain-bound one and can lose the token), write
+    // through sanitizeConnectionProfiles below rather than persisting raw
+    // `parsed`, and tell the user to ROTATE, since every existing backup copy
+    // still holds the old secret. Do not add it without those three.
 
     if (parsed && typeof parsed === 'object') {
       const remote = parsed.remote && typeof parsed.remote === 'object' ? parsed.remote : {}
@@ -6792,7 +6877,14 @@ function readDesktopConnectionConfig() {
 
 function writeDesktopConnectionConfig(config) {
   fs.mkdirSync(path.dirname(DESKTOP_CONNECTION_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_CONNECTION_CONFIG_PATH, JSON.stringify(config, null, 2))
+  // Owner-only, not writeFileAtomic: this is the single choke point for every
+  // connection.json write (the IPC save/apply handlers and
+  // persistSshConnectionToken all land here), and the file carries the
+  // safeStorage-encrypted gateway token plus its URL and SSH host/user/keyPath.
+  // safeStorage keeps the token opaque; 0600 keeps the whole record — and the
+  // fields that are NOT encrypted — off other local accounts, matching
+  // native-oauth-tokens.json and desktop-installation.json.
+  writeSecretFileAtomic(DESKTOP_CONNECTION_CONFIG_PATH, JSON.stringify(config, null, 2))
   connectionConfigCache = config
   connectionConfigCacheMtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
 }
@@ -6849,6 +6941,23 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
   const mode = envOverride ? 'remote' : savedMode === 'ssh' ? 'ssh' : modeIsRemoteLike(savedMode) ? savedMode : 'local'
 
+  // Whether the OS keyring (safeStorage) can encrypt the saved token. When
+  // false the renderer knows to offer the plain-text opt-in in Settings →
+  // Gateway. safeStorage.isEncryptionAvailable can throw on some platforms, so
+  // treat any failure as "not available".
+  let secureTokenStorage = false
+
+  try {
+    secureTokenStorage = Boolean(safeStorage.isEncryptionAvailable())
+  } catch {
+    secureTokenStorage = false
+  }
+
+  // Whether the currently saved token is stored in plain text (the keyring-less
+  // opt-in path). The env override supplies its token from the environment, not
+  // the saved block, so it never reports as plain text here.
+  const remoteTokenPlainText = !envOverride && block.token?.encoding === 'plain'
+
   let remoteOauthConnected = false
 
   if (authMode === 'oauth' && remoteUrl) {
@@ -6877,6 +6986,11 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
     remoteTokenPreview: tokenPreview(remoteToken),
     remoteTokenSet: Boolean(remoteToken),
+    // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
+    // affordance in Settings → Gateway on keyring-less Linux.
+    secureTokenStorage,
+    // Whether the saved token is currently persisted in plain text.
+    remoteTokenPlainText,
     sshHost: (ssh || savedSsh)?.host || '',
     sshUser: (ssh || savedSsh)?.user || '',
     sshPort: (ssh || savedSsh)?.port || null,
@@ -6945,11 +7059,18 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
-  const nextToken = incomingToken
-    ? persistToken
-      ? encryptDesktopSecret(incomingToken)
-      : { encoding: 'plain', value: incomingToken }
-    : existingBlock.token
+  // Persist decision lives in hardening.resolvePersistedRemoteToken so the
+  // IPC-propagation seam (allowPlainTextToken → encryptDesktopSecret opt-in) is
+  // covered by a focused regression test. Pass allowPlainText through RAW — the
+  // helper coerces with `=== true`, so a truthy-non-true value never enables
+  // plain-text storage, and that strictness is asserted in exactly one place.
+  const nextToken = resolvePersistedRemoteToken({
+    incomingToken,
+    persistToken,
+    existingToken: existingBlock.token,
+    allowPlainText: input.allowPlainTextToken,
+    encryptSecret: encryptDesktopSecret
+  })
 
   if (mode === 'ssh') {
     const sshBlock = buildSshBlock(input, savedProfileSsh(existing, key) || rawExistingBlock)
@@ -11608,13 +11729,13 @@ ipcMain.handle('hermes:fs:openDir', async (_event, dirPath) => {
 // it yields `undefined/desktop-plugins` (or a non-existent remote path) and the
 // on-disk plugin door silently breaks (#66899). Electron owns this resolution
 // so it stays valid in every connection mode. Created on demand, like openDir.
-ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => {
+async function localPluginsRoot(dirName: string): Promise<string> {
   // Profile-aware: a named Desktop profile gets its own plugin root under
   // profiles/<name>/, matching the profile-scoped hermes_home the backend
   // reported before this resolver existed. 'default'/unset pins the global root.
   const profile = readActiveDesktopProfile()
   const base = profile && profile !== 'default' ? path.join(HERMES_HOME, 'profiles', profile) : HERMES_HOME
-  const dir = path.join(base, 'desktop-plugins')
+  const dir = path.join(base, dirName)
 
   try {
     await fs.promises.mkdir(dir, { recursive: true })
@@ -11624,7 +11745,16 @@ ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => {
   }
 
   return dir
-})
+}
+
+ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => localPluginsRoot('desktop-plugins'))
+
+// The LOCAL agent-plugin root (`<HERMES_HOME>/plugins`), same Electron-local
+// resolution as above. This is the desktop half of a UNIFIED plugin package:
+// an agent plugin may ship `desktop/plugin.js` alongside its Python code (the
+// same shape as `dashboard/manifest.json`), and the renderer's disk door scans
+// this root for it — one installable folder serving both SDKs.
+ipcMain.handle('hermes:fs:agentPluginsRoot', async () => localPluginsRoot('plugins'))
 
 // Rename a file/folder in place. The renderer passes the existing path + a new
 // base name; the destination is resolved in the SAME parent dir so a rename can
@@ -11754,6 +11884,9 @@ ipcMain.handle('hermes:git:review:push', async (_event, repoPath) => reviewPush(
 ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) => reviewShipInfo(repoPath, resolveGhBinary()))
 ipcMain.handle('hermes:git:review:prList', async (_event, repoPath, branches, numbers) =>
   reviewPrList(repoPath, resolveGhBinary(), branches, numbers)
+)
+ipcMain.handle('hermes:git:review:fetchPrComment', async (_event, repoPath, url) =>
+  reviewFetchPrComment(repoPath, resolveGhBinary(), url)
 )
 ipcMain.handle('hermes:git:review:createPr', async (_event, repoPath) =>
   reviewCreatePr(repoPath, resolveGitBinary(), resolveGhBinary())
@@ -12318,6 +12451,15 @@ app.whenReady().then(() => {
   } else if (systemCa.error) {
     rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
   }
+
+  // Keyring-less Linux `--password-store=basic` support. This must run before
+  // createWindow() and anything that could touch safeStorage; the narrow
+  // platform/switch/guard semantics live in the extracted helper.
+  enableBasicPasswordStoreEncryption({
+    platform: process.platform,
+    passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
+    safeStorageApi: safeStorage
+  })
 
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())

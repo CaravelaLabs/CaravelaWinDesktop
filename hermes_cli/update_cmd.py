@@ -773,12 +773,14 @@ def _print_update_completion(message: str) -> None:
         print(f"=== hermes-update completed {action_id} ===")
 
 
-def _update_via_zip(args):
+def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
     drivers causing 'Invalid argument' errors on file creation).
     """
+    active_tool_dependencies = _m()._capture_active_tool_dependencies()
+
     import tempfile
     import zipfile
     from urllib.request import urlretrieve
@@ -983,6 +985,14 @@ def _update_via_zip(args):
             )
         _m()._install_python_dependencies_with_optional_fallback(pip_cmd)
 
+    install_prefix = [uv_bin, "pip"] if uv_bin else pip_cmd
+    install_env = uv_env if uv_bin else None
+    _m()._restore_active_tool_dependencies(
+        active_tool_dependencies,
+        install_prefix,
+        env=install_env,
+    )
+
     # ZIP path parity: heal the active memory provider's bridge packages
     # after the dependency reinstall, same as the git-pull path (#53272,
     # #70636).
@@ -1011,6 +1021,10 @@ def _update_via_zip(args):
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    _rebuild_desktop_after_update(
+        _m().PROJECT_ROOT / "apps" / "desktop",
+        had_desktop_app_before_update=had_desktop_app_before_update,
+    )
 
     # Sync skills
     try:
@@ -1786,10 +1800,113 @@ def _upgrade_pip_before_lazy_refresh(
     except subprocess.CalledProcessError as exc:
         logger.debug("pip upgrade before lazy refresh failed: %s", exc)
 
+
+def _capture_active_lazy_features() -> list[str]:
+    """Snapshot active lazy backends before a managed runtime is replaced."""
+    try:
+        from tools import lazy_deps
+
+        return lazy_deps.active_features()
+    except Exception as exc:
+        logger.debug("Could not snapshot active lazy features: %s", exc)
+        return []
+
+
+def _capture_active_tool_dependencies() -> list[str]:
+    """Snapshot Python dependencies installed explicitly through ``hermes tools``."""
+    try:
+        from hermes_cli import tools_config
+
+        return tools_config.active_restorable_python_tool_dependencies()
+    except Exception as exc:
+        logger.debug("Could not snapshot active Hermes Tools dependencies: %s", exc)
+        return []
+
+
+def _restore_active_tool_dependencies(
+    dependencies: list[str],
+    install_cmd_prefix: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Restore allowlisted ``hermes tools`` dependencies into a rebuilt venv.
+
+    The dependency names came from a pre-rebuild import probe and are resolved
+    through a static package allowlist. Never raises: a failed optional tool
+    must not block the core update, but the user must be told what stayed
+    unavailable.
+    """
+    if not dependencies:
+        return
+
+    try:
+        from hermes_cli import tools_config
+    except Exception as exc:
+        logger.debug("Hermes Tools dependency restore skipped (import failed): %s", exc)
+        return
+
+    target_python = _m()._resolve_install_target_python(install_cmd_prefix, env)
+    missing: list[tuple[str, tuple[str, ...]]] = []
+    for name in dependencies:
+        spec = tools_config.restorable_python_tool_dependency(name)
+        if spec is None:
+            continue
+        module_name, install_args = spec
+        if target_python is not None:
+            try:
+                probe = subprocess.run(
+                    [
+                        str(target_python),
+                        "-c",
+                        "import importlib.util,sys; "
+                        "raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)",
+                        module_name,
+                    ],
+                    capture_output=True,
+                    env=env,
+                    check=False,
+                )
+                if probe.returncode == 0:
+                    continue
+            except (subprocess.SubprocessError, OSError):
+                # An indeterminate probe is safer to repair than to treat as
+                # proof that a pre-rebuild dependency survived.
+                pass
+        missing.append((name, install_args))
+
+    if not missing:
+        return
+
+    print()
+    print(f"→ Restoring {len(missing)} Hermes Tools dependency set(s)...")
+    restored: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for name, install_args in missing:
+        try:
+            _m()._run_package_only_install(
+                install_cmd_prefix + ["install", *install_args, "--quiet"],
+                env=env,
+            )
+            restored.append(name)
+        except Exception as exc:
+            # This is best-effort recovery for optional tooling. Unexpected
+            # installer failures must be surfaced without aborting the core
+            # runtime update.
+            failed.append((name, str(exc)))
+
+    if restored:
+        print(f"  ✓ {len(restored)} restored: {', '.join(restored)}")
+    for name, reason in failed:
+        if len(reason) > 200:
+            reason = reason[:200] + "..."
+        print(f"  ⚠ {name} failed to restore: {reason}")
+
+
 def _refresh_active_lazy_features(
     install_cmd_prefix: list[str] | None = None,
     *,
     env: dict[str, str] | None = None,
+    features: list[str] | None = None,
 ) -> bool:
     """Refresh lazy-installed backends after a code update.
 
@@ -1817,11 +1934,14 @@ def _refresh_active_lazy_features(
         logger.debug("Lazy refresh skipped (import failed): %s", exc)
         return True
 
-    try:
-        active = lazy_deps.active_features()
-    except Exception as exc:
-        logger.debug("Lazy refresh skipped (active_features failed): %s", exc)
-        return True
+    if features is None:
+        try:
+            active = lazy_deps.active_features()
+        except Exception as exc:
+            logger.debug("Lazy refresh skipped (active_features failed): %s", exc)
+            return True
+    else:
+        active = features
 
     if not active:
         return True
@@ -1831,7 +1951,10 @@ def _refresh_active_lazy_features(
 
     unexpected_failure = False
     try:
-        results = lazy_deps.refresh_active_features(prompt=False)
+        if features is None:
+            results = lazy_deps.refresh_active_features(prompt=False)
+        else:
+            results = lazy_deps.restore_features(active)
     except Exception as exc:
         # refresh_active_features is documented as never-raise, but defend
         # the update flow against future regressions.
@@ -1839,7 +1962,7 @@ def _refresh_active_lazy_features(
         results = {}
         unexpected_failure = True
 
-    refreshed = [f for f, s in results.items() if s == "refreshed"]
+    refreshed = [f for f, s in results.items() if s in {"refreshed", "restored"}]
     current = [f for f, s in results.items() if s == "current"]
     failed = [(f, s) for f, s in results.items() if s.startswith("failed:")]
     skipped = [(f, s) for f, s in results.items() if s.startswith("skipped:")]
@@ -2419,8 +2542,10 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         sys.exit(1)
 
     if is_shallow:
-        # No history to count across the shallow boundary. Compare tip SHAs and
-        # report presence-only (mirrors the banner's _check_via_local_git).
+        # No history to count across the shallow boundary. Compare tip SHAs
+        # (mirrors the banner's _check_via_local_git), then try to recover the
+        # exact count via the GitHub compare API — the remote graph is complete
+        # even when the local one is truncated.
         head_sha = subprocess.run(
             git_cmd + ["rev-parse", "HEAD"],
             cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -2432,9 +2557,19 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         if head_sha and target_sha and head_sha == target_sha:
             print("✓ Already up to date.")
         else:
-            print(f"⚕ Update available (behind {compare_branch}).")
+            from hermes_cli.banner import _github_compare_behind
             from hermes_cli.config import recommended_update_command
 
+            counted = _github_compare_behind(head_sha, target_sha)
+            if counted == 0:
+                # Local commits on top of the remote tip — not behind.
+                print("✓ Already up to date.")
+                return
+            if counted is not None:
+                commits_word = "commit" if counted == 1 else "commits"
+                print(f"⚕ Update available: {counted} {commits_word} behind {compare_branch}.")
+            else:
+                print(f"⚕ Update available (behind {compare_branch}).")
             print(f"  Run '{recommended_update_command()}' to install.")
         return
 
@@ -3026,6 +3161,61 @@ def _detect_venv_python_processes(
         matches.append((int(pid), str(name), cmdline_raw))
     return matches
 
+# Native-extension modules that pin files inside the venv once imported.  If
+# the updater process itself has any of these loaded, the dependency sync
+# below cannot rewrite the backing ``.pyd``/``.dll`` — Windows blocks REPLACE
+# on a mapped image — and the update dies with ``os error 5`` between
+# uninstall and reinstall, stranding the venv half-updated (#83569).
+# ``cryptography`` is the canonical case: ``hermes_cli.main`` imports it at
+# startup while resolving external secret sources, so EVERY CLI-driven
+# ``hermes update`` used to self-lock before that import was made lazy.
+# Keep this guard as defence-in-depth against future eager imports (new
+# secret sources, plugins absorbed into core, refactors of the startup
+# order).  Keys are module prefixes in ``sys.modules``; values are display
+# names.
+_SELF_LOCKING_NATIVE_MODULES: dict[str, str] = {
+    "cryptography.hazmat.bindings._rust": "cryptography (_rust.pyd)",
+}
+
+
+def _detect_self_loaded_native_modules() -> list[str]:
+    """Native venv extensions already loaded into THIS updater process.
+
+    Returns display names (empty off Windows — POSIX lets a running process
+    keep using an unlinked inode, so self-locking is a Windows-only hazard).
+    Never raises.
+    """
+    if not _m()._is_windows():
+        return []
+    found = [
+        display
+        for prefix, display in _SELF_LOCKING_NATIVE_MODULES.items()
+        if prefix in sys.modules
+    ]
+    return sorted(set(found))
+
+
+def _defer_update_for_self_lock(loaded: list[str]) -> None:
+    """Bail out before the dependency sync when the updater holds a lock.
+
+    The install cannot win this race from inside the locked process — even
+    killing threads would not unmap the image — so defer it: drop the
+    update-incomplete marker (next launch's fresh process completes the
+    install before importing anything heavy), explain, and exit 2 like the
+    other preflight refusals.
+    """
+    print("✗ This updater process has already loaded native venv modules that")
+    print("  the dependency sync must replace:")
+    for name in loaded:
+        print(f"    {name}")
+    print()
+    print("  On Windows a mapped extension cannot be replaced by the process")
+    print("  holding it. The update has been deferred: the next `hermes` launch")
+    print("  will complete it in a fresh process before anything imports these")
+    print("  modules.")
+    _m()._write_update_incomplete_marker()
+
+
 def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
     """Explain which venv processes block the update and how to clear them."""
     lines = [
@@ -3455,6 +3645,13 @@ def _cold_start_windows_gateway_after_update() -> None:
     Best-effort and idempotent: re-checks that nothing is running first so a
     concurrent start (e.g. the autostart entry firing) can't produce a
     duplicate gateway.
+
+    A successful ``Popen`` only proves the process was created, not that it
+    survived (e.g. a Windows job object denying breakaway kills it before it
+    logs anything — #84185). So the success line is gated on the same
+    post-spawn liveness poll every other ``_spawn_detached`` caller uses
+    (``gateway_windows._report_gateway_start``), instead of being printed
+    unconditionally from the returned PID.
     """
     if not _m()._is_windows():
         return
@@ -3483,7 +3680,7 @@ def _cold_start_windows_gateway_after_update() -> None:
 
     if pid:
         print()
-        print(f"  ✓ Starting Windows gateway after update (PID {pid})")
+        gateway_windows._report_gateway_start(f"cold-start after update (PID {pid})")
 
 def _for_each_systemd_gateway_unit(
     list_units_stdout: str,
@@ -3535,6 +3732,47 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     print("    hermes gateway status")
     print("    systemctl --user restart <unit>   # user-scope")
     print("    sudo systemctl restart <unit>     # system-scope")
+
+def _surviving_gateway_pids_after_failed_restart():
+    """Best-effort PIDs of gateways still running after the restart phase died.
+
+    Returns ``None`` when the answer cannot be determined — most importantly
+    when ``hermes_cli.gateway`` itself no longer imports, which is one of the
+    ways the restart phase aborts in the first place (the update replaced the
+    checkout under a process that already loaded the old modules). ``None`` and
+    a non-empty list are both treated as "assume stale" by the caller; only a
+    positive empty result is proof that nothing needs restarting.
+    """
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        return list(find_gateway_pids(all_profiles=True))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not probe for surviving gateways after update: %s", exc)
+        return None
+
+def _warn_gateway_restart_phase_aborted(exc: BaseException, pids) -> None:
+    """Print a recovery warning when the whole restart phase raised.
+
+    Issue #78574: the gateway auto-restart phase was wrapped in a blanket
+    ``except Exception`` that only logged at debug level, so an early failure
+    (e.g. importing ``hermes_cli.gateway`` from the freshly pulled checkout)
+    erased every drain/restart line from the update output. The update still
+    printed "Update complete!" and exited 0 while the running gateway kept
+    serving pre-update modules against replaced source files — the next turn
+    died with an ImportError.
+    """
+    print()
+    print(f"⚠ Update incomplete — gateway auto-restart failed: {exc}")
+    if pids:
+        listed = ", ".join(str(pid) for pid in pids)
+        print(f"  Gateway process(es) still running pre-update code: {listed}")
+    else:
+        print("  Any gateway still running is serving pre-update code")
+        print("  (mixed sys.modules) against the updated checkout.")
+    print("  Restart it manually, then verify:")
+    print("    hermes gateway restart")
+    print("    hermes gateway status")
 
 def _refresh_windows_gateway_launchers() -> None:
     """Regenerate installed Windows gateway launcher scripts after update.
@@ -3866,9 +4104,92 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
+
+def _desktop_app_present(desktop_dir: Path) -> bool:
+    """Return whether a packaged or source Desktop build exists."""
+    return (
+        _m()._desktop_packaged_executable(desktop_dir) is not None
+        or _m()._desktop_dist_exists(desktop_dir)
+    )
+
+
+def _rebuild_desktop_after_update(
+    desktop_dir: Path, *, had_desktop_app_before_update: bool
+) -> None:
+    """Rebuild an installed Desktop app when its source or artifact changed."""
+    # The release tree is ignored by git and can disappear during an update.
+    # Its pre-update presence is enough to restore it; do not make people who
+    # have never used Desktop pay for an Electron build.
+    has_desktop_app = had_desktop_app_before_update or _desktop_app_present(desktop_dir)
+    if not (
+        (desktop_dir / "package.json").exists()
+        and _m()._resolve_node_runtime_npm()
+        and has_desktop_app
+    ):
+        return
+
+    print("→ Checking if desktop app needs rebuilding...")
+    # Consult the content-hash stamp IN-PROCESS first. The spawned
+    # `hermes desktop --build-only` subprocess re-imports the whole CLI stack
+    # (~1-3 s) just to reach the same _m()._desktop_build_needed check; when
+    # the stamp already says "up to date" we can skip the spawn entirely. The
+    # update path never passes --source, so the subprocess would run with
+    # source_mode=False — mirror that here. Any error in the pre-check falls
+    # through to the subprocess.
+    skip_desktop_build = False
+    try:
+        skip_desktop_build = not _m()._desktop_build_needed(
+            desktop_dir, _m().PROJECT_ROOT, source_mode=False
+        )
+    except Exception:
+        skip_desktop_build = False
+    if skip_desktop_build:
+        print("  ✓ Desktop app up to date")
+        return
+
+    desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
+    # Capture the (very loud) Electron/vite build output into update.log
+    # instead of streaming it to the terminal. On the rare nonzero exit,
+    # retry once after waiting again for the venv — this covers a
+    # still-settling rebuild window the first wait didn't fully catch — then
+    # surface the captured tail so the failure is debuggable.
+    #
+    # Start the build subprocess with the Hermes-managed Node on PATH: when
+    # `hermes update` runs inside the desktop updater chain (Desktop →
+    # hermes-setup → hermes update), the shell PATH customizations are lost,
+    # so a bare-PATH child would fail with `node: not found` before cmd_gui can
+    # self-heal.
+    from hermes_constants import with_hermes_node_path
+
+    build_env = with_hermes_node_path()
+    build_result = _m()._run_logged_subprocess(
+        desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+    )
+    if build_result.returncode != 0:
+        build_result = _m()._run_logged_subprocess(
+            desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+        )
+    if build_result.returncode != 0:
+        print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
+        tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
+        if tail:
+            print(tail)
+        from hermes_constants import display_hermes_home as _dhh
+
+        print(f"  Full build log: {_dhh()}/logs/update.log")
+    else:
+        print("  ✓ Desktop app up to date")
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    # A managed-runtime refresh can replace site-packages before the normal
+    # ``.[all]`` install runs. Snapshot while the old environment can still
+    # prove which optional backends the user had activated.
+    active_lazy_features = _m()._capture_active_lazy_features()
+    active_tool_dependencies = _m()._capture_active_tool_dependencies()
+
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -3992,6 +4313,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(2)
 
+    # Self-lock preflight: the venv-holder sweep above excludes this process
+    # by design (a CLI `hermes update` IS the venv python), so an updater
+    # that has already imported a native venv extension would sail through
+    # and lock its own dependency sync — the #83569 failure mode. Refuse
+    # before touching the checkout; the marker makes the next fresh launch
+    # finish the install. Deliberately not bypassed by --force-venv: that
+    # escape hatches external holders; it cannot unmap an image from the
+    # running process.
+    _self_locked = _m()._detect_self_loaded_native_modules()
+    if _self_locked:
+        _m()._defer_update_for_self_lock(_self_locked)
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        sys.exit(2)
+
+    # Capture this after every fail-closed venv guard, but before either
+    # update path can remove the ignored release tree.
+    desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
+    had_desktop_app_before_update = _desktop_app_present(desktop_dir)
+
     # Try git-based update first, fall back to ZIP download on Windows
     # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)
     use_zip_update = False
@@ -4054,7 +4394,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
         try:
-            _update_via_zip(args)
+            _update_via_zip(
+                args,
+                had_desktop_app_before_update=had_desktop_app_before_update,
+            )
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         return
@@ -4158,7 +4501,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates
+        # Check if there are updates. On shallow checkouts `rev-list --count`
+        # walks the truncated graph and can report the entire remote ancestry
+        # (e.g. "Found 9980 new commit(s)" on a depth-1 install — #53479).
+        # The zero/nonzero gate is still sound (HEAD == origin/<branch> counts
+        # 0), so keep it, but treat the shallow NUMBER as unknown and recover
+        # the real one via the GitHub compare API when possible.
         result = subprocess.run(
             git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
             cwd=_m().PROJECT_ROOT,
@@ -4167,6 +4515,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         commit_count = int(result.stdout.strip())
+
+        apply_is_shallow = (
+            subprocess.run(
+                git_cmd + ["rev-parse", "--is-shallow-repository"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            ).stdout.strip()
+            == "true"
+        )
+        if commit_count > 0 and apply_is_shallow:
+            from hermes_cli.banner import _github_compare_behind
+
+            head_sha = subprocess.run(
+                git_cmd + ["rev-parse", "HEAD"],
+                cwd=_m().PROJECT_ROOT, capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            ).stdout.strip()
+            target_sha = subprocess.run(
+                git_cmd + ["rev-parse", f"origin/{branch}"],
+                cwd=_m().PROJECT_ROOT, capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            ).stdout.strip()
+            counted = _github_compare_behind(head_sha, target_sha)
+            # counted == 0 means local-ahead (remote tip reachable from HEAD):
+            # not behind, fall through to the up-to-date path.
+            commit_count = counted if counted is not None else -1
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -4243,9 +4618,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     _m()._install_python_dependencies_with_optional_fallback(
                         [repair_uv, "pip"], env=repair_env, group="all"
                     )
+                    _m()._refresh_active_lazy_features(
+                        [repair_uv, "pip"],
+                        env=repair_env,
+                        features=active_lazy_features,
+                    )
+                    _m()._restore_active_tool_dependencies(
+                        active_tool_dependencies,
+                        [repair_uv, "pip"],
+                        env=repair_env,
+                    )
                 else:
                     _m()._install_python_dependencies_with_optional_fallback(
                         [sys.executable, "-m", "pip"], group="all"
+                    )
+                    _m()._refresh_active_lazy_features(
+                        [sys.executable, "-m", "pip"],
+                        features=active_lazy_features,
+                    )
+                    _m()._restore_active_tool_dependencies(
+                        active_tool_dependencies,
+                        [sys.executable, "-m", "pip"],
                     )
                 _m()._clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
@@ -4270,7 +4663,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
+        if commit_count > 0:
+            print(f"→ Found {commit_count} new commit(s)")
+        else:
+            # Shallow checkout, exact count unrecoverable (offline/rate-limited
+            # compare API) — the tips differ, so there IS an update.
+            print("→ Updates available (commit count unknown on this shallow checkout)")
 
         print("→ Pulling updates...")
         update_succeeded = False
@@ -4386,6 +4784,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         _invalidate_update_cache()
 
+        # Verify HEAD actually moved (issue #79678). ``merge --ff-only``
+        # succeeding only means the merge completed, not that the update
+        # applied: a checkout that is pinned to a raw SHA (detached HEAD) can
+        # report "N new commit(s)" against origin yet still sit on the old
+        # commit afterward (the branch-switch step re-detaches to the SHA).
+        # Before this guard, ``hermes update`` printed "✓ Code updated!" and
+        # reinstalled deps + rebuilt the desktop app against the stale tree —
+        # no error, no warning, ``hermes doctor`` healthy. Compare pre-pull
+        # and post-pull HEAD; if they match, surface the no-op instead of
+        # claiming success.
+        post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+            print()
+            print("✗ Code did not move — update was a no-op.")
+            print(
+                f"  HEAD is pinned to {pre_pull_sha[:10]} (detached checkout); "
+                f"origin/{branch} advanced but the working tree stayed put."
+            )
+            print(
+                "  Reattach to the branch and retry: "
+                f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
+            )
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            sys.exit(1)
+
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in
         # the old bytecode (e.g. get_hermes_home added to hermes_constants).
@@ -4495,7 +4918,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Lazy refresh can corrupt the venv when a backend install fails.
         # Clear the lazy marker only when refresh/repair is confirmed healthy.
-        lazy_ok = _m()._refresh_active_lazy_features(install_prefix, env=lazy_env)
+        lazy_ok = _m()._refresh_active_lazy_features(
+            install_prefix,
+            env=lazy_env,
+            features=active_lazy_features,
+        )
         if lazy_ok:
             _m()._clear_lazy_refresh_incomplete_marker()
         else:
@@ -4503,6 +4930,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 "  ⚠ Lazy-refresh recovery incomplete — run `hermes` again "
                 "to finish import-based venv repair."
             )
+
+        _m()._restore_active_tool_dependencies(
+            active_tool_dependencies,
+            install_prefix,
+            env=lazy_env,
+        )
 
         # Heal the active memory provider's bridge packages last — the core
         # reinstall + lazy refresh above may have stripped or downgraded
@@ -4530,62 +4963,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
-        # Rebuild the desktop app if the source tree changed since the last
-        # build.  ``hermes desktop --build-only`` uses the content-hash stamp
-        # internally, so this is effectively a no-op when nothing changed.
-        # Only bother if the user has a desktop app installed (indicated by
-        # an existing packaged executable or desktop dist); people who have
-        # never run ``hermes desktop`` shouldn't be forced into a full
-        # Electron build by ``hermes update``.
-        desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
-        has_desktop_app = _m()._desktop_packaged_executable(desktop_dir) is not None or _m()._desktop_dist_exists(desktop_dir)
-        if (desktop_dir / "package.json").exists() and _m()._resolve_node_runtime_npm() and has_desktop_app:
-            print("→ Checking if desktop app needs rebuilding...")
-            # Consult the content-hash stamp IN-PROCESS first. The spawned
-            # `hermes desktop --build-only` subprocess re-imports the whole
-            # CLI stack (~1-3 s) just to reach the same _m()._desktop_build_needed
-            # check; when the stamp already says "up to date" we can skip the
-            # spawn entirely. The update path never passes --source, so the
-            # subprocess would run with source_mode=False — mirror that here.
-            # Any error in the pre-check falls through to the subprocess.
-            _skip_desktop_build = False
-            try:
-                _skip_desktop_build = not _m()._desktop_build_needed(
-                    desktop_dir, _m().PROJECT_ROOT, source_mode=False
-                )
-            except Exception:
-                _skip_desktop_build = False
-            if _skip_desktop_build:
-                print("  ✓ Desktop app up to date")
-            else:
-                _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
-                # Capture the (very loud) Electron/vite build output into
-                # update.log instead of streaming it to the terminal. On the rare
-                # nonzero exit, retry once after waiting again for the venv — this
-                # covers a still-settling rebuild window the first wait didn't fully
-                # catch — then surface the captured tail so the failure is
-                # debuggable.
-                #
-                # Start the build subprocess with the Hermes-managed Node on PATH:
-                # when `hermes update` runs inside the desktop updater chain
-                # (Desktop → hermes-setup → hermes update), the shell PATH
-                # customizations are lost, so a bare-PATH child would fail with
-                # `node: not found` before cmd_gui can self-heal.
-                from hermes_constants import with_hermes_node_path
-
-                _build_env = with_hermes_node_path()
-                build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
-                if build_result.returncode != 0:
-                    build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
-                if build_result.returncode != 0:
-                    print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
-                    tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
-                    if tail:
-                        print(tail)
-                    from hermes_constants import display_hermes_home as _dhh
-                    print(f"  Full build log: {_dhh()}/logs/update.log")
-                else:
-                    print("  ✓ Desktop app up to date")
+        _rebuild_desktop_after_update(
+            desktop_dir,
+            had_desktop_app_before_update=had_desktop_app_before_update,
+        )
 
         print()
         print("✓ Code updated!")
@@ -5069,6 +5450,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 pass
 
         gateway_fleet_restart_incomplete = False
+        # Snapshot of gateways running before we touch anything. Stays empty
+        # until we successfully import the probe and are about to stop/drain —
+        # so an exception raised before we touch any gateway keeps this empty
+        # (nothing to fail closed on), while a failure after we have stopped a
+        # discovered gateway lets the handler fail closed on an empty survivor
+        # probe rather than reporting a clean update (#78574).
+        _pre_restart_gateway_pids: list | None = []
 
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
@@ -5247,6 +5635,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
             killed_pids = set()
             relaunched_profiles = []
             externally_supervised_profiles = []
+
+            # Record which gateways are running before any stop/drain, so a
+            # later failure that leaves the survivor probe empty can still be
+            # recognised as "a running gateway was stopped and did not come
+            # back" rather than "nothing was running" (#78574). Best-effort:
+            # if the probe itself raises, leave the snapshot as-is (the
+            # survivor probe's own None result already fails closed).
+            try:
+                _pre_restart_gateway_pids = list(find_gateway_pids(all_profiles=True))
+            except Exception:
+                _pre_restart_gateway_pids = None
 
             # --- Systemd services (Linux) ---
             # Discover all hermes-gateway* units (default + profiles)
@@ -5730,6 +6129,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
+            # An exception escaping the whole phase means the drain/restart
+            # output the user relies on never printed. Don't let that pass for
+            # a clean update: surface it and treat the fleet as stale unless we
+            # can positively prove no gateway is running (#78574).
+            #
+            # A positive-empty ``_surviving`` is only proof-of-safety when
+            # nothing was running before we touched anything. If a gateway was
+            # discovered pre-restart and none survive now, it was stopped and
+            # its replacement was never verified — the same fail-open contract
+            # this fix closes — so we must still fail closed on ``[]``.
+            _surviving = _surviving_gateway_pids_after_failed_restart()
+            if _restart_phase_failure_is_incomplete(
+                _surviving, _pre_restart_gateway_pids
+            ):
+                gateway_fleet_restart_incomplete = True
+                _warn_gateway_restart_phase_aborted(e, _surviving)
+                if gateway_mode:
+                    _exit_code_path = get_hermes_home() / ".update_exit_code"
+                    try:
+                        _exit_code_path.write_text("1", encoding="utf-8")
+                    except OSError:
+                        pass
 
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
 
@@ -5780,16 +6201,40 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
-        if sys.platform == "win32":
+        if _m()._is_windows():
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(args)
+            _update_via_zip(
+                args,
+                had_desktop_app_before_update=had_desktop_app_before_update,
+            )
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
+
+def _restart_phase_failure_is_incomplete(surviving, pre_restart_pids) -> bool:
+    """Whether an escaped gateway-restart-phase exception must fail the update.
+
+    Fail closed unless we can positively prove the fleet is safe:
+
+    * ``surviving is None`` — the survivor probe could not determine state
+      (typically the freshly-pulled ``hermes_cli.gateway`` no longer imports,
+      one of the ways the phase aborts). Assume stale.
+    * ``surviving`` non-empty — a gateway is still running pre-update code.
+    * ``surviving == []`` — nothing is running now. That is proof-of-safety
+      ONLY when nothing was running before we touched anything. If a gateway
+      was discovered pre-restart (``pre_restart_pids`` non-empty, or ``None``
+      meaning the pre-state could not be read), it was stopped without a
+      verified replacement, so we still fail closed (#78574).
+    """
+    if surviving is None or surviving:
+        return True
+    # surviving == []: safe only if we know nothing was running beforehand.
+    return pre_restart_pids is None or bool(pre_restart_pids)
+
 
 def _print_items(items, label, key, fallback_key=None):
     if not items:

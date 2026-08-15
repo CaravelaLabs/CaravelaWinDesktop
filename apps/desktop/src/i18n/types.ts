@@ -170,6 +170,7 @@ export interface Translations {
     updateHermes: string
     updateReadyTitle: string
     updateReadyMessage: (count: number) => string
+    updateReadyMessageUnknown: string
     seeWhatsNew: string
     errors: {
       elevenLabsNeedsKey: string
@@ -294,6 +295,7 @@ export interface Translations {
       providerApiKeys: string
       providerCustomEndpoints: string
       gateway: string
+      connections: string
       apiKeys: string
       keybinds: string
       keysTools: string
@@ -450,6 +452,7 @@ export interface Translations {
       cantReach: string
       tapCheck: string
       updateReady: (count: number) => string
+      updateReadyUnknown: string
       lastChecked: (age: string) => string
       justNowSuffix: string
       automaticUpdates: string
@@ -512,6 +515,43 @@ export interface Translations {
       replace: string
       set: string
       clear: string
+    }
+    // v2 multi-connection registry: Settings → Connections.
+    connections: {
+      title: string
+      intro: string
+      stagedNote: string
+      loadFailed: string
+      primaryPill: string
+      managedPill: string
+      addConnection: string
+      editConnection: string
+      removeConnection: string
+      removeConfirmTitle: string
+      removeConfirmDesc: (label: string) => string
+      makePrimary: string
+      testConnection: string
+      testOk: string
+      testFailed: string
+      saveFailed: string
+      removeFailed: string
+      kindLocal: string
+      kindRemote: string
+      kindCloud: string
+      kindSsh: string
+      kindLocalDesc: string
+      kindRemoteDesc: string
+      kindCloudDesc: string
+      kindSshDesc: string
+      labelTitle: string
+      labelDesc: string
+      labelPlaceholder: string
+      urlTitle: string
+      sshHostTitle: string
+      save: string
+      saving: string
+      cancel: string
+      empty: string
     }
     gateway: {
       loading: string
@@ -875,6 +915,7 @@ export interface Translations {
   skills: {
     tabSkills: string
     tabToolsets: string
+    configuringProfile: string
     tabMcp: string
     tabHub: string
     all: string
@@ -1662,6 +1703,7 @@ export interface Translations {
       rename: string
       archive: string
       newWindow: string
+      openInTerminal: string
       hideTabBar: string
       openInNewTab: string
       openInSplit: string

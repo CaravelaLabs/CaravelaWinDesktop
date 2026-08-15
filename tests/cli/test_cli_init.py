@@ -372,6 +372,64 @@ class TestHistoryDisplay:
         )
 
 
+class TestNestedDictModelDefaultPairing:
+    """A dict-valued ``model.default`` must keep its nested provider paired.
+
+    ``model.default: {provider: ..., model: ...}`` canonicalizes to the string
+    model AND the nested provider, so ``HermesCLI`` routes the model through
+    that provider instead of discarding it and falling back to the outer
+    merged ``model.provider`` (``"auto"`` — authoritative at runtime
+    resolution, which would route the model through the wrong active
+    provider).
+    """
+
+    def test_nested_dict_default_keeps_provider_paired(self):
+        cli = _make_cli(config_overrides={
+            "model": {
+                "default": {"provider": "nous", "model": "nested-default-model"},
+                "provider": "auto",
+            },
+        })
+        assert cli.model == "nested-default-model"
+        assert cli.requested_provider == "nous"
+        assert cli.provider == "nous"
+
+    def test_nested_dict_model_alias_keeps_provider_paired(self):
+        cli = _make_cli(config_overrides={
+            "model": {
+                "model": {"provider": "openai", "model": "nested-alias-model"},
+                "provider": "auto",
+            },
+        })
+        assert cli.model == "nested-alias-model"
+        assert cli.requested_provider == "openai"
+        assert cli.provider == "openai"
+
+    def test_flat_string_default_still_uses_outer_provider(self):
+        cli = _make_cli(config_overrides={
+            "model": {
+                "default": "flat-default-model",
+                "provider": "auto",
+            },
+        })
+        assert cli.model == "flat-default-model"
+        assert cli.requested_provider == "auto"
+        assert cli.provider == "auto"
+
+    def test_nested_provider_does_not_override_explicit_provider_arg(self):
+        cli = _make_cli(
+            config_overrides={
+                "model": {
+                    "default": {"provider": "nous", "model": "nested-default-model"},
+                    "provider": "auto",
+                },
+            },
+            provider="anthropic",
+        )
+        assert cli.model == "nested-default-model"
+        assert cli.requested_provider == "anthropic"
+        assert cli.provider == "anthropic"
+
 
 class TestRootLevelProviderOverride:
     """Root-level provider/base_url in config.yaml must NOT override model.provider."""
@@ -531,6 +589,74 @@ class TestRootLevelProviderOverride:
         assert result["model"]["default"] == "m-key"
         assert "model" not in result["model"] and "name" not in result["model"]
 
+
+    # --- dict-valued model.default flattening (PR #83902 follow-up) --------
+    # ``model.default: {provider: ..., model: ...}`` must flatten into a string
+    # ``model.default`` plus ``model.provider`` at the load chokepoint so every
+    # reader (doctor, status, fallback picker, prompt-size, context-switch
+    # guard) sees plain strings instead of a nested dict that crashes
+    # ``.strip()``/``.lower()`` or routes the model through the wrong provider.
+
+    def test_nested_dict_default_flattens_model_and_provider(self):
+        """dict model.default -> string default + provider, no outer provider set."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        result = _normalize_root_model_keys({
+            "model": {
+                "default": {"provider": "nous", "model": "nested-default-model"},
+            },
+        })
+        assert result["model"]["default"] == "nested-default-model"
+        assert result["model"]["provider"] == "nous"
+
+    def test_nested_dict_default_provider_wins_over_auto(self):
+        """Nested provider replaces the merged default "auto"."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        result = _normalize_root_model_keys({
+            "model": {
+                "default": {"provider": "nous", "model": "nested-default-model"},
+                "provider": "auto",
+            },
+        })
+        assert result["model"]["default"] == "nested-default-model"
+        assert result["model"]["provider"] == "nous"
+
+    def test_nested_dict_default_never_overrides_explicit_provider(self):
+        """An explicitly configured model.provider beats the nested provider."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        result = _normalize_root_model_keys({
+            "model": {
+                "default": {"provider": "nous", "model": "nested-default-model"},
+                "provider": "anthropic",
+            },
+        })
+        assert result["model"]["default"] == "nested-default-model"
+        assert result["model"]["provider"] == "anthropic"
+
+    def test_nested_dict_model_alias_flattens_to_default(self):
+        """dict model.model alias also flattens (default > model > name)."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        result = _normalize_root_model_keys({
+            "model": {
+                "model": {"provider": "openai", "model": "nested-alias-model"},
+            },
+        })
+        assert result["model"]["default"] == "nested-alias-model"
+        assert result["model"]["provider"] == "openai"
+        assert "model" not in result["model"]
+
+    def test_flat_string_default_untouched(self):
+        """Plain string defaults keep existing behavior exactly."""
+        from hermes_cli.config import _normalize_root_model_keys
+
+        result = _normalize_root_model_keys({
+            "model": {"default": "flat-default-model", "provider": "auto"},
+        })
+        assert result["model"]["default"] == "flat-default-model"
+        assert result["model"]["provider"] == "auto"
 
 
 

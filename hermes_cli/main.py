@@ -696,7 +696,17 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+# Updating dependencies must not import optional secret-manager libraries into
+# the updater process before ``uv`` replaces the environment.  On Windows,
+# Bitwarden's cryptography import maps ``_rust.pyd`` and the parent updater then
+# prevents its own child installer from replacing that file (#73381).  Profile
+# flags have already been stripped above, so the first remaining argument is
+# the authoritative argparse subcommand.  Dotenv/managed config still loads;
+# only external secret fetches are unnecessary for installation maintenance.
+load_hermes_dotenv(
+    project_env=PROJECT_ROOT / ".env",
+    load_external_secrets=sys.argv[1:2] != ["update"],
+)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -8590,12 +8600,17 @@ def _run_quarantined_install(
         moved = _quarantine_running_hermes_exe(scripts_dir)
     try:
         _run_install_with_heartbeat(cmd, env=env)
-    except BaseException:
-        # Restore shims if pip/uv didn't write replacements (e.g. install
-        # failed before the entry-points step). Don't swallow the error.
+    finally:
+        # Restore shims when the installer didn't write replacements — on
+        # FAILURE (install died before the entry-points step) and on SUCCESS
+        # too: uv audits an already-satisfied editable install as a no-op and
+        # rewrites no entry points, which would otherwise leave the shims
+        # quarantined aside and `hermes` missing from PATH after a green
+        # install (#75584). _restore_quarantined_exes skips any shim the
+        # installer actually replaced, so this never clobbers fresh output.
+        # Errors are not swallowed — the finally re-raises whatever escaped.
         if scripts_dir is not None:
             _restore_quarantined_exes(moved)
-        raise
 
 
 def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:

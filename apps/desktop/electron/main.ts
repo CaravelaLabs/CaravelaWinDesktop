@@ -17,7 +17,6 @@ import {
   globalShortcut,
   ipcMain,
   Menu,
-  nativeImage,
   nativeTheme,
   Notification,
   powerMonitor,
@@ -84,6 +83,8 @@ import {
   tokenPreview
 } from './connection-config'
 import {
+  backendScopeKey,
+  backendScopePrefix,
   mergeConnectionInput,
   migrateV1ToRegistry,
   normalizeConnectionInput,
@@ -95,6 +96,7 @@ import {
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
+import { formatDesktopLogLine } from './desktop-log-line'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -115,9 +117,21 @@ import {
   tuiResumeArgs
 } from './external-terminal'
 import { findGitBash as _findGitBash } from './find-git-bash'
-import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
+import {
+  installFindShortcut,
+  installFoundInPageForwarder,
+  performFindAfterIndexingStarted,
+  stopFind
+} from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
+import {
+  filenameFromContentDisposition,
+  gatewayFilePath,
+  isNotFoundError,
+  parseDataUrlToBuffer,
+  pumpStreamToFile
+} from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
 import {
@@ -169,8 +183,10 @@ import { cursorPointInWindow } from './hud-cursor'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
+import { imageContextMenuItems } from './image-context-menu'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
+import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -313,6 +329,10 @@ const IS_WSL = isWslEnvironment()
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
 const APP_ROOT = app.getAppPath()
+
+// Device-local preference: block F12 from opening DevTools.
+// Set dynamically via IPC from the renderer Settings → Advanced.
+let f12Blocked = false
 
 // Preload must be plain JS — Electron's sandbox can't run .ts, and tsx's
 // ESM loader is broken on Electron 40's Node (ERR_INVALID_RETURN_PROPERTY_VALUE).
@@ -1055,30 +1075,10 @@ app.setAboutPanelOptions({
   copyright: 'Copyright © 2026 Nous Research'
 })
 
-// Custom scheme for streaming local media (video/audio) into the renderer.
-// Reading large media through `readFileDataUrl` failed: it base64-loads the
-// whole file into memory and is hard-capped (default 16 MB, Settings → Chat),
-// so any non-trivial video silently refused to load. Streaming via a protocol
-// handler removes the size cap and gives the <video> element seekable,
-// range-aware playback. Must be registered before the app is ready.
-const MEDIA_PROTOCOL = 'hermes-media'
-
-// Only audio/video may be streamed. Without this the handler would read any
-// non-blocklisted local file (no size cap) for any `fetch(hermes-media://…)`.
-const STREAMABLE_MEDIA_EXTS = new Set([
-  '.avi',
-  '.flac',
-  '.m4a',
-  '.mkv',
-  '.mov',
-  '.mp3',
-  '.mp4',
-  '.ogg',
-  '.opus',
-  '.wav',
-  '.webm'
-])
-
+// Custom scheme for streaming audio/video into the renderer. Local paths read
+// from this machine; remote paths are proxied through the configured gateway
+// with main-process authentication. This avoids whole-file data URLs and keeps
+// playback seekable and Range-aware. Must be registered before app readiness.
 protocol.registerSchemesAsPrivileged([
   {
     scheme: MEDIA_PROTOCOL,
@@ -1092,31 +1092,45 @@ protocol.registerSchemesAsPrivileged([
 ])
 
 function registerMediaProtocol() {
-  protocol.handle(MEDIA_PROTOCOL, async request => {
-    let resolvedPath
+  const handler = createMediaProtocolHandler({
+    ensureRemoteBearer: baseUrl => ensureNativeAccessToken(baseUrl).catch(() => null),
+    fetchLocal: (resolvedPath, headers, method) =>
+      electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
+        bypassCustomProtocolHandlers: true,
+        credentials: 'omit',
+        headers,
+        method
+      }),
+    fetchRemote: (url, headers, method) =>
+      electronNet.fetch(url, {
+        bypassCustomProtocolHandlers: true,
+        credentials: 'omit',
+        headers,
+        method
+      }),
+    fetchRemoteWithCookies: (url, headers, method) => {
+      const oauthSession = getOauthSession()
 
-    try {
-      const url = new URL(request.url)
+      if (!oauthSession) {
+        throw new Error('OAuth session partition is unavailable.')
+      }
 
-      const filePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+      return oauthSession.fetch(url, {
+        bypassCustomProtocolHandlers: true,
+        credentials: 'include',
+        headers,
+        method
+      })
+    },
+    resolveLocalFile: async filePath => {
+      const { resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' })
 
-      ;({ resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' }))
-    } catch {
-      return new Response('Media not found', { status: 404 })
-    }
-
-    if (!STREAMABLE_MEDIA_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
-      return new Response('Unsupported media type', { status: 415 })
-    }
-
-    // Delegate to Electron's net stack on a file:// URL — it resolves the
-    // content-type and honors Range requests so seeking works. Forward the
-    // renderer's headers (notably Range) and skip custom-protocol re-entry.
-    return electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
-      bypassCustomProtocolHandlers: true,
-      headers: request.headers
-    })
+      return resolvedPath
+    },
+    resolveRemoteConnection: profile => ensureBackend(profile)
   })
+
+  protocol.handle(MEDIA_PROTOCOL, handler)
 }
 
 let mainWindow = null
@@ -1336,7 +1350,10 @@ function rememberLog(chunk) {
     return
   }
 
-  const lines = text.split(/\r?\n/).map(line => `[hermes] ${line}`)
+  // One timestamp per chunk: lines arriving in the same event happened
+  // at the same moment.  ISO-8601 UTC, matching agent.log/gateway.log.
+  const stamp = new Date().toISOString()
+  const lines = text.split(/\r?\n/).map(line => formatDesktopLogLine(line, stamp))
   hermesLog.push(...lines)
 
   if (hermesLog.length > 300) {
@@ -4646,6 +4663,64 @@ function fetchJson(url, token, options: any = {}) {
   })
 }
 
+// Token-auth download that streams the response body straight to a
+// user-selected destination (via finalizeGatewayDownload) instead of buffering
+// the whole file in memory. The connect timeout is cleared once headers arrive
+// so a slow save dialog or a large stream doesn't trip it.
+function downloadViaTokenToFile(url, token, ctx, options: any = {}) {
+  return new Promise((resolve, reject) => {
+    let parsed
+
+    try {
+      parsed = new URL(url)
+    } catch (error) {
+      reject(new Error(`Invalid URL: ${error.message}`))
+
+      return
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+
+      return
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+    const req = client.request(
+      parsed,
+      {
+        method: 'GET',
+        headers: {
+          'X-Hermes-Session-Token': token
+        }
+      },
+      res => {
+        // Headers arrived — the connection phase is done. Drop the idle timeout
+        // so it can't abort mid-stream or while the save dialog is open.
+        req.setTimeout(0)
+        finalizeGatewayDownload(res, res.statusCode || 500, res.headers || {}, {
+          ...ctx,
+          abort: () => {
+            try {
+              req.destroy()
+            } catch {
+              // already finished
+            }
+          }
+        }).then(resolve, reject)
+      }
+    )
+
+    req.on('error', reject)
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    })
+    req.end()
+  })
+}
+
 function fetchPublicJson(url, options: any = {}) {
   // Credential-free JSON GET/POST for public gateway endpoints
   // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
@@ -5128,17 +5203,6 @@ async function resourceBufferFromUrl(rawUrl) {
 
     req.on('error', reject)
   })
-}
-
-async function copyImageFromUrl(rawUrl) {
-  const { buffer } = (await resourceBufferFromUrl(rawUrl)) as any
-  const image = nativeImage.createFromBuffer(buffer)
-
-  if (image.isEmpty()) {
-    throw new Error('Could not read image')
-  }
-
-  clipboard.writeImage(image)
 }
 
 async function saveImageFromUrl(rawUrl) {
@@ -5766,7 +5830,11 @@ function buildApplicationMenu() {
     submenu: [
       { role: 'reload' },
       { role: 'forceReload' },
-      { role: 'toggleDevTools' },
+      {
+        label: 'Toggle Developer Tools',
+        accelerator: process.platform === 'darwin' ? 'Alt+Cmd+I' : 'Ctrl+Shift+I',
+        click: (_menuItem, browserWindow) => toggleDevTools(browserWindow || mainWindow)
+      },
       { type: 'separator' },
       {
         label: 'Actual Size',
@@ -5827,9 +5895,20 @@ function toggleDevTools(window) {
 }
 
 function installDevToolsShortcut(window) {
-  // F12 / Cmd+Opt+I works in both dev and packaged builds.
+  // Only Ctrl+Shift+I (or Cmd+Opt+I on Mac) opens DevTools.
+  // F12 is explicitly blocked so Chromium's built-in handler doesn't open it.
   window.webContents.on('before-input-event', (event, input) => {
     const key = input.key.toLowerCase()
+
+    // F12 opens DevTools by default; block only when the user disabled it.
+    if (input.key === 'F12') {
+      if (f12Blocked) {
+        event.preventDefault()
+
+        return
+      }
+      // Not blocked — fall through to open DevTools.
+    }
 
     const isInspectShortcut =
       input.key === 'F12' ||
@@ -5992,39 +6071,19 @@ function installContextMenu(window) {
   window.webContents.on('context-menu', (_event, params) => {
     const template = []
     const hasSelection = Boolean(params.selectionText?.trim())
-    const hasImage = params.mediaType === 'image' && Boolean(params.srcURL)
     const hasLink = Boolean(params.linkURL)
     const isEditable = Boolean(params.isEditable)
 
-    if (hasImage) {
-      template.push(
-        {
-          label: 'Open Image',
-          click: () => {
-            if (params.srcURL && !params.srcURL.startsWith('data:')) {
-              openExternalUrl(params.srcURL)
-            }
-          },
-          enabled: !params.srcURL.startsWith('data:')
-        },
-        {
-          label: 'Copy Image',
-          click: () => {
-            void copyImageFromUrl(params.srcURL).catch(error => rememberLog(`Copy image failed: ${error.message}`))
-          }
-        },
-        {
-          label: 'Copy Image Address',
-          click: () => clipboard.writeText(params.srcURL)
-        },
-        {
-          label: 'Save Image As...',
-          click: () => {
-            void saveImageFromUrl(params.srcURL).catch(error => rememberLog(`Save image failed: ${error.message}`))
-          }
+    template.push(
+      ...imageContextMenuItems(params, {
+        copyImageAt: (x, y) => window.webContents.copyImageAt(x, y),
+        openImage: openExternalUrl,
+        copyImageAddress: url => clipboard.writeText(url),
+        saveImage: url => {
+          void saveImageFromUrl(url).catch(error => rememberLog(`Save image failed: ${error.message}`))
         }
-      )
-    }
+      })
+    )
 
     if (hasLink) {
       if (template.length) {
@@ -6775,6 +6834,235 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
   }
 }
 
+// OAuth-session download that streams the response body straight to a
+// user-selected destination (via finalizeGatewayDownload). The connect timeout
+// is cleared once the response headers arrive.
+function downloadViaOauthSessionToFile(url, ctx, options: any = {}) {
+  return new Promise((resolve, reject) => {
+    const sess = getOauthSession()
+
+    if (!sess) {
+      reject(new Error('OAuth session partition is unavailable.'))
+
+      return
+    }
+
+    let parsed
+
+    try {
+      parsed = new URL(url)
+    } catch (error) {
+      reject(new Error(`Invalid URL: ${error.message}`))
+
+      return
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+
+      return
+    }
+
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+    const request = electronNet.request({
+      method: 'GET',
+      url,
+      session: sess,
+      useSessionCookies: true,
+      redirect: 'follow'
+    } as any)
+
+    let settled = false
+
+    const timer = setTimeout(() => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+
+      try {
+        request.abort()
+      } catch {
+        // already finished
+      }
+
+      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    request.on('response', res => {
+      if (settled) {
+        return
+      }
+
+      // Response headers arrived — cancel the connect timeout so it can't abort
+      // the stream while the save dialog is open or bytes are still flowing.
+      settled = true
+      clearTimeout(timer)
+      finalizeGatewayDownload(res, res.statusCode || 500, res.headers || {}, {
+        ...ctx,
+        abort: () => {
+          try {
+            request.abort()
+          } catch {
+            // already finished
+          }
+        }
+      }).then(resolve, reject)
+    })
+    request.on('error', error => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
+    request.end()
+  })
+}
+
+// Shared tail for both transports: validate status, pick a filename, prompt the
+// save dialog, then stream the (still-unconsumed) response body to the chosen
+// destination. On an HTTP error the status code is attached so saveGatewayFile
+// can trigger the 404-only compatibility fallback.
+async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) {
+  if (statusCode >= 400) {
+    const message = await readGatewayErrorText(res)
+    const error: any = new Error(`${statusCode}: ${message}`)
+    error.statusCode = statusCode
+    throw error
+  }
+
+  const disposition = headers['content-disposition'] || headers['Content-Disposition']
+  const filename = filenameFromContentDisposition(disposition) || ctx.suggested || ctx.fallbackName
+
+  const result = await dialog.showSaveDialog(mainWindow, {
+    defaultPath: filename,
+    title: 'Save File'
+  })
+
+  if (result.canceled || !result.filePath) {
+    ctx.abort?.()
+
+    return { canceled: true, saved: false }
+  }
+
+  try {
+    await pumpStreamToFile(res, result.filePath, {
+      createWriteStream: (destPath: string) => fs.createWriteStream(destPath),
+      unlink: (destPath: string) => fs.promises.unlink(destPath)
+    })
+  } catch (error) {
+    ctx.abort?.()
+    throw error
+  }
+
+  return { path: result.filePath, saved: true }
+}
+
+// Read a bounded amount of an error response body for the thrown message.
+function readGatewayErrorText(res): Promise<string> {
+  return new Promise(resolve => {
+    const chunks = []
+    let total = 0
+
+    res.on('data', chunk => {
+      if (total >= 500) {
+        return
+      }
+
+      const buffer = Buffer.from(chunk)
+
+      total += buffer.length
+      chunks.push(buffer)
+    })
+    res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8').slice(0, 500)))
+    res.on('error', () => resolve(Buffer.concat(chunks).toString('utf8').slice(0, 500)))
+  })
+}
+
+async function saveGatewayFile(payload: any = {}) {
+  const filePath = gatewayFilePath(payload.path)
+
+  if (!filePath) {
+    throw new Error('Missing gateway file path')
+  }
+
+  const profile = payload.profile || null
+  const connection = await ensureBackend(profile)
+  const suggested = String(payload.suggestedName || '').trim()
+  const fallbackName = path.basename(filePath) || suggested || 'download'
+  const ctx = { suggested, fallbackName }
+
+  const requestPath = pathWithGlobalRemoteProfile(`/api/fs/download?path=${encodeURIComponent(filePath)}`, profile, {
+    globalRemote: globalRemoteActive(),
+    profileRemoteOverride: profileHasRemoteOverride(profile)
+  })
+
+  const url = `${connection.baseUrl}${requestPath}`
+
+  try {
+    return await (connection.authMode === 'oauth'
+      ? downloadViaOauthSessionToFile(url, ctx)
+      : downloadViaTokenToFile(url, connection.token, ctx))
+  } catch (error) {
+    // Desktop and the remote gateway update independently. A gateway predating
+    // /api/fs/download 404s here; fall back (ONLY on 404) to the older capped
+    // data-URL route so downloads keep working against older backends.
+    if (isNotFoundError(error)) {
+      return await saveGatewayFileViaDataUrl(connection, profile, filePath, ctx)
+    }
+
+    throw error
+  }
+}
+
+// Compatibility fallback: fetch the file through the capped
+// `/api/fs/read-data-url` route, decode it, and save. Bounded by the gateway's
+// data-URL cap, so it only serves smaller files — enough to keep older gateways
+// working until they gain the streaming route.
+async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any = {}) {
+  const requestPath = pathWithGlobalRemoteProfile(
+    `/api/fs/read-data-url?path=${encodeURIComponent(filePath)}`,
+    profile,
+    {
+      globalRemote: globalRemoteActive(),
+      profileRemoteOverride: profileHasRemoteOverride(profile)
+    }
+  )
+
+  const url = `${connection.baseUrl}${requestPath}`
+
+  const json = (
+    connection.authMode === 'oauth' ? await fetchJsonViaOauthSession(url) : await fetchJson(url, connection.token)
+  ) as any
+
+  const dataUrl = json?.dataUrl
+
+  if (!dataUrl) {
+    throw new Error('Gateway returned no file data')
+  }
+
+  const buffer = parseDataUrlToBuffer(dataUrl)
+  const filename = ctx.suggested || ctx.fallbackName
+
+  const result = await dialog.showSaveDialog(mainWindow, {
+    defaultPath: filename,
+    title: 'Save File'
+  })
+
+  if (result.canceled || !result.filePath) {
+    return { canceled: true, saved: false }
+  }
+
+  await fs.promises.writeFile(result.filePath, buffer)
+
+  return { path: result.filePath, saved: true }
+}
+
 // Mint a single-use WS ticket for a gated gateway. Returns the ticket string.
 // Prefers a native bearer token (cookieless RFC 8252 flow) when present,
 // falling back to the OAuth cookie partition otherwise.
@@ -7248,6 +7536,7 @@ async function discoverCloudAgents(org?: string) {
         const err = new Error(
           'Your Hermes Cloud session has expired. Open Settings → Gateway and sign in again.'
         ) as any
+
         err.needsCloudLogin = true
         err.cause = error
         throw err
@@ -8321,6 +8610,20 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
 
 function persistSshConnectionToken(profile, source, token) {
   try {
+    // Registry-scoped ssh backend (source "registry:<connectionId>"): the
+    // served token belongs on the registry entry, not v1 connection.json.
+    if (typeof source === 'string' && source.startsWith('registry:')) {
+      const id = source.slice('registry:'.length)
+      const registry = readDesktopConnectionsRegistry()
+      const entry = registry.connections.find(c => c.id === id)
+
+      if (entry && entry.kind === 'ssh') {
+        writeDesktopConnectionsRegistry(upsertConnection(registry, { ...entry, token: encryptDesktopSecret(token) }))
+      }
+
+      return
+    }
+
     const config = readDesktopConnectionConfig()
     const encrypted = encryptDesktopSecret(token)
 
@@ -8887,6 +9190,148 @@ async function ensureBackend(profile) {
   startPoolIdleReaper()
 
   return entry.connectionPromise
+}
+
+// ── Registry-scoped backends (multi-connection, PR 2 of the campaign) ──────
+// Resolve a backend for (connectionId, profile) against the v2 registry.
+// The LOCAL connection routes through ensureBackend() untouched, so every
+// single-source path stays byte-identical; non-local connections pool under
+// the composite key from backendScopeKey() and reuse the same pool entry
+// lifecycle (LRU, idle reaper, touch) as per-profile local backends.
+async function ensureRegistryBackend(connectionId, profile) {
+  const registry = readDesktopConnectionsRegistry()
+  const id = String(connectionId || '').trim() || registry.primary
+  const source = registry.connections.find(c => c.id === id)
+
+  if (!source) {
+    throw new Error(`No connection with id "${id}".`)
+  }
+
+  if (source.kind === 'local') {
+    return ensureBackend(profile)
+  }
+
+  const key = backendScopeKey(id, profile)
+  const existing = backendPool.get(key)
+
+  if (existing) {
+    existing.lastActiveAt = Date.now()
+
+    return existing.connectionPromise
+  }
+
+  evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
+
+  const entry = {
+    process: null,
+    port: null,
+    token: null,
+    connectionPromise: null,
+    lastActiveAt: Date.now(),
+    remoteBaseUrl: null
+  }
+
+  entry.connectionPromise = connectRegistryBackend(source, profile, key, entry).catch(error => {
+    if (backendPool.get(key) === entry) {
+      backendPool.delete(key)
+    }
+
+    throw error
+  })
+  backendPool.set(key, entry)
+  startPoolIdleReaper()
+
+  return entry.connectionPromise
+}
+
+// Dial a non-local registry connection for one profile. Never spawns a local
+// child (entry.process stays null — stopPoolBackend/evict already tolerate
+// that shape from remote per-profile overrides).
+async function connectRegistryBackend(source, profile, key, poolEntry) {
+  const profileKey = String(profile ?? '').trim() || 'default'
+
+  if (source.kind === 'ssh') {
+    // The composite key doubles as the ssh scope so each (connection, profile)
+    // pair owns its own tunnel + remote dashboard; the profile that re-homes
+    // the REMOTE process is the entry's remoteProfile or the requested one —
+    // never the composite string.
+    const sshConfig = normalizeSshConfig({
+      mode: 'ssh',
+      host: source.host,
+      user: source.user,
+      port: source.port,
+      keyPath: source.keyPath,
+      remoteHermesPath: source.remoteHermesPath,
+      remoteProfile: source.remoteProfile || (profileKey === 'default' ? '' : profileKey)
+    })
+
+    if (!sshConfig) {
+      throw new Error(`SSH connection "${source.label}" has no host configured.`)
+    }
+
+    const connection = await bootstrapSshConnection(
+      key,
+      sshConfig,
+      decryptDesktopSecret(source.token),
+      `registry:${source.id}`
+    )
+
+    poolEntry.remoteBaseUrl = connection.baseUrl
+
+    return {
+      ...connection,
+      profile: profileKey,
+      connectionId: source.id,
+      logs: hermesLog.slice(-80),
+      ...getWindowState()
+    }
+  }
+
+  // remote / cloud: one gateway host serves every profile of that source,
+  // scoped per request — the descriptor carries the profile + connectionId so
+  // renderer-side WS minting and REST scoping target the right agent.
+  const token = source.authMode === 'oauth' ? null : decryptDesktopSecret(source.token)
+
+  const connection = await buildRemoteConnection(
+    source.url,
+    normAuthMode(source.authMode),
+    token,
+    `registry:${source.id}`,
+    undefined,
+    source.kind === 'cloud' ? 'cloud' : 'url'
+  )
+
+  await waitForHermes(connection.baseUrl, connection.token, undefined, connection.authMode)
+  poolEntry.remoteBaseUrl = connection.baseUrl
+
+  return {
+    ...connection,
+    profile: profileKey,
+    connectionId: source.id,
+    // One host, many profiles: REST paths must carry ?profile= (same contract
+    // as the global-remote shared-primary route).
+    sharedRemote: true,
+    logs: hermesLog.slice(-80),
+    ...getWindowState()
+  }
+}
+
+// Stop every pooled backend and ssh scope owned by a registry connection —
+// called when the connection is removed from the registry.
+function stopRegistryConnectionBackends(connectionId) {
+  const prefix = backendScopePrefix(connectionId)
+
+  for (const key of [...backendPool.keys()]) {
+    if (String(key).startsWith(prefix)) {
+      stopPoolBackend(key)
+    }
+  }
+
+  for (const scope of [...sshConnections.keys()]) {
+    if (String(scope).startsWith(prefix)) {
+      void teardownSshConnection(scope)
+    }
+  }
 }
 
 // Mark a pool profile as recently used so the idle reaper spares it. The
@@ -9579,6 +10024,16 @@ async function startHermes() {
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
+
+  // Claim Ctrl/Cmd+F in the main process — on Pop!_OS / GNOME-based Linux
+  // distros the Ctrl+F keydown does not reach the renderer's `view.findInPage`
+  // binding (#81727). Routing it through `before-input-event` forwards the
+  // intent at the earliest observable point. macOS / Windows keep the
+  // renderer's own rebindable keybind, so the hook is Linux-only: installing
+  // it elsewhere would make Ctrl/Cmd+F un-rebindable and double-open.
+  if (process.platform === 'linux') {
+    installFindShortcut(win)
+  }
 
   if (zoom) {
     installZoomShortcuts(win)
@@ -10295,8 +10750,14 @@ function spawnHudWindow(sessionId, profile) {
       hudWindow = null
     }
 
-    // Closed from its own side (⌘W) — put the app back so the user is never
-    // left with no surface, and correct every window's toggle.
+    // Closed from its own side (⌘W) — closeHudWindow()'s dispose() never ran,
+    // so the global snap shortcut would otherwise stay registered (and stuck
+    // taken) with no HUD left to apply it to. dispose() is idempotent, so
+    // this is safe even if closeHudWindow() already released it.
+    hudSnapShortcut.dispose()
+
+    // Put the app back so the user is never left with no surface, and
+    // correct every window's toggle.
     restoreMainWindowFromHud()
     broadcastHudState(false)
   })
@@ -10811,6 +11272,14 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+// Registry-scoped variant: resolve a backend for (connectionId, profile).
+// connectionId '' / 'local' / the registry primary all behave sensibly; the
+// local kind delegates to ensureBackend so legacy behavior is untouched.
+ipcMain.handle('hermes:connection:for', async (_event, payload) => {
+  const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
+
+  return ensureRegistryBackend(connectionId, profile)
+})
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -11362,8 +11831,12 @@ ipcMain.handle('hermes:connections:save', async (_event, payload) => {
   return { ok: true, connection: saved, registry: sanitizeConnectionsRegistry() }
 })
 ipcMain.handle('hermes:connections:remove', async (_event, id) => {
-  const registry = removeConnection(readDesktopConnectionsRegistry(), String(id || ''))
+  const key = String(id || '')
+  const registry = removeConnection(readDesktopConnectionsRegistry(), key)
   writeDesktopConnectionsRegistry(registry)
+  // Tear down anything the removed connection still had running: pooled
+  // backends under its composite keys and any ssh tunnel scopes it owned.
+  stopRegistryConnectionBackends(key)
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
 })
@@ -12166,6 +12639,8 @@ ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
 // canvas. The main process has no such gate.
 ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
 
+ipcMain.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(payload))
+
 ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
 
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
@@ -12384,6 +12859,30 @@ ipcMain.on('hermes:quick-entry:state', (_event, payload) => {
 
 ipcMain.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
 
+// Disable F12 DevTools: maintained in the main process so a cold launch
+// restores it before any window is shown (applied on ready). The renderer
+// toggles it from Settings → Advanced over IPC. See store/disable-f12.
+const DISABLE_F12_CONFIG_PATH = path.join(app.getPath('userData'), 'disable-f12.json')
+
+function readPersistedDisableF12() {
+  try {
+    return JSON.parse(fs.readFileSync(DISABLE_F12_CONFIG_PATH, 'utf8')).on === true
+  } catch {
+    return false
+  }
+}
+
+ipcMain.on('hermes:devtools:disable-f12', (_event, on) => {
+  f12Blocked = Boolean(on)
+
+  try {
+    fs.mkdirSync(path.dirname(DISABLE_F12_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(DISABLE_F12_CONFIG_PATH, JSON.stringify({ on: f12Blocked }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[disable-f12] write failed: ${error.message}`)
+  }
+})
+
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
@@ -12419,7 +12918,7 @@ function ensureFoundInPageForwarder(sender: Electron.WebContents): void {
   })
 }
 
-ipcMain.handle('hermes:find-in-page', (event, query, options) => {
+ipcMain.handle('hermes:find-in-page', async (event, query, options) => {
   const win = BrowserWindow.fromWebContents(event.sender)
 
   if (!win || win.isDestroyed()) {
@@ -12427,11 +12926,10 @@ ipcMain.handle('hermes:find-in-page', (event, query, options) => {
   }
 
   ensureFoundInPageForwarder(event.sender)
-  performFind(win.webContents, query, options)
+  await performFindAfterIndexingStarted(win.webContents, query, options)
 
-  // The match count arrives asynchronously via `found-in-page`; the
-  // synchronous return value is intentionally `{ count: 0 }` to mirror
-  // Electron's own `findInPage` return semantics (an opaque request id).
+  // The match count still arrives asynchronously via `found-in-page`; this
+  // reply only acknowledges that Chromium has begun returning this request.
   return { count: 0 }
 })
 
@@ -13516,6 +14014,7 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
+  f12Blocked = readPersistedDisableF12()
   // Quick Entry's global chord — registered on ready so a cold launch restores
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).

@@ -27,7 +27,13 @@
  * these into the IPC layer and owns file I/O + secret encryption.
  */
 
-import { hostLabelFromBaseUrl, modeIsRemoteLike, normalizeRemoteBaseUrl, normalizeSshConfig, normAuthMode } from './connection-config'
+import {
+  hostLabelFromBaseUrl,
+  modeIsRemoteLike,
+  normalizeRemoteBaseUrl,
+  normalizeSshConfig,
+  normAuthMode
+} from './connection-config'
 
 export const REGISTRY_VERSION = 2
 
@@ -128,6 +134,31 @@ export function agentHandle(profile: string, connectionLabel: string, duplicated
   return duplicated ? `${name}-${labelSlug(connectionLabel)}` : name
 }
 
+/**
+ * Pool key for a backend serving (connection, profile). The local/primary
+ * connection keeps the BARE profile key so every legacy pool entry, reaper
+ * log line, and touch call stays byte-identical for single-source users;
+ * non-local connections get an unambiguous composite (`conn:<id>::<profile>`)
+ * that cannot collide with a plain profile name (colons are invalid in
+ * profile names). The single home of the composite-key rule — Electron pool
+ * keying and any renderer socket registry must both derive keys here.
+ */
+export function backendScopeKey(connectionId: null | string | undefined, profile: null | string | undefined): string {
+  const profileKey = String(profile ?? '').trim() || 'default'
+  const connection = String(connectionId ?? '').trim()
+
+  if (!connection || connection === LOCAL_CONNECTION_ID) {
+    return profileKey
+  }
+
+  return `conn:${connection}::${profileKey}`
+}
+
+/** All pool keys owned by a connection share this prefix (used to stop them on remove). */
+export function backendScopePrefix(connectionId: string): string {
+  return `conn:${String(connectionId).trim()}::`
+}
+
 /** Mint a registry-unique id from a label (slug, then -2/-3… suffixes). */
 export function connectionIdForLabel(label: string, taken: Iterable<string>): string {
   const used = new Set([...taken])
@@ -204,7 +235,12 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
     throw new Error('The id "local" is reserved for the local connection.')
   }
 
-  const id = input.id || connectionIdForLabel(label, registry.connections.map(c => c.id))
+  const id =
+    input.id ||
+    connectionIdForLabel(
+      label,
+      registry.connections.map(c => c.id)
+    )
 
   if (kind === 'ssh') {
     const ssh = normalizeSshConfig({
@@ -436,7 +472,10 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
     )
 
     const entry: RegistryConnection = {
-      id: connectionIdForLabel(label, connections.map(c => c.id)),
+      id: connectionIdForLabel(
+        label,
+        connections.map(c => c.id)
+      ),
       kind,
       label,
       url,
@@ -473,12 +512,18 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
       return existing
     }
 
-    const label = uniqueLabel(ssh.host, connections.map(c => c.label))
+    const label = uniqueLabel(
+      ssh.host,
+      connections.map(c => c.label)
+    )
 
     const { mode: _mode, ...sshFields } = ssh
 
     const entry: RegistryConnection = {
-      id: connectionIdForLabel(label, connections.map(c => c.id)),
+      id: connectionIdForLabel(
+        label,
+        connections.map(c => c.id)
+      ),
       kind: 'ssh',
       label,
       ...sshFields

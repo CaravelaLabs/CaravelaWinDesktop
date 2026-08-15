@@ -43,7 +43,7 @@ from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -3777,6 +3777,97 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
     "\x1b[0m"      # reset text attributes
     "\x1b[?25h"    # ensure cursor visible
 )
+_EXTENDED_ENTER_KEYS_SEQ = "\x1b[>1u\x1b[>4;2m"
+
+
+_BACKSLASH_LINE_CONTINUATION_RE = re.compile(r"\\[ \t]*$")
+
+
+def _terminal_supports_extended_enter_keys(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether it is safe/useful to request modified Enter key reporting.
+
+    The classic CLI already maps Kitty CSI-u / xterm modifyOtherKeys Shift+Enter
+    byte sequences to the newline handler. Some terminals (notably iTerm2) only
+    emit those distinct sequences after the application asks for extended key
+    mode. Keep this allowlist aligned with the Ink TUI, which enables the same
+    modes for these terminals.
+    """
+    if env is None:
+        env = os.environ
+    term_program = (env.get("TERM_PROGRAM") or "").strip()
+    term = (env.get("TERM") or "").strip().lower()
+    if env.get("WT_SESSION"):
+        return True
+    if term_program in {"iTerm.app", "WezTerm", "ghostty", "vscode"}:
+        return True
+    if env.get("KITTY_WINDOW_ID") or "kitty" in term:
+        return True
+    if term == "xterm-ghostty":
+        return True
+    if term.startswith("tmux") or term_program.lower() == "tmux":
+        return True
+    return False
+
+
+def _enable_extended_enter_keys(output=None, env: Optional[Mapping[str, str]] = None) -> bool:
+    """Ask allowlisted terminals to report Shift+Enter distinctly.
+
+    Writes both the Kitty keyboard protocol push (CSI >1u) and xterm
+    modifyOtherKeys level 2 (CSI >4;2m), mirroring the Ink TUI. The exit reset
+    sequence already pops/resets both modes, so this is safe across normal
+    exits, Ctrl+C, and SIGTERM cleanup.
+    """
+    if not _terminal_supports_extended_enter_keys(env):
+        return False
+    try:
+        target = output
+        if target is not None and hasattr(target, "write_raw"):
+            target.write_raw(_EXTENDED_ENTER_KEYS_SEQ)
+            target.flush()
+            return True
+        stream = sys.stdout
+        if stream is not None and stream.isatty():
+            stream.write(_EXTENDED_ENTER_KEYS_SEQ)
+            stream.flush()
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _cli_multiline_shortcuts_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether classic CLI harness-standard multiline fallbacks are on.
+
+    Default is on to match the norm in adjacent agent harnesses: Ctrl+J is a
+    documented no-setup newline shortcut in Claude Code, OpenCode defaults
+    ``input_newline`` to include ``ctrl+j``, and Codex exposes Ctrl+J/keymap
+    newline behavior. Users on unusual POSIX PTYs that send bare LF for plain
+    Enter can set ``display.cli_multiline_shortcuts: false`` to restore the
+    legacy c-j submit fallback.
+    """
+    if config is None:
+        config = CLI_CONFIG
+    display = config.get("display") if isinstance(config, dict) else None
+    value = display.get("cli_multiline_shortcuts", True) if isinstance(display, dict) else True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return True
+
+
+def _is_backslash_line_continuation(text: str) -> bool:
+    """True when Enter should turn a trailing backslash into a newline."""
+    return bool(_BACKSLASH_LINE_CONTINUATION_RE.search(text or ""))
+
+
+def _apply_backslash_line_continuation(text: str) -> str:
+    """Replace a trailing ``\\`` marker with an actual newline."""
+    return _BACKSLASH_LINE_CONTINUATION_RE.sub("", text or "") + "\n"
 
 
 def _preserve_ctrl_enter_newline() -> bool:
@@ -3787,8 +3878,8 @@ def _preserve_ctrl_enter_newline() -> bool:
     NOT be bound to submit;
     binding it to submit makes Ctrl+Enter (intended as 'newline like Alt+Enter')
     submit instead. Local POSIX TTYs that deliver Enter as LF (docker exec,
-    some thin PTYs without SSH) still need c-j bound to submit, so we keep
-    that binding for those.
+    some thin PTYs without SSH) still need c-j bound to submit when
+    display.cli_multiline_shortcuts is disabled, so we keep that legacy opt-out.
 
     See issue #22379.
     """
@@ -3817,22 +3908,33 @@ def _preserve_ctrl_enter_newline() -> bool:
     return False
 
 
-def _bind_prompt_submit_keys(kb, handler) -> None:
+def _bind_prompt_submit_keys(
+    kb,
+    handler,
+    *,
+    multiline_shortcuts_enabled: Optional[bool] = None,
+) -> None:
     """Bind terminal Enter forms to the submit handler.
 
-    Enter is always submit. On POSIX we also bind c-j (LF) to submit because
-    some thin PTYs (docker exec, certain SSH flavors) deliver Enter as LF
-    instead of CR — without this, Enter appears dead on those terminals.
+    Enter is always submit. By default, c-j (Ctrl+J/LF) is left for the
+    multiline newline handler because that is the common agent-harness UX.
+    Users can set ``display.cli_multiline_shortcuts: false`` to restore the
+    legacy POSIX fallback that binds c-j to submit on local thin PTYs whose
+    plain Enter arrives as LF instead of CR.
 
-    Exception: on Windows, WSL, SSH sessions, Windows Terminal, and Ghostty,
-    c-j is the wire encoding of Ctrl+Enter (a distinct keystroke from
-    plain Enter / c-m). We leave c-j unbound there so the c-j newline
-    handler registered separately can fire — giving the user an
-    Enter-involving newline keystroke without terminal settings changes.
+    Even when the setting is disabled, environments where Ctrl+Enter is known
+    to arrive as c-j (Windows, WSL, SSH, Windows Terminal, Ghostty) keep c-j
+    reserved for newline; otherwise Ctrl+Enter submits instead of composing.
     See _preserve_ctrl_enter_newline() and issue #22379.
     """
+    if multiline_shortcuts_enabled is None:
+        multiline_shortcuts_enabled = _cli_multiline_shortcuts_enabled()
     kb.add("enter")(handler)
-    if sys.platform != "win32" and not _preserve_ctrl_enter_newline():
+    if (
+        sys.platform != "win32"
+        and not multiline_shortcuts_enabled
+        and not _preserve_ctrl_enter_newline()
+    ):
         kb.add("c-j")(handler)
 
 
@@ -6115,7 +6217,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
             pet_cfg = display.get("pet", {}) if isinstance(display.get("pet"), dict) else {}
 
-            enabled = bool(pet_cfg.get("enabled"))
+            from utils import is_truthy_value
+
+            enabled = is_truthy_value(pet_cfg.get("enabled"), default=False)
             slug = str(pet_cfg.get("slug", "") or "")
             scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
             cols = constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
@@ -8616,7 +8720,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
-        _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
+        _cprint(f"  {_DIM}Multi-line: Ctrl+J, Alt+Enter, or \\+Enter for a new line{_RST}")
         _cprint(f"  {_DIM}Draft editor: Ctrl+G (Alt+G in VSCode/Cursor){_RST}")
         if _is_termux_environment():
             _cprint(f"  {_DIM}Attach image: /image {_termux_example_image_path()} or start your prompt with a local image path{_RST}\n")
@@ -9238,17 +9342,71 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return True
 
 
-    def save_conversation(self):
-        """Save the current conversation to a JSON snapshot under ~/.hermes/sessions/saved/.
+    def save_conversation(self, cmd: str = "/save"):
+        """Handle /save — export the current session to json, md, or html.
 
-        The snapshot is a convenience export for sharing or off-line inspection;
-        every message is already persisted incrementally to the SQLite session
-        DB, so the live session remains resumable via ``hermes --resume <id>``
-        regardless of whether the user ever runs ``/save``.
+        Usage: ``/save [json|md|html] [filename] [redact]``
+
+        The snapshot is a convenience export for sharing or off-line
+        inspection; every message is already persisted incrementally to the
+        SQLite session DB, so the live session remains resumable via
+        ``hermes --resume <id>`` regardless of whether the user ever runs
+        ``/save``. ``redact`` runs the export through the force-mode secret
+        redaction pass before writing.
         """
-        if not self.conversation_history:
-            print("(;_;) No conversation to save.")
+        from hermes_cli.session_export import (
+            SAVE_USAGE,
+            normalize_save_format,
+            render_session_for_save,
+        )
+
+        parts = cmd.split()[1:]
+        if not parts:
+            print(SAVE_USAGE)
             return
+        redact = False
+        if parts[-1].lower() in ("redact", "--redact"):
+            redact = True
+            parts = parts[:-1]
+            if not parts:
+                print(SAVE_USAGE)
+                return
+
+        try:
+            fmt = normalize_save_format(parts[0])
+        except ValueError as e:
+            print(f"(._.) {e}")
+            print(SAVE_USAGE)
+            return
+        filename = parts[1] if len(parts) > 1 else None
+
+        # Prefer the durable DB row (has metadata + tool calls); fall back to
+        # the in-memory history for sessions that never touched the DB.
+        # getattr: test doubles (SimpleNamespace / object.__new__) may not
+        # carry _session_db or session_id.
+        session_data = None
+        _db = getattr(self, "_session_db", None)
+        _sid = getattr(self, "session_id", None)
+        if _db and _sid:
+            try:
+                session_data = _db.export_session(_sid)
+            except Exception:
+                session_data = None
+        if not session_data:
+            if not self.conversation_history:
+                print("(;_;) No conversation to save.")
+                return
+            session_data = {
+                "id": self.session_id,
+                "model": self.model,
+                "started_at": self.session_start.timestamp(),
+                "messages": self.conversation_history,
+            }
+
+        if redact:
+            from hermes_cli.session_export_md import redact_session_data
+
+            session_data = redact_session_data(session_data)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         saved_dir = get_hermes_home() / "sessions" / "saved"
@@ -9257,17 +9415,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception as e:
             print(f"(x_x) Failed to create save directory {saved_dir}: {e}")
             return
-        path = saved_dir / f"hermes_conversation_{timestamp}.json"
+        if filename:
+            path = Path(filename).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+        else:
+            path = saved_dir / f"hermes_conversation_{timestamp}.{fmt}"
 
         try:
+            content = render_session_for_save(session_data, fmt)
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "model": self.model,
-                    "session_id": self.session_id,
-                    "session_start": self.session_start.isoformat(),
-                    "messages": self.conversation_history,
-                }, f, indent=2, ensure_ascii=False)
-            print(f"(^_^)v Conversation snapshot saved to: {path}")
+                f.write(content)
+            label = {"json": "JSON", "md": "Markdown", "html": "HTML"}[fmt]
+            print(f"(^_^)v Conversation saved to: {path} ({label})")
             if self.session_id:
                 print(f"       Resume the live session with: hermes --resume {self.session_id}")
         except Exception as e:
@@ -11024,7 +11184,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
         elif canonical == "save":
-            self.save_conversation()
+            self.save_conversation(cmd_original)
         elif canonical == "cron":
             self._handle_cron_command(cmd_original)
         elif canonical == "suggestions":
@@ -14972,7 +15132,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent._persist_user_message_idx = None
             agent._persist_user_message_override = None
             agent._persist_user_message_timestamp = None
-            staged_user_message = {"role": "user", "content": message}
+            from agent.message_metadata import stamp_message_timestamp
+
+            staged_user_message = stamp_message_timestamp(
+                {"role": "user", "content": message}
+            )
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 
@@ -16350,6 +16514,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Key bindings for the input area
         kb = KeyBindings()
 
+        _multiline_shortcuts_enabled = _cli_multiline_shortcuts_enabled(self.config or CLI_CONFIG)
+
         from prompt_toolkit.keys import Keys as _IgnoreKeys
 
         @kb.add(_IgnoreKeys.Ignore, eager=True)
@@ -16504,7 +16670,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return
 
             # --- Normal input routing ---
-            text = event.app.current_buffer.text.strip()
+            raw_text = event.app.current_buffer.text
+            if (
+                _multiline_shortcuts_enabled
+                and event.app.current_buffer.cursor_position == len(raw_text)
+                and _is_backslash_line_continuation(raw_text)
+            ):
+                continued = _apply_backslash_line_continuation(raw_text)
+                event.app.current_buffer.text = continued
+                event.app.current_buffer.cursor_position = len(continued)
+                event.app.invalidate()
+                return
+            text = raw_text.strip()
             has_images = bool(self._attached_images)
             if text or has_images:
                 # Handle /model directly on the UI thread so interactive pickers
@@ -16658,7 +16835,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._inline_pastes(event.app.current_buffer)
                 event.app.current_buffer.reset(append_to_history=True)
 
-        _bind_prompt_submit_keys(kb, handle_enter)
+        _bind_prompt_submit_keys(
+            kb,
+            handle_enter,
+            multiline_shortcuts_enabled=_multiline_shortcuts_enabled,
+        )
         
         @kb.add('escape', 'enter')
         def handle_alt_enter(event):
@@ -16671,19 +16852,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             """
             event.current_buffer.insert_text('\n')
 
-        if _preserve_ctrl_enter_newline():
+        if _multiline_shortcuts_enabled or _preserve_ctrl_enter_newline():
             @kb.add('c-j')
             def handle_ctrl_enter_newline(event):
-                """Ctrl+Enter inserts a newline on Windows, WSL, SSH, and WT.
+                """Ctrl+J inserts a newline for multi-line input.
 
-                Windows Terminal (incl. WSL/SSH sessions through it) delivers
-                Ctrl+Enter as LF (c-j), distinct from plain Enter (c-m). This
-                binding makes Ctrl+Enter the equivalent of Alt+Enter on those
-                terminals, giving an Enter-involving newline keystroke
-                without requiring terminal settings changes. Ctrl+J (the raw
-                LF keystroke) also triggers this by virtue of being the same
-                key code — a harmless side effect since Ctrl+J has no
-                conflicting Hermes binding. See issue #22379.
+                This is enabled by default to match Claude Code / Codex /
+                OpenCode behavior. On Windows Terminal and similar environments,
+                Ctrl+Enter is delivered as the same c-j key code, so this also
+                covers Ctrl+Enter there. Set display.cli_multiline_shortcuts:
+                false to restore legacy c-j submit behavior on unusual POSIX
+                PTYs where plain Enter arrives as LF.
                 """
                 event.current_buffer.insert_text('\n')
 
@@ -17297,6 +17476,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from hermes_cli.config import load_config
             from hermes_cli.voice import (
                 normalize_voice_record_key_for_prompt_toolkit,
+                pt_key_to_sequence,
                 voice_record_key_from_config,
             )
             _raw_key = voice_record_key_from_config(load_config())
@@ -17322,7 +17502,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # voice.record_key mid-session (Copilot round-13 on #19835).
         self.set_voice_record_key_cache(_raw_key)
 
-        @kb.add(_voice_key)
+        @kb.add(*pt_key_to_sequence(_voice_key))
         def handle_voice_record(event):
             """Toggle voice recording when voice mode is active.
 
@@ -18954,8 +19134,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     pass
                 # The app enables focus reporting + mouse tracking; record that
-                # so _run_cleanup resets them on exit (#36823).
+                # so _run_cleanup resets them on exit (#36823). When multiline
+                # shortcuts are on, also ask supported terminals (e.g. iTerm2)
+                # to distinguish Shift+Enter from Enter; the same cleanup reset
+                # pops kitty keyboard mode and resets modifyOtherKeys.
                 _mark_tui_input_modes_active()
+                if _multiline_shortcuts_enabled:
+                    _enable_extended_enter_keys(app.output)
                 # Drive the petdex mascot animation (no-op when no pet enabled).
                 self._pet_start_anim()
                 app.run()

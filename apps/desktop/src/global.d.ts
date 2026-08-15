@@ -18,6 +18,12 @@ declare global {
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.
       getConnection: (profile?: string | null) => Promise<HermesConnection>
+      // Registry-scoped backend resolution: dial (connectionId, profile). An
+      // empty/local connectionId delegates to the legacy getConnection path.
+      getConnectionFor?: (payload: {
+        connectionId?: null | string
+        profile?: null | string
+      }) => Promise<HermesConnection>
       // Reconnect-after-wake recovery: liveness-probe the cached PRIMARY backend
       // and drop it if a remote one has gone unreachable, so the next
       // getConnection() rebuilds a reachable descriptor instead of the renderer
@@ -182,6 +188,11 @@ declare global {
       }) => Promise<null | string>
       writeClipboard: (text: string) => Promise<boolean>
       readClipboard: () => Promise<string>
+      saveGatewayFile?: (payload: { path: string; profile?: null | string; suggestedName?: string }) => Promise<{
+        canceled?: boolean
+        path?: string
+        saved: boolean
+      }>
       saveImageFromUrl: (url: string) => Promise<boolean>
       saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
       saveClipboardImage: () => Promise<string>
@@ -198,6 +209,7 @@ declare global {
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void
       setTranslucency?: (payload: { intensity: number }) => void
       setKeepAwake?: (on: boolean) => void
+      setDisableF12?: (blocked: boolean) => void
       setPreviewShortcutActive?: (active: boolean) => void
       openExternal: (url: string) => Promise<void>
       openPreviewInBrowser?: (url: string) => Promise<void>
@@ -372,6 +384,10 @@ declare global {
       findInPage: (query: string, options?: { forward?: boolean; findNext?: boolean }) => Promise<{ count: number }>
       stopFindInPage: () => Promise<void>
       onFoundInPage: (callback: (result: { activeMatchOrdinal: number; count: number }) => void) => () => void
+      // Main-process `before-input-event` forwards Ctrl/Cmd+F here so the
+      // renderer can still open the FindBar when the OS compositor has
+      // already grabbed the chord (#81727, e.g. Pop!_OS / GNOME).
+      onOpenFindBarRequested: (callback: () => void) => () => void
     }
   }
 }
@@ -554,10 +570,16 @@ export interface HermesConnection {
   // Set for pool (non-primary) backends so the renderer knows which profile a
   // connection belongs to.
   profile?: string
+  // The registry connection this descriptor was resolved through (absent on
+  // legacy v1/primary paths). Set by getConnectionFor.
+  connectionId?: string
   // True only when `profile` is a request scope on the shared primary backend.
   // A pooled backend also carries `profile`, so presence alone cannot identify
   // the shared-primary routing case.
   sharedPrimary?: boolean
+  // True when `profile` is a request scope on a SHARED registry remote/cloud
+  // backend (one host, many profiles) — the registry analogue of sharedPrimary.
+  sharedRemote?: boolean
   windowButtonPosition: { x: number; y: number } | null
 }
 

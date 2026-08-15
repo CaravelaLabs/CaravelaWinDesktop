@@ -248,7 +248,7 @@ export interface Translations {
     enterHud: string
     exitHud: string
     layoutEditor: string
-    layoutEditorTitle: string
+    layoutEditorTitle: (modifier: string) => string
   }
 
   keybinds: {
@@ -361,8 +361,15 @@ export interface Translations {
       colorModeDesc: string
       toolViewTitle: string
       toolViewDesc: string
+      reasoningCollapsedTitle: string
+      reasoningCollapsedDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
+      sessionDensityTitle: string
+      sessionDensityDesc: string
+      sessionDensityCompact: string
+      sessionDensityComfortable: string
+      sessionDensityDetailed: string
       terminalFontTitle: string
       terminalFontDesc: string
       terminalFontPlaceholder: string
@@ -374,6 +381,8 @@ export interface Translations {
       backdropDesc: string
       reactionsTitle: string
       reactionsDesc: string
+      composerPopoutTitle: string
+      composerPopoutDesc: string
       embedsTitle: string
       embedsDesc: string
       embedsAsk: string
@@ -480,8 +489,11 @@ export interface Translations {
       autosaveFailed: string
       imported: string
       invalidJson: string
+      toolsetsWipeConfirm: string
       keepAwakeTitle: string
       keepAwakeDesc: string
+      disableF12Title: string
+      disableF12Desc: string
       attachmentSizeTitle: string
       attachmentSizeDesc: string
       attachmentSizeUnit: string
@@ -1694,9 +1706,14 @@ export interface Translations {
     loading: string
     loadMore: string
     loadCount: (step: number) => string
+    messageCount: (count: number) => string
+    toolCallCount: (count: number) => string
     row: {
       pin: string
       unpin: string
+      markUnread: string
+      markRead: string
+      unreadFailed: string
       copyId: string
       export: string
       branchFrom: string
@@ -1722,6 +1739,10 @@ export interface Translations {
       renameTitle: string
       renameDesc: string
       untitledPlaceholder: string
+      deleteTitle: string
+      deleteDesc: (title: string) => string
+      deleting: string
+      deleted: string
       untitledChat: (id: string) => string
       messageCount: (count: number) => string
       todoProgress: string
@@ -1741,6 +1762,7 @@ export interface Translations {
       working: string
       done: string
     }
+    markAllRead: string
   }
 
   composer: {
@@ -1847,6 +1869,12 @@ export interface Translations {
       done: (skill: string) => string
       doneTip: string
     }
+    githubSuggestions: {
+      label: string
+      tip: string
+      done: string
+      doneTip: string
+    }
     repairSuggestions: {
       label: (server: string) => string
       tip: (server: string) => string
@@ -1908,7 +1936,7 @@ export interface Translations {
       scopeLastTurn: string
       commit: string
       commitAndPush: string
-      commitPlaceholder: string
+      commitPlaceholder: (shortcut: string) => string
       generateCommitMessage: string
       stopGenerating: string
       createPr: string

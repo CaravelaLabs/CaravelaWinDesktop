@@ -280,8 +280,10 @@ function remoteRequestMatchesBaseUrl(requestUrl, baseUrl) {
     const request = new URL(requestUrl)
     const base = new URL(baseUrl)
     const basePath = base.pathname.replace(/\/+$/, '')
+
     const requestProtocol =
       request.protocol === 'ws:' ? 'http:' : request.protocol === 'wss:' ? 'https:' : request.protocol
+
     const baseProtocol = base.protocol === 'ws:' ? 'http:' : base.protocol === 'wss:' ? 'https:' : base.protocol
 
     if (requestProtocol !== baseProtocol || request.host !== base.host) {
@@ -311,6 +313,9 @@ function normalizeSshConfig(entry) {
   }
 
   let host = String(entry.host || '').trim()
+
+  // Tolerate a pasted command: "ssh root@box" → "root@box".
+  host = host.replace(/^ssh\s+/i, '').trim()
 
   if (!host) {
     return null

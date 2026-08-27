@@ -1,5 +1,6 @@
 import { spawn, type SpawnOptions } from 'node:child_process'
 import { statSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 import { hiddenWindowsChildOptions } from './windows-child-options'
@@ -90,8 +91,24 @@ export function resolvePosixScriptHandoff(
     return null
   }
 
-  const scriptPath = path.join(updateRoot, 'scripts', 'desktop-update', 'posix.sh')
   const exists = deps.fileExists ?? stagedFileExists
+  const branded =
+    Boolean(process.env.APPIMAGE) || process.env.HERMES_DESKTOP_APP_NAME === 'Caravela'
+  const caravelaWrapper = path.join(
+    os.homedir(),
+    'caravela-installer',
+    'automation',
+    'posix-update-wrapper.sh'
+  )
+  if (branded && exists(caravelaWrapper)) {
+    return {
+      command: '/bin/bash',
+      args: [caravelaWrapper],
+      scriptPath: caravelaWrapper
+    }
+  }
+
+  const scriptPath = path.join(updateRoot, 'scripts', 'desktop-update', 'posix.sh')
 
   if (!exists(scriptPath)) {
     return null

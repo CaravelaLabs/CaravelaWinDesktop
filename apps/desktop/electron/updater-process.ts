@@ -54,6 +54,7 @@ export function resolveUpdateScriptHandoff(
   // meet a checkout from either side of the move (the checkout also ships a
   // forwarder at the legacy path for the inverse skew).
   for (const candidate of [
+    path.join(updateRoot, 'scripts', 'desktop-update', 'caravela-windows.ps1'),
     path.join(updateRoot, 'scripts', 'desktop-update', 'windows.ps1'),
     path.join(updateRoot, 'scripts', 'desktop-update.ps1')
   ]) {

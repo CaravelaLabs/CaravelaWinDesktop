@@ -1,9 +1,10 @@
-import { type CSSProperties, useState } from 'react'
+import { useState } from 'react'
 
 import { capitalize, normalize } from '@/lib/text'
 import { useTheme } from '@/themes/context'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
+import { Wordmark } from './wordmark'
 
 type IntroCopy = {
   headline: string
@@ -165,7 +166,7 @@ export function Intro({ personality, seed }: IntroProps) {
   const productName = theme.branding?.productName ?? 'Caravela Agent'
   const wordmark = (productName || WORDMARK).toUpperCase()
   const assetBase = import.meta.env.BASE_URL
-  const wordmarkSrc = wordmarkUrl ? `${assetBase}${wordmarkUrl.replace(/^\/+/, '')}` : null
+  const wordmarkSrc = wordmarkUrl ? `${assetBase}${wordmarkUrl.replace(/^\//, '')}` : null
 
   return (
     <div
@@ -186,16 +187,7 @@ export function Intro({ personality, seed }: IntroProps) {
             />
           </div>
         ) : (
-          <p
-            aria-label={wordmark}
-            className="fit-text mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
-            style={{ '--fit-min': '2.75rem' } as CSSProperties}
-          >
-            <span>
-              <span>{wordmark}</span>
-            </span>
-            <span aria-hidden="true">{wordmark}</span>
-          </p>
+          <Wordmark className="mb-1" text={wordmark} />
         )}
 
         <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>

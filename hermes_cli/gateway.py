@@ -131,21 +131,27 @@ def _get_service_pids(all_profiles: bool = False) -> set:
     manual processes and killed.  Default-scope callers (``gateway status``,
     cron checks) keep seeing only the current profile's service; the orphan
     reaper passes all_profiles=True for the same friendly-fire reason.  The
-    systemd branch has always been fleet-wide (``hermes-gateway*``) and is
-    unaffected.
+    systemd branch mirrors this: default scope filters to the current
+    profile's exact unit name; ``all_profiles=True`` widens to the
+    ``hermes-gateway*`` fleet glob.
     """
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
-    # systemd always lists every hermes-gateway* unit regardless of scope.
+    # Default scope lists only this profile's unit (the unit name encodes the
+    # profile via get_service_name()); all_profiles widens to the fleet glob.
     if supports_systemd_services():
+        if all_profiles:
+            pattern = "hermes-gateway*"
+        else:
+            pattern = get_service_name()
         for scope_args in [["systemctl", "--user"], ["systemctl"]]:
             try:
                 result = subprocess.run(
                     scope_args
                     + [
                         "list-units",
-                        "hermes-gateway*",
+                        pattern,
                         "--plain",
                         "--no-legend",
                         "--no-pager",
@@ -2282,11 +2288,38 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     # the Scheduled-Task bootstrap's argv (``gateway run``) matches the
     # gateway scan — killing that bootstrap takes the detached gateway it
     # spawned down with it.
+    #
+    # Exclusion evidence comes from the RAW registration record, not the
+    # liveness-validated probe.  ``get_running_pid`` (any flags) returns
+    # None whenever a record fails validation — start-time mismatch after
+    # PID-reuse checks, argv drift, lock hiccups — which is exactly when a
+    # healthy standalone gateway (no service supervisor — e.g. `hermes
+    # gateway run` on Windows) is at risk: its PID never joins the
+    # exclusion set and the sweep hard-kills it.  On Windows SIGTERM is
+    # TerminateProcess, so the gateway's planned-stop watcher never gets a
+    # chance to drain.  Reading the raw pidfile + lock records (no
+    # validation, no unlink side effects) is strictly safer for a KILL
+    # exclusion list: a stale recorded PID at worst spares one process this
+    # sweep, while a validation false-negative would kill a live gateway.
+    # The validated probe is still consulted for the runtime-status
+    # fallback PID it can surface when no pidfile exists.
     try:
-        from gateway.status import get_running_pid
+        from gateway.status import (
+            _pid_from_record,
+            _read_gateway_lock_record,
+            _read_pid_record,
+            get_running_pid,
+        )
 
-        recorded = get_running_pid()
-        if recorded and recorded > 0:
+        recorded_pids = set()
+        for _record in (_read_pid_record(), _read_gateway_lock_record()):
+            _raw_pid = _pid_from_record(_record)
+            if _raw_pid and _raw_pid > 0:
+                recorded_pids.add(_raw_pid)
+        _probed = get_running_pid(cleanup_stale=False)
+        if _probed and _probed > 0:
+            recorded_pids.add(_probed)
+        for recorded in recorded_pids:
             own.add(recorded)
             try:
                 import psutil  # type: ignore
@@ -6042,6 +6075,82 @@ def _running_under_gateway_supervisor() -> bool:
     return is_gateway_supervisor_process()
 
 
+def named_profile_served_by_running_multiplexer() -> bool:
+    """True when a live default multiplexer already ticks this named profile.
+
+    Shared by the named-profile start guard and cron liveness: a satellite
+    profile has no gateway.pid of its own, but the default multiplexer's
+    ticker still fires its jobs (#97120).
+    """
+    try:
+        suffix = _profile_suffix()
+    except Exception:
+        return False
+    if not suffix:
+        return False
+
+    try:
+        from hermes_constants import get_default_hermes_root
+        default_root = get_default_hermes_root()
+    except Exception:
+        return False
+
+    try:
+        from gateway.status import _read_pid_record
+
+        default_pid_path = default_root / "gateway.pid"
+        rec = _read_pid_record(default_pid_path)
+        if not rec:
+            return False
+        from gateway.status import _pid_exists, _pid_from_record
+        pid = _pid_from_record(rec)
+        if not pid or not _pid_exists(pid):
+            return False
+
+        from gateway.config import _env_multiplex_profiles_override
+
+        cfg_path = default_root / "config.yaml"
+        cfg = {}
+        if cfg_path.exists():
+            from hermes_cli.config import read_user_config_raw
+
+            cfg = read_user_config_raw(cfg_path)
+
+        env_multiplex = _env_multiplex_profiles_override()
+        if env_multiplex is False:
+            return False
+        if env_multiplex is True:
+            multiplex = True
+        else:
+            if not cfg_path.exists():
+                return False
+            multiplex = bool(
+                cfg.get("multiplex_profiles")
+                or (cfg.get("gateway", {}) or {}).get("multiplex_profiles")
+            )
+        if not multiplex:
+            return False
+
+        gateway_cfg = cfg.get("gateway", {}) or {}
+        if "multiplex_profile_allowlist" in cfg:
+            raw_allowlist = cfg.get("multiplex_profile_allowlist")
+        else:
+            raw_allowlist = gateway_cfg.get("multiplex_profile_allowlist")
+        from gateway.config import _normalize_multiplex_profile_allowlist
+        from hermes_cli.profiles import normalize_profile_name
+
+        profile_allowlist = _normalize_multiplex_profile_allowlist(raw_allowlist)
+        if (
+            profile_allowlist is not None
+            and normalize_profile_name(suffix) not in profile_allowlist
+        ):
+            return False
+        return True
+    except Exception:
+        logger.debug("Multiplexer-serving probe failed", exc_info=True)
+        return False
+
+
 def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
     """Refuse a named-profile gateway when a multiplexer is already serving it.
 
@@ -6057,85 +6166,11 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
     """
     if force:
         return
-    # (a) Are we a named profile? Default/custom-hash homes return "".
     try:
         suffix = _profile_suffix()
     except Exception:
         return
-    if not suffix:
-        return  # default profile (or unrecognized) — this guard doesn't apply
-
-    try:
-        from hermes_constants import get_default_hermes_root
-        default_root = get_default_hermes_root()
-        # (b) Is the default-profile gateway running?
-        from gateway.status import get_running_pid as _default_running_pid  # noqa
-    except Exception:
-        return
-
-    try:
-        import yaml as _yaml
-        from gateway.status import _read_pid_record  # type: ignore
-
-        # (b) default gateway PID file present + alive
-        default_pid_path = default_root / "gateway.pid"
-        rec = _read_pid_record(default_pid_path)
-        if not rec:
-            return
-        from gateway.status import _pid_exists, _pid_from_record
-        pid = _pid_from_record(rec)
-        if not pid or not _pid_exists(pid):
-            return
-
-        # (c) multiplexing is on for the default gateway. Precedence mirrors
-        # gateway.config: the GATEWAY_MULTIPLEX_PROFILES env override wins over
-        # config.yaml when set to a recognized value, so a hosted gateway that
-        # forces multiplex on via env (with no multiplex_profiles in config.yaml)
-        # still trips this guard. A blank/unrecognized env value falls through
-        # to config.yaml.
-        from gateway.config import _env_multiplex_profiles_override
-
-        cfg_path = default_root / "config.yaml"
-        cfg = {}
-        if cfg_path.exists():
-            # Raw read of the DEFAULT root's config (not the active profile
-            # home, so load_config() is the wrong owner here); whole probe is
-            # fail-open via the enclosing except.
-            from hermes_cli.config import read_user_config_raw
-
-            cfg = read_user_config_raw(cfg_path)
-
-        env_multiplex = _env_multiplex_profiles_override()
-        if env_multiplex is False:
-            return  # explicitly forced OFF by the operator env override
-        if env_multiplex is True:
-            multiplex = True
-        else:
-            if not cfg_path.exists():
-                return
-            multiplex = bool(
-                cfg.get("multiplex_profiles")
-                or (cfg.get("gateway", {}) or {}).get("multiplex_profiles")
-            )
-        if not multiplex:
-            return
-
-        gateway_cfg = cfg.get("gateway", {}) or {}
-        if "multiplex_profile_allowlist" in cfg:
-            raw_allowlist = cfg.get("multiplex_profile_allowlist")
-        else:
-            raw_allowlist = gateway_cfg.get("multiplex_profile_allowlist")
-        from gateway.config import _normalize_multiplex_profile_allowlist
-        from hermes_cli.profiles import normalize_profile_name
-
-        profile_allowlist = _normalize_multiplex_profile_allowlist(raw_allowlist)
-        if (
-            profile_allowlist is not None
-            and normalize_profile_name(suffix) not in profile_allowlist
-        ):
-            return
-    except Exception:
-        logger.debug("Multiplexer-conflict probe failed", exc_info=True)
+    if not named_profile_served_by_running_multiplexer():
         return
 
     print_error(

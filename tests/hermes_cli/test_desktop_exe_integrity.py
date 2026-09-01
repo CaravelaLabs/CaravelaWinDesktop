@@ -195,6 +195,34 @@ def test_expected_machines_prefers_user_runnable_api_over_arch_name(monkeypatch)
 # ─── _desktop_packaged_executable arch preference (win32) ───────────────────
 
 
+def test_packaged_executable_finds_product_name_from_package_json(tmp_path, monkeypatch):
+    """A rebranded productName (Caravela.exe) is still a launchable app."""
+    import json as _json
+
+    desktop_dir = tmp_path / "apps" / "desktop"
+    unpacked = desktop_dir / "release" / "win-unpacked"
+    unpacked.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text(
+        _json.dumps({"productName": "Caravela", "build": {"productName": "Caravela"}}),
+        encoding="utf-8",
+    )
+    exe = unpacked / "Caravela.exe"
+    exe.write_bytes(b"MZ")
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    assert cli_main._desktop_packaged_executable(desktop_dir) == exe
+
+
+def test_packaged_executable_still_finds_stock_hermes_exe(tmp_path, monkeypatch):
+    desktop_dir = tmp_path / "apps" / "desktop"
+    unpacked = desktop_dir / "release" / "win-unpacked"
+    unpacked.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
+    exe = unpacked / "Hermes.exe"
+    exe.write_bytes(b"MZ")
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    assert cli_main._desktop_packaged_executable(desktop_dir) == exe
+
+
 
 
 

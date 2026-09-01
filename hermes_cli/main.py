@@ -6995,24 +6995,69 @@ def _write_desktop_build_stamp(project_root: Path, *, source_mode: bool) -> None
         logger.debug("Failed to write desktop build stamp: %s", exc)
 
 
+def _desktop_product_names(desktop_dir: Path) -> list[str]:
+    """electron-builder executable / bundle names for this desktop app.
+
+    Stock Hermes ships as Hermes.exe / Hermes.app / hermes. A rebrand
+    (Caravela sets ``productName`` / ``build.productName``) emits a different
+    basename. Looking only for Hermes.exe then reports
+    ``--build-only produced no launchable app`` even though packaging
+    succeeded — that is what the in-app Update dialog surfaces.
+    """
+    names: list[str] = []
+    pkg: dict = {}
+    pkg_path = desktop_dir / "package.json"
+    try:
+        loaded = json.loads(pkg_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            pkg = loaded
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    build = pkg.get("build") if isinstance(pkg.get("build"), dict) else {}
+    win = build.get("win") if isinstance(build.get("win"), dict) else {}
+    for value in (
+        win.get("executableName"),
+        build.get("productName"),
+        pkg.get("productName"),
+        pkg.get("name"),
+    ):
+        if isinstance(value, str) and value.strip():
+            names.append(value.strip())
+    names.extend(["Hermes", "Caravela", "hermes"])
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in names:
+        key = n.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(n)
+    return out
+
+
 def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     """Return the current platform's unpacked Electron app executable."""
     release_dir = desktop_dir / "release"
+    names = _desktop_product_names(desktop_dir)
     if sys.platform == "darwin":
-        candidates = list(release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes"))
+        candidates: list[Path] = []
+        for n in names:
+            candidates.extend(release_dir.glob(f"mac*/{n}.app/Contents/MacOS/{n}"))
     elif sys.platform == "win32":
+        arches = ("win-unpacked", "win-ia32-unpacked", "win-arm64-unpacked")
         candidates = [
-            release_dir / "win-unpacked" / "Hermes.exe",
-            release_dir / "win-ia32-unpacked" / "Hermes.exe",
-            release_dir / "win-arm64-unpacked" / "Hermes.exe",
+            release_dir / arch / f"{n}.exe"
+            for arch in arches
+            for n in names
         ]
     else:
-        candidates = [
-            release_dir / "linux-unpacked" / "hermes",
-            release_dir / "linux-unpacked" / "Hermes",
-            release_dir / "linux-arm64-unpacked" / "hermes",
-            release_dir / "linux-arm64-unpacked" / "Hermes",
-        ]
+        arches = ("linux-unpacked", "linux-arm64-unpacked")
+        candidates = []
+        for arch in arches:
+            for n in names:
+                candidates.append(release_dir / arch / n)
+                lowered = n.lower()
+                if lowered != n:
+                    candidates.append(release_dir / arch / lowered)
 
     existing = [p for p in candidates if p.exists()]
     if not existing:

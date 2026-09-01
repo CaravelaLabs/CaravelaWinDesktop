@@ -4225,6 +4225,8 @@ function Install-Desktop {
     # 3. Sanity-check the produced binary. Probe both arches so this works
     # on x64 and arm64 build machines.
     $exeCandidates = @(
+        "$desktopDir\release\win-unpacked\Caravela.exe",
+        "$desktopDir\release\win-arm64-unpacked\Caravela.exe",
         "$desktopDir\release\win-unpacked\Hermes.exe",
         "$desktopDir\release\win-arm64-unpacked\Hermes.exe"
     )
@@ -4239,7 +4241,7 @@ function Install-Desktop {
         }
     }
     if (-not $found) {
-        throw "Desktop build completed but no Hermes.exe was found under $desktopDir\release\*-unpacked\"
+        throw "Desktop build completed but no Caravela.exe/Hermes.exe was found under $desktopDir\release\*-unpacked\"
     }
 
     # 3b. The Hermes icon + identity are stamped onto Hermes.exe by the
@@ -4299,8 +4301,8 @@ function New-DesktopShortcuts {
         }
 
         $targets = @(
-            (Join-Path ([Environment]::GetFolderPath('Programs')) 'Hermes.lnk'),
-            (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Hermes.lnk')
+            (Join-Path ([Environment]::GetFolderPath('Programs')) 'Caravela.lnk'),
+            (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Caravela.lnk')
         )
 
         foreach ($lnkPath in $targets) {
@@ -4313,7 +4315,7 @@ function New-DesktopShortcuts {
                 $sc.TargetPath = $TargetExe
                 $sc.WorkingDirectory = $workDir
                 $sc.IconLocation = $iconLocation
-                $sc.Description = 'Hermes Agent'
+                $sc.Description = 'Caravela'
                 $sc.Save()
                 Write-Success "Shortcut created: $lnkPath"
             } catch {

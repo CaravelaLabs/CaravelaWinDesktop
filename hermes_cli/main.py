@@ -6995,69 +6995,50 @@ def _write_desktop_build_stamp(project_root: Path, *, source_mode: bool) -> None
         logger.debug("Failed to write desktop build stamp: %s", exc)
 
 
-def _desktop_product_names(desktop_dir: Path) -> list[str]:
-    """electron-builder executable / bundle names for this desktop app.
-
-    Stock Hermes ships as Hermes.exe / Hermes.app / hermes. A rebrand
-    (Caravela sets ``productName`` / ``build.productName``) emits a different
-    basename. Looking only for Hermes.exe then reports
-    ``--build-only produced no launchable app`` even though packaging
-    succeeded — that is what the in-app Update dialog surfaces.
-    """
+def _desktop_windows_exe_names(desktop_dir: Path) -> list:
+    """electron-builder output name: branded productName, then Hermes.exe."""
     names: list[str] = []
-    pkg: dict = {}
-    pkg_path = desktop_dir / "package.json"
+    pkg = desktop_dir / "package.json"
     try:
-        loaded = json.loads(pkg_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            pkg = loaded
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+        build = data.get("build") if isinstance(data, dict) else {}
+        if not isinstance(build, dict):
+            build = {}
+        for key in (
+            build.get("executableName"),
+            build.get("productName"),
+            data.get("executableName") if isinstance(data, dict) else None,
+            data.get("productName") if isinstance(data, dict) else None,
+        ):
+            if isinstance(key, str):
+                n = key.strip()
+                if n and n not in names:
+                    names.append(n)
+    except Exception:
         pass
-    build = pkg.get("build") if isinstance(pkg.get("build"), dict) else {}
-    win = build.get("win") if isinstance(build.get("win"), dict) else {}
-    for value in (
-        win.get("executableName"),
-        build.get("productName"),
-        pkg.get("productName"),
-        pkg.get("name"),
-    ):
-        if isinstance(value, str) and value.strip():
-            names.append(value.strip())
-    names.extend(["Hermes", "Caravela", "hermes"])
-    seen: set[str] = set()
-    out: list[str] = []
-    for n in names:
-        key = n.casefold()
-        if key not in seen:
-            seen.add(key)
-            out.append(n)
-    return out
+    if "Hermes" not in names:
+        names.append("Hermes")
+    return [n if n.lower().endswith(".exe") else f"{n}.exe" for n in names]
 
 
 def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     """Return the current platform's unpacked Electron app executable."""
     release_dir = desktop_dir / "release"
-    names = _desktop_product_names(desktop_dir)
     if sys.platform == "darwin":
-        candidates: list[Path] = []
-        for n in names:
-            candidates.extend(release_dir.glob(f"mac*/{n}.app/Contents/MacOS/{n}"))
+        candidates = list(release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes"))
     elif sys.platform == "win32":
-        arches = ("win-unpacked", "win-ia32-unpacked", "win-arm64-unpacked")
         candidates = [
-            release_dir / arch / f"{n}.exe"
-            for arch in arches
-            for n in names
+            release_dir / folder / name
+            for name in _desktop_windows_exe_names(desktop_dir)
+            for folder in ("win-unpacked", "win-ia32-unpacked", "win-arm64-unpacked")
         ]
     else:
-        arches = ("linux-unpacked", "linux-arm64-unpacked")
-        candidates = []
-        for arch in arches:
-            for n in names:
-                candidates.append(release_dir / arch / n)
-                lowered = n.lower()
-                if lowered != n:
-                    candidates.append(release_dir / arch / lowered)
+        candidates = [
+            release_dir / "linux-unpacked" / "hermes",
+            release_dir / "linux-unpacked" / "Hermes",
+            release_dir / "linux-arm64-unpacked" / "hermes",
+            release_dir / "linux-arm64-unpacked" / "Hermes",
+        ]
 
     existing = [p for p in candidates if p.exists()]
     if not existing:
@@ -8427,6 +8408,33 @@ def _desktop_launch_options() -> tuple[list[str], str, str, str]:
     return flags, disable_gpu, password_store, ozone_hint
 
 
+
+def _register_caravela_windows_shortcuts(packaged_executable: Optional[Path]) -> None:
+    """Point Start Menu/Desktop at unpacked Caravela.exe, not Program Files NSIS."""
+    if sys.platform != "win32" or packaged_executable is None:
+        return
+    wrapper = PROJECT_ROOT / "scripts" / "desktop-update" / "caravela-windows.ps1"
+    if not wrapper.exists():
+        return
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", str(wrapper),
+                "-InstallRoot", str(PROJECT_ROOT),
+                "-RelaunchExe", str(packaged_executable),
+                "-RetargetShortcuts",
+            ],
+            check=False,
+            timeout=60,
+            capture_output=True,
+        )
+    except Exception:
+        logger.debug("Caravela shortcut retarget skipped", exc_info=True)
+
+
 def _register_linux_desktop_entry() -> None:
     """Install the XDG desktop entry for Hermes Desktop (Linux only, best-effort).
 
@@ -8684,6 +8692,7 @@ def cmd_gui(args: argparse.Namespace):
     # in the application menu with its icon. Best-effort and idempotent.
     # A failure must never stop the app from launching.
     _register_linux_desktop_entry()
+    _register_caravela_windows_shortcuts(packaged_executable)
 
     # --build-only: produce the artifact but do NOT launch. The installer's
     # --update flow drives the rebuild headlessly and then launches the desktop

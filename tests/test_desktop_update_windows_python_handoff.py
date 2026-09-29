@@ -95,6 +95,12 @@ def test_update_invocation_uses_module_entrypoint() -> None:
         "The desktop rebuild step must also go through "
         "`python.exe -m hermes_cli.main desktop ...` for the same reason."
     )
+    assert '$alreadyRebuilt = $res.Output -match "Desktop app rebuilt"' in source, (
+        "A Desktop-driven update must compile the shell unless hermes update "
+        "already printed 'Desktop app rebuilt'. Matching the content hash is "
+        "not success — that skip is what relaunches the previous exe."
+    )
+    assert "-not $alreadyRebuilt" in source
 
 
 def test_update_no_longer_invokes_the_hermes_exe_shim() -> None:

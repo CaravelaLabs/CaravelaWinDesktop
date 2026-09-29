@@ -87,7 +87,27 @@ def test_successful_rebuild_returns_true(desktop_env, monkeypatch, capsys):
     )
     assert _run(desktop_dir) is True
     assert len(builds) == 1
-    assert "Desktop app up to date" in capsys.readouterr().out
+    assert "Desktop app rebuilt" in capsys.readouterr().out
+
+
+def test_force_rebuilds_even_when_content_stamp_matches(desktop_env):
+    desktop_dir, calls = desktop_env
+    calls["build_needed"] = False
+    spawned = []
+
+    def _spawn(cmd, cwd=None, env=None):
+        spawned.append(list(cmd))
+        return _Result(0)
+
+    # The fixture's _m() returns a class; patch the instance method the
+    # update helper actually calls via update_cmd._m().
+    monkeypatch_target = update_cmd._m()
+    monkeypatch_target._run_logged_subprocess = staticmethod(_spawn)
+    assert _rebuild_desktop_after_update(
+        desktop_dir, had_desktop_app_before_update=True, force=True
+    ) is True
+    assert calls["builds"] == 0
+    assert spawned and spawned[0][-2:] == ["--build-only", "--force-build"]
 
 
 def test_up_to_date_desktop_returns_true_without_spawning(desktop_env):

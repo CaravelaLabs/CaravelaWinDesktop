@@ -1522,14 +1522,18 @@ try {
         Write-HandoffLog "retry exit code: $($res.Code)"
     }
 
-    # -- 4. Truthful completion: don't trust exit 0 -------------------------
-    # `hermes update` treats a Desktop GUI build failure as NON-fatal (prints
-    # a one-line warning, exits 0). For a Desktop-DRIVEN update that warning
-    # is fatal: we would relaunch the old exe and call it success. Detect it,
-    # retry the build once, and propagate honestly.
+    # -- 4. Truthful completion: don't trust exit 0 ------------------------
+    # `hermes update` treats a matching desktop content hash as "up to date"
+    # and skips the Electron pack. The already-up-to-date early return never
+    # checks the shell at all. For a Desktop-DRIVEN update that skip is a
+    # failure: we would relaunch the old exe and call it success. Compile
+    # unless this run already printed "Desktop app rebuilt". A build failure
+    # is also non-fatal inside `hermes update` (one-line warning, exit 0) —
+    # retry once here and propagate honestly.
     $desktopBuildFailed = $false
-    if ($res.Code -eq 0 -and $res.Output -match "Desktop build failed") {
-        Write-HandoffLog "hermes update reported a desktop build failure (non-fatal there, fatal here); retrying build"
+    $alreadyRebuilt = $res.Output -match "Desktop app rebuilt"
+    if ($res.Code -eq 0 -and -not $alreadyRebuilt) {
+        Write-HandoffLog "desktop shell was not rebuilt by hermes update; forcing a desktop build"
         Publish-UiProgress "Rebuilding Desktop"
         $rebuild = Invoke-HermesStep $pythonExe @("-m", "hermes_cli.main", "desktop", "--force-build", "--build-only") "rebuild"
         Write-HandoffLog "desktop rebuild exit code: $($rebuild.Code)"

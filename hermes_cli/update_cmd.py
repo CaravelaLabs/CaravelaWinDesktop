@@ -2257,6 +2257,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     desktop_build_ok = _rebuild_desktop_after_update(
         _m().PROJECT_ROOT / "apps" / "desktop",
         had_desktop_app_before_update=had_desktop_app_before_update,
+        force=True,
     )
 
     # Sync skills
@@ -4075,6 +4076,19 @@ def _repair_node_deps_on_current_checkout(
     # _update_node_dependencies call site; it staleness-checks internally,
     # so this is a no-op when nothing changed.
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    # A current git checkout is not a current desktop shell. The in-app
+    # Update button hits this path whenever origin has no new commits, and
+    # used to return before any Electron pack. force=True compiles anyway.
+    desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
+    if not _rebuild_desktop_after_update(
+        desktop_dir,
+        had_desktop_app_before_update=_desktop_app_present(desktop_dir),
+        force=True,
+    ):
+        print_completion(
+            "⚠ Checkout is current, but the desktop app was not rebuilt."
+        )
+        return False
     _check_and_apply_config_migration(
         assume_yes=assume_yes,
         gateway_mode=gateway_mode,
@@ -7691,9 +7705,15 @@ def _desktop_app_present(desktop_dir: Path) -> bool:
 
 
 def _rebuild_desktop_after_update(
-    desktop_dir: Path, *, had_desktop_app_before_update: bool
+    desktop_dir: Path, *, had_desktop_app_before_update: bool, force: bool = False
 ) -> bool:
     """Rebuild an installed Desktop app when its source or artifact changed.
+
+    ``force=True`` is the Desktop-driven update contract: a matching content
+    hash is not success. The in-app Update button relaunches whatever exe is
+    already on disk, so skipping the Electron pack leaves the user on the
+    previous shell. Callers that pass ``force`` always spawn
+    ``hermes desktop --force-build --build-only``.
 
     Returns ``False`` only when a rebuild was attempted and failed, so the
     caller can withhold ``✓ Update complete!`` and (in gateway mode) write
@@ -7720,18 +7740,25 @@ def _rebuild_desktop_after_update(
     # update path never passes --source, so the subprocess would run with
     # source_mode=False — mirror that here. Any error in the pre-check falls
     # through to the subprocess.
+    #
+    # force=True skips that short-circuit. A Desktop update must compile even
+    # when apps/desktop bytes match the last stamp — the running shell can
+    # still be an older pack, and the button has no other compile step.
     skip_desktop_build = False
-    try:
-        skip_desktop_build = not _m()._desktop_build_needed(
-            desktop_dir, _m().PROJECT_ROOT, source_mode=False
-        )
-    except Exception:
-        skip_desktop_build = False
+    if not force:
+        try:
+            skip_desktop_build = not _m()._desktop_build_needed(
+                desktop_dir, _m().PROJECT_ROOT, source_mode=False
+            )
+        except Exception:
+            skip_desktop_build = False
     if skip_desktop_build:
         print("  ✓ Desktop app up to date")
         return True
 
     desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
+    if force:
+        desktop_build_cmd.append("--force-build")
     # Capture the (very loud) Electron/vite build output into update.log
     # instead of streaming it to the terminal. On the rare nonzero exit,
     # retry once after waiting again for the venv — this covers a
@@ -7762,7 +7789,10 @@ def _rebuild_desktop_after_update(
 
         print(f"  Full build log: {_dhh()}/logs/update.log")
         return False
-    print("  ✓ Desktop app up to date")
+    # Distinct from the hash-skip line. The Windows desktop hand-off
+    # force-builds unless it sees this exact sentence, so a successful pack
+    # is not compiled a second time.
+    print("  ✓ Desktop app rebuilt")
     return True
 
 
@@ -9184,6 +9214,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         desktop_build_ok = _rebuild_desktop_after_update(
             desktop_dir,
             had_desktop_app_before_update=had_desktop_app_before_update,
+            force=True,
         )
 
         print()

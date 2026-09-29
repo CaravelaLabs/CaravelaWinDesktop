@@ -1,22 +1,22 @@
 import { atom } from 'nanostores'
 
+import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import { $petActivity, $petInfo, $petUnread, clearPetUnread, type PetActivity, type PetInfo } from '@/store/pet'
-import { $awaitingResponse, $busy } from '@/store/session'
 
 /**
  * Controller for the pop-out pet overlay (main-renderer side).
  *
  * Shift-clicking the in-window pet "pops it out" into a transparent,
  * always-on-top OS window (created in electron/main.ts) that can leave the
- * app's bounds and stays visible while Hermes is minimized. That window carries
+ * app's bounds and stays visible while Caravela is minimized. That window carries
  * NO gateway connection — this renderer remains the single source of truth and
  * pushes the live pet state to it over IPC. Control flows back (pop the pet back
  * in, submit a composer message) via `onControl`.
  *
  * The overlay renders the same `PetSprite` / `PetBubble` as the in-window pet by
- * mirroring the four reactive inputs of `$petState` (`$petInfo`, `$petActivity`,
- * `$busy`, `$awaitingResponse`) into its own copies of those atoms — so the
+ * mirroring the reactive inputs of `$petState` (`$petInfo`, `$petActivity`, the
+ * primary view's turn-busy and awaiting-response) into its own copies of those atoms — so the
  * popped-out mascot is pixel-identical and needs zero bespoke render logic.
  */
 
@@ -144,8 +144,8 @@ function currentPayload(): PetOverlayStatePayload {
   return {
     info: $petInfo.get(),
     activity: $petActivity.get(),
-    busy: $busy.get(),
-    awaiting: $awaitingResponse.get(),
+    busy: PRIMARY_SESSION_VIEW.$busy.get(),
+    awaiting: PRIMARY_SESSION_VIEW.$awaitingResponse.get(),
     unread: $petUnread.get(),
     reaction: $petReaction.get()
   }
@@ -181,8 +181,8 @@ function openOverlay(request: PetOverlayOpenRequest): void {
   stateUnsubs = [
     $petInfo.subscribe(pushNow),
     $petActivity.subscribe(pushNow),
-    $busy.subscribe(pushNow),
-    $awaitingResponse.subscribe(pushNow),
+    PRIMARY_SESSION_VIEW.$busy.subscribe(pushNow),
+    PRIMARY_SESSION_VIEW.$awaitingResponse.subscribe(pushNow),
     $petUnread.subscribe(pushNow),
     $petReaction.subscribe(pushNow)
   ]

@@ -1,7 +1,7 @@
 {
   "name": "@hermes/bootstrap-installer",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.0.0",
   "description": "Caravela Setup \u2014 installer/updater UI for Caravela.",
   "type": "module",
   "scripts": {

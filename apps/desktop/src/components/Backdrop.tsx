@@ -1,7 +1,7 @@
+import { useTheme } from '@/themes'
 import { useStore } from '@nanostores/react'
 
 import { $backdrop } from '@/store/backdrop'
-import { useTheme } from '@/themes/context'
 
 const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
 
@@ -10,25 +10,16 @@ export function Backdrop() {
   const { theme } = useTheme()
   const branding = theme.branding
   const backdropUrl = branding?.backdropUrl
-  // 'motif' = brand illustration (SVG/PNG) rendered as-is, full-cover.
-  // 'photo' (default) = photo treatment with the invert/blend filter
-  // tuned for the default backdrop. Branded themes that ship a motif opt into
-  // the clean path so their identity asset isn't put through the photo filter.
-  const motifMode = branding?.backdropMode === 'motif'
+  const motif = branding?.backdropMode === 'motif' && backdropUrl
 
-  if (!on) {
+  if (!on && !motif) {
     return null
   }
 
-  if (motifMode && backdropUrl) {
+  if (motif) {
     return (
-      <div aria-hidden className="pointer-events-none absolute inset-0 z-2 overflow-hidden">
-        <img
-          alt=""
-          className="absolute inset-0 h-full w-full object-cover"
-          fetchPriority="low"
-          src={assetPath(backdropUrl)}
-        />
+      <div aria-hidden className="pointer-events-none absolute inset-0 z-2" role="img" aria-label="Caravela atmospheric backdrop">
+        <img alt="" className="h-full w-full object-cover" fetchPriority="low" src={assetPath(backdropUrl)} />
       </div>
     )
   }

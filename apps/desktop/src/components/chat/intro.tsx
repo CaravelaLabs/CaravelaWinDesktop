@@ -1,7 +1,8 @@
 import { useState } from 'react'
 
+import { useI18n } from '@/i18n'
+import { useTheme } from '@/themes'
 import { capitalize, normalize } from '@/lib/text'
-import { useTheme } from '@/themes/context'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
 import { Wordmark } from './wordmark'
@@ -146,8 +147,6 @@ function pickCopy(copies: IntroCopy[], seed = 0): IntroCopy {
   return copies[Math.abs(seed) % copies.length] || FALLBACK_COPY[0]
 }
 
-const WORDMARK = 'HERMES AGENT'
-
 function resolveCopy(personality?: string, seed?: number): IntroCopy {
   const personalityKey = normalizeKey(personality)
 
@@ -160,13 +159,20 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 
 export function Intro({ personality, seed }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
-  const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+  const { t } = useI18n()
   const { theme } = useTheme()
   const wordmarkUrl = theme.branding?.wordmarkUrl
-  const productName = theme.branding?.productName ?? 'Caravela Agent'
-  const wordmark = (productName || WORDMARK).toUpperCase()
-  const assetBase = import.meta.env.BASE_URL
-  const wordmarkSrc = wordmarkUrl ? `${assetBase}${wordmarkUrl.replace(/^\//, '')}` : null
+  const productName = theme.branding?.productName ?? 'Caravela'
+  const wordmark = productName.toUpperCase()
+  const wordmarkSrc = wordmarkUrl ? `${import.meta.env.BASE_URL}${wordmarkUrl.replace(/^\//, '')}` : null
+  const rotationSeed = mountSeed + (seed ?? 0)
+  const copy = resolveCopy(personality, rotationSeed)
+  const key = normalizeKey(personality)
+
+  const bodies =
+    t.intro.stock[key] ?? (NEUTRAL_PERSONALITIES.has(key) ? t.intro.stock.none : t.intro.custom(personality || ''))
+
+  const body = bodies?.[Math.abs(rotationSeed) % bodies.length] ?? copy.body
 
   return (
     <div
@@ -175,22 +181,14 @@ export function Intro({ personality, seed }: IntroProps) {
     >
       <div className="w-full min-w-0">
         {wordmarkSrc ? (
-          // Branded wordmark image — replaces the Collapse-font WORDMARK text
-          // when the active theme ships its own typographic identity (e.g. the
-          // Caravela ship-and-waves wordmark). Sized to roughly match the fit-
-          // text wordmark's visual weight on a default chat empty-state.
-          <div className="mx-auto mb-1 flex w-[calc(100%-1rem)] items-center justify-center" aria-label={wordmark}>
-            <img
-              alt={wordmark}
-              src={wordmarkSrc}
-              className="h-auto max-h-[40vh] w-auto max-w-[min(360px,55%)] object-contain"
-            />
+          <div aria-label={wordmark} className="mx-auto mb-1 flex w-[calc(100%-1rem)] items-center justify-center">
+            <img alt={wordmark} className="h-16 w-auto max-w-full object-contain" src={wordmarkSrc} />
           </div>
         ) : (
           <Wordmark className="mb-1" text={wordmark} />
         )}
 
-        <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>
+        <p className="m-0 text-center leading-normal tracking-tight">{body}</p>
       </div>
     </div>
   )

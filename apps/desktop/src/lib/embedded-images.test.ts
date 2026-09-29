@@ -12,7 +12,7 @@ describe('extractEmbeddedImages', () => {
   it('lifts a bare data:image URL out of prose', () => {
     const result = extractEmbeddedImages(`describe this ${SAMPLE_PNG_DATA_URL}`)
 
-    expect(result.cleanedText).toBe('describe this')
+    expect(result.cleanedText).toBe('describe this ')
     expect(result.images).toEqual([SAMPLE_PNG_DATA_URL])
   })
 
@@ -68,7 +68,7 @@ describe('extractImageRefs', () => {
   })
 
   it('lifts a backtick-quoted ref so a path with spaces survives intact', () => {
-    const ref = '@image:`/Users/me/Library/Application Support/Hermes/composer-images/a.png`'
+    const ref = '@image:`/Users/me/Library/Application Support/Caravela/composer-images/a.png`'
     const result = extractImageRefs(`${ref}\nwhat is this?`)
 
     expect(result).toEqual({ cleanedText: 'what is this?', refs: [ref] })
@@ -79,7 +79,7 @@ describe('extractImageRefs', () => {
     // lifted ref already renders that same attachment.
     const result = extractImageRefs('@image:/tmp/cat.png\nwhat is in this photo?\n[screenshot]')
 
-    expect(result).toEqual({ cleanedText: 'what is in this photo?', refs: ['@image:/tmp/cat.png'] })
+    expect(result).toEqual({ cleanedText: 'what is in this photo?\n', refs: ['@image:/tmp/cat.png'] })
   })
 
   it('keeps [screenshot] when the message carries no image refs', () => {

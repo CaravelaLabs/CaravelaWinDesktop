@@ -6,6 +6,7 @@ import { test } from 'vitest'
 
 import {
   collectRelaunchArgs,
+  describeUpdaterHandoffFailure,
   MARKER_SELF_ADOPT_EPOCH_MS,
   observeUpdaterHandoff,
   resolvePosixScriptHandoff,
@@ -23,7 +24,7 @@ test('stagedUpdaterSupportsPrewrittenMarker rejects installers predating the sel
   // The real-world trap: an installer staged at first install months ago, never
   // refreshed because copy_self_to_hermes_home no-ops during --update.
   assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
+    stagedUpdaterSupportsPrewrittenMarker('C:\\Caravela\\hermes-setup.exe', {
       stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS - 60 * DAY_MS
     }),
     false
@@ -32,13 +33,13 @@ test('stagedUpdaterSupportsPrewrittenMarker rejects installers predating the sel
 
 test('stagedUpdaterSupportsPrewrittenMarker accepts installers from the fix onward', () => {
   assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
+    stagedUpdaterSupportsPrewrittenMarker('C:\\Caravela\\hermes-setup.exe', {
       stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS
     }),
     true
   )
   assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
+    stagedUpdaterSupportsPrewrittenMarker('C:\\Caravela\\hermes-setup.exe', {
       stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS + 30 * DAY_MS
     }),
     true
@@ -49,7 +50,7 @@ test('stagedUpdaterSupportsPrewrittenMarker treats an unreadable mtime as unsupp
   // Bias toward the path that can always make progress: a skipped pre-write
   // loses anti-respawn hardening, a wedged updater can never update again.
   assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
+    stagedUpdaterSupportsPrewrittenMarker('C:\\Caravela\\hermes-setup.exe', {
       stagedMtimeMs: () => null
     }),
     false
@@ -61,12 +62,12 @@ test('resolveStagedUpdaterBinary still returns a stale staged updater on Windows
   // the stale binary is the only updater these users have, and it works fine
   // once it is allowed to write its own claim.
   assert.equal(
-    resolveStagedUpdaterBinary('C:\\Hermes', {
+    resolveStagedUpdaterBinary('C:\\Caravela', {
       fileExists: () => true,
       isWindows: true,
       stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS - 60 * DAY_MS
     }),
-    path.join('C:\\Hermes', 'hermes-setup.exe')
+    path.join('C:\\Caravela', 'hermes-setup.exe')
   )
 })
 
@@ -84,7 +85,7 @@ test('spawnUpdaterProcess hides the updater console and detaches the child on Wi
   const result = spawnUpdaterProcess(
     'hermes-setup.exe',
     ['--update', '--branch', 'main'],
-    { cwd: 'C:\\Hermes', detached: true, stdio: 'ignore' },
+    { cwd: 'C:\\Caravela', detached: true, stdio: 'ignore' },
     {
       isWindows: true,
       spawnProcess: (command, args, options) => {
@@ -101,7 +102,7 @@ test('spawnUpdaterProcess hides the updater console and detaches the child on Wi
     {
       args: ['--update', '--branch', 'main'],
       command: 'hermes-setup.exe',
-      options: { cwd: 'C:\\Hermes', detached: true, stdio: 'ignore', windowsHide: true }
+      options: { cwd: 'C:\\Caravela', detached: true, stdio: 'ignore', windowsHide: true }
     }
   ])
 })
@@ -218,7 +219,10 @@ test('resolveUpdateScriptHandoff is Windows-only (POSIX updates in place)', () =
   assert.equal(handoff, null)
 })
 
-test('wrapHandoffForDetachedConsole routes through cmd start with own console', () => {
+test('wrapHandoffForDetachedConsole runs the script inside a non-detached hidden wrapper console', () => {
+  // #116161: `start /min` allocated a NEW (minimized, visible) console for
+  // powershell on every hand-off; `detached: true` (DETACHED_PROCESS) would
+  // leave the wrapper console-less, forcing the same allocation under `/b`.
   const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
   const expected = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
 
@@ -231,13 +235,14 @@ test('wrapHandoffForDetachedConsole routes through cmd start with own console', 
   const wrapped = wrapHandoffForDetachedConsole(handoff, ['-InstallRoot', root, '-Branch', 'main'])
 
   assert.equal(wrapped.command, 'cmd.exe')
+  assert.equal(wrapped.detached, false)
   assert.deepEqual(wrapped.args, [
     '/d',
     '/s',
     '/c',
     'start',
     '',
-    '/min',
+    '/b',
     'powershell',
     '-NoProfile',
     '-ExecutionPolicy',
@@ -391,6 +396,18 @@ test('observeUpdaterHandoff reports a non-zero early exit', async () => {
   assert.equal(outcome.ok, false)
   assert.equal(outcome.reason, 'early-exit')
   assert.equal(outcome.code, 127)
+})
+
+test('describeUpdaterHandoffFailure leads with plain copy and confines the raw outcome to Details', () => {
+  for (const raw of ['updater exited 127 before the settle window elapsed', 'updater spawn failed: ENOENT']) {
+    const text = describeUpdaterHandoffFailure({ message: raw })
+    const [lead, details] = text.split('\n\nDetails: ')
+
+    assert.ok(lead && !lead.includes(raw))
+    assert.equal(details, raw)
+  }
+
+  assert.doesNotMatch(describeUpdaterHandoffFailure({}), /Details:/)
 })
 
 test('observeUpdaterHandoff reports a signal death inside the window', async () => {

@@ -3,7 +3,7 @@ import { atom } from 'nanostores'
 import { type ClientWakeCaptureHandle, startClientWakeCapture } from '@/lib/wake-client-capture'
 import { $gateway } from '@/store/gateway'
 
-// "Hey Hermes" wake-word listener state for the composer toggle. The gateway is
+// "Hey Caravela" wake-word listener state for the composer toggle. The gateway is
 // the single source of truth (the listener lives in the backend and is shared
 // with the TUI under a single-owner mic lease); this atom is the renderer's
 // cache of that truth, refreshed from every wake.* RPC response we see.
@@ -59,7 +59,24 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
   try {
     clientCapture = await startClientWakeCapture({
       frameLength: result.frame_length,
-      request: gatewayRequester
+      request: gatewayRequester,
+      // The continuous PCM chain can die after arming (dead track, stalled
+      // graph, sustained silence, refused feeds — #119089). A "listening" ear
+      // that can never fire is worse than an honest off state, so mirror the
+      // start-failure path: drop the capture, show the reason, release the lease.
+      onError: error => {
+        stopClientCapture()
+        const failed = $wakeWord.get()
+        $wakeWord.set({
+          ...failed,
+          listening: false,
+          notice: error.message,
+          pending: false
+        })
+
+        // Best-effort: release server lease if client mic failed.
+        void gatewayRequester('wake.stop', {}).catch(() => undefined)
+      }
     })
   } catch (error) {
     const current = $wakeWord.get()
@@ -142,7 +159,7 @@ const gatewayRequester: WakeRequester = async <T>(method: string, params: Record
   const gateway = $gateway.get()
 
   if (!gateway) {
-    throw new Error('Hermes gateway unavailable')
+    throw new Error('Caravela gateway unavailable')
   }
 
   return method === 'wake.start'

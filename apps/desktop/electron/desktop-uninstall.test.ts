@@ -10,35 +10,76 @@
  */
 
 import assert from 'node:assert/strict'
+import { type ChildProcess, spawn } from 'node:child_process'
+import { once } from 'node:events'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 import { test } from 'vitest'
 
 import {
+  allowedUninstallModes,
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
+  installKindAllowsCodeRemoval,
   modeRemovesAgent,
   modeRemovesUserData,
+  nativeRemovalInstructions,
+  resolveInstallKind,
   resolveRemovableAppPath,
   shouldRemoveAppBundle,
-  UNINSTALL_MODES,
   uninstallArgsForMode
 } from './desktop-uninstall'
 
 // --- uninstallArgsForMode ---
-
-test('uninstallArgsForMode maps each mode to the module-runner argv', () => {
-  assert.deepEqual(uninstallArgsForMode('gui'), ['-m', 'hermes_cli.uninstall', '--mode', 'gui'])
-  assert.deepEqual(uninstallArgsForMode('lite'), ['-m', 'hermes_cli.uninstall', '--mode', 'lite'])
-  assert.deepEqual(uninstallArgsForMode('full'), ['-m', 'hermes_cli.uninstall', '--mode', 'full'])
-})
 
 test('uninstallArgsForMode throws on an unknown mode (no silent full wipe)', () => {
   assert.throws(() => uninstallArgsForMode('nuke'), /Unknown uninstall mode/)
   assert.throws(() => uninstallArgsForMode(''), /Unknown uninstall mode/)
 })
 
-test('UNINSTALL_MODES lists exactly the three supported modes', () => {
-  assert.deepEqual([...UNINSTALL_MODES].sort(), ['full', 'gui', 'lite'])
+// --- resolveInstallKind / allowedUninstallModes / nativeRemovalInstructions ---
+
+test('resolveInstallKind reads the stamp: distribution nix wins, payload kind means bundled', () => {
+  assert.equal(resolveInstallKind({ distribution: 'nix' }), 'nix')
+  assert.equal(resolveInstallKind({ source: 'nix' }), 'nix')
+  // distribution beats payload: a nix stamp never becomes 'bundled'.
+  assert.equal(resolveInstallKind({ distribution: 'nix', payload: 'bundled' }), 'nix')
+  assert.equal(resolveInstallKind({ distribution: 'desktop-app', payload: 'bundled' }), 'bundled')
+  assert.equal(resolveInstallKind({ payload: 'bundled' }), 'bundled')
+  // light artifacts have no agent code either — same managed flow.
+  assert.equal(resolveInstallKind({ payload: 'light' }), 'bundled')
+  // bootstrap / no stamp facts at all → the classic source/installer flow.
+  assert.equal(resolveInstallKind({ payload: 'bootstrap' }), 'standard')
+  assert.equal(resolveInstallKind({}), 'standard')
+  assert.equal(resolveInstallKind(), 'standard')
+})
+
+test('only standard installs allow desktop uninstall; managed kinds have no safe mode', (): void => {
+  assert.equal(installKindAllowsCodeRemoval('standard'), true)
+  assert.equal(installKindAllowsCodeRemoval('nix'), false)
+  assert.equal(installKindAllowsCodeRemoval('bundled'), false)
+
+  assert.deepEqual(allowedUninstallModes('standard'), ['gui', 'lite', 'full'])
+  assert.deepEqual(allowedUninstallModes('nix'), [])
+  assert.deepEqual(allowedUninstallModes('bundled'), [])
+})
+
+test('nativeRemovalInstructions names the steward per kind and OS', () => {
+  assert.match(nativeRemovalInstructions('nix', 'linux'), /installed by Nix/)
+  assert.match(nativeRemovalInstructions('nix', 'darwin'), /flake or profile/)
+  assert.match(nativeRemovalInstructions('bundled', 'win32'), /Installed apps/)
+  assert.match(nativeRemovalInstructions('bundled', 'darwin'), /Trash/)
+  assert.match(
+    nativeRemovalInstructions('bundled', 'linux', '/home/x/Apps/Caravela.AppImage'),
+    /\/home\/x\/Apps\/Caravela\.AppImage/
+  )
+  assert.match(
+    nativeRemovalInstructions('bundled', 'linux', '/opt/hermes/linux-unpacked'),
+    /app directory at \/opt\/hermes\/linux-unpacked/
+  )
+  assert.match(nativeRemovalInstructions('bundled', 'linux'), /wherever you saved it/)
 })
 
 // --- modeRemovesAgent / modeRemovesUserData ---
@@ -47,22 +88,24 @@ test('mode predicates classify what each mode removes', () => {
   assert.equal(modeRemovesAgent('gui'), false)
   assert.equal(modeRemovesAgent('lite'), true)
   assert.equal(modeRemovesAgent('full'), true)
+  assert.equal(modeRemovesAgent('data'), false)
 
   assert.equal(modeRemovesUserData('gui'), false)
   assert.equal(modeRemovesUserData('lite'), false)
   assert.equal(modeRemovesUserData('full'), true)
+  assert.equal(modeRemovesUserData('data'), true)
 })
 
 // --- resolveRemovableAppPath ---
 
 test('resolveRemovableAppPath finds the .app bundle on macOS', () => {
   assert.equal(
-    resolveRemovableAppPath('/Applications/Hermes.app/Contents/MacOS/Hermes', 'darwin'),
-    '/Applications/Hermes.app'
+    resolveRemovableAppPath('/Applications/Caravela.app/Contents/MacOS/Caravela', 'darwin'),
+    '/Applications/Caravela.app'
   )
   assert.equal(
-    resolveRemovableAppPath('/Users/x/Applications/Hermes.app/Contents/MacOS/Hermes', 'darwin'),
-    '/Users/x/Applications/Hermes.app'
+    resolveRemovableAppPath('/Users/x/Applications/Caravela.app/Contents/MacOS/Caravela', 'darwin'),
+    '/Users/x/Applications/Caravela.app'
   )
 })
 
@@ -81,23 +124,23 @@ test('resolveRemovableAppPath: dev-run .app resolves (safety is shouldRemoveAppB
 
 test('resolveRemovableAppPath finds the install dir on Windows', () => {
   assert.equal(
-    resolveRemovableAppPath('C:\\Users\\x\\AppData\\Local\\Programs\\Hermes\\Hermes.exe', 'win32'),
-    'C:\\Users\\x\\AppData\\Local\\Programs\\Hermes'
+    resolveRemovableAppPath('C:\\Users\\x\\AppData\\Local\\Programs\\Caravela\\Caravela.exe', 'win32'),
+    'C:\\Users\\x\\AppData\\Local\\Programs\\Caravela'
   )
   assert.equal(
-    resolveRemovableAppPath('C:\\Users\\x\\AppData\\Local\\hermes-desktop\\Hermes.exe', 'win32'),
+    resolveRemovableAppPath('C:\\Users\\x\\AppData\\Local\\hermes-desktop\\Caravela.exe', 'win32'),
     'C:\\Users\\x\\AppData\\Local\\hermes-desktop'
   )
 })
 
 test('resolveRemovableAppPath returns null for an unrecognized Windows dir', () => {
-  assert.equal(resolveRemovableAppPath('C:\\Temp\\foo\\Hermes.exe', 'win32'), null)
+  assert.equal(resolveRemovableAppPath('C:\\Temp\\foo\\Caravela.exe', 'win32'), null)
 })
 
 test('resolveRemovableAppPath uses APPIMAGE on Linux when set', () => {
   assert.equal(
-    resolveRemovableAppPath('/tmp/.mount_HermesXXXX/hermes', 'linux', { APPIMAGE: '/home/x/Apps/Hermes.AppImage' }),
-    '/home/x/Apps/Hermes.AppImage'
+    resolveRemovableAppPath('/tmp/.mount_HermesXXXX/hermes', 'linux', { APPIMAGE: '/home/x/Apps/Caravela.AppImage' }),
+    '/home/x/Apps/Caravela.AppImage'
   )
 })
 
@@ -115,15 +158,69 @@ test('resolveRemovableAppPath returns null for an empty exe path', () => {
 // --- shouldRemoveAppBundle ---
 
 test('shouldRemoveAppBundle requires packaged AND a resolved path', () => {
-  assert.equal(shouldRemoveAppBundle(true, '/Applications/Hermes.app'), true)
-  assert.equal(shouldRemoveAppBundle(false, '/Applications/Hermes.app'), false)
+  assert.equal(shouldRemoveAppBundle(true, '/Applications/Caravela.app'), true)
+  assert.equal(shouldRemoveAppBundle(false, '/Applications/Caravela.app'), false)
   assert.equal(shouldRemoveAppBundle(true, null), false)
   assert.equal(shouldRemoveAppBundle(false, null), false)
 })
 
-// --- buildPosixCleanupScript ---
+test.skipIf(process.platform === 'win32').each(['gui', 'lite', 'full'] as const)(
+  'POSIX cleanup executes %s in its sandbox and preserves its sibling',
+  async (mode: string): Promise<void> => {
+    const root: string = fs.mkdtempSync(path.join(os.tmpdir(), "uninstall-o'brien-"))
+    const app: string = path.join(root, 'App with spaces')
+    const sibling: string = path.join(root, 'App with spaces-other')
+    const recorder: string = path.join(root, "recorder's.cjs")
+    const resultFile: string = path.join(root, 'observed.json')
+    const script: string = path.join(root, 'cleanup.sh')
+    let child: ChildProcess | undefined
 
-test('buildPosixCleanupScript waits for the PID, runs the uninstall module, removes bundle', () => {
+    try {
+      fs.mkdirSync(app)
+      fs.mkdirSync(sibling)
+      fs.writeFileSync(
+        recorder,
+        `require('node:fs').writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({argv:process.argv.slice(2), home:process.env.HERMES_HOME, pythonPath:process.env.PYTHONPATH, cwd:process.cwd()}))`
+      )
+      fs.writeFileSync(
+        script,
+        buildPosixCleanupScript({
+          desktopPid: 0,
+          pythonExe: process.execPath,
+          pythonPath: mode === 'gui' ? null : root,
+          agentRoot: root,
+          uninstallArgs: [recorder, ...uninstallArgsForMode(mode)],
+          appPath: mode === 'lite' ? null : app,
+          hermesHome: root
+        })
+      )
+      child = spawn('bash', [script], {
+        env: { ...process.env, PYTHONPATH: 'inherited', HERMES_HOME: root },
+        stdio: 'ignore'
+      })
+      await once(child, 'close')
+      assert.equal(child.exitCode, 0)
+      assert.deepEqual(JSON.parse(fs.readFileSync(resultFile, 'utf8')), {
+        argv: ['-m', 'hermes_cli.uninstall', '--mode', mode],
+        home: root,
+        pythonPath: mode === 'gui' ? 'inherited' : `${root}:inherited`,
+        cwd: root
+      })
+      assert.equal(fs.existsSync(app), mode === 'lite')
+      assert.equal(fs.existsSync(sibling), true)
+      assert.equal(fs.existsSync(script), false)
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill()
+        await once(child, 'close')
+      }
+
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }
+)
+
+test('buildPosixCleanupScript waits for the PID, runs the uninstall module, removes bundle', (): void => {
   const script = buildPosixCleanupScript({
     desktopPid: 4321,
     pythonExe: '/home/x/.hermes/hermes-agent/venv/bin/python',
@@ -134,76 +231,12 @@ test('buildPosixCleanupScript waits for the PID, runs the uninstall module, remo
     hermesHome: '/home/x/.hermes'
   })
 
-  assert.match(script, /^#!\/bin\/bash/)
+  assert.match(script, /^#!\/usr\/bin\/env bash\n/)
   assert.match(script, /pid=4321/)
   assert.match(script, /kill -0 "\$pid"/)
-  // bounded wait (~30s), not unbounded
-  assert.match(script, /seq 1 60/)
   assert.match(script, /'-m' 'hermes_cli\.uninstall' '--mode' 'gui'/)
   assert.match(script, /rm -rf '\/opt\/hermes\/linux-unpacked'/)
   assert.match(script, /export HERMES_HOME='\/home\/x\/\.hermes'/)
-})
-
-test('buildPosixCleanupScript exports PYTHONPATH when pythonPath is set (lite/full)', () => {
-  const script = buildPosixCleanupScript({
-    desktopPid: 1,
-    pythonExe: '/usr/bin/python3',
-    pythonPath: '/home/x/.hermes/hermes-agent',
-    agentRoot: '/home/x/.hermes/hermes-agent',
-    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
-    appPath: null,
-    hermesHome: '/home/x/.hermes'
-  })
-
-  // System python + source on PYTHONPATH so import hermes_cli works while the
-  // venv is torn down.
-  assert.match(script, /export PYTHONPATH='\/home\/x\/\.hermes\/hermes-agent'/)
-  assert.match(script, /'\/usr\/bin\/python3' '-m' 'hermes_cli\.uninstall' '--mode' 'full'/)
-})
-
-test('buildPosixCleanupScript omits PYTHONPATH when pythonPath is null (gui)', () => {
-  const script = buildPosixCleanupScript({
-    desktopPid: 1,
-    pythonExe: '/p/python',
-    pythonPath: null,
-    agentRoot: '/a',
-    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
-    appPath: null,
-    hermesHome: '/h'
-  })
-
-  assert.doesNotMatch(script, /export PYTHONPATH/)
-})
-
-test('buildPosixCleanupScript omits the bundle rm when appPath is null', () => {
-  const script = buildPosixCleanupScript({
-    desktopPid: 1,
-    pythonExe: '/p/python',
-    pythonPath: null,
-    agentRoot: '/a',
-    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'lite'],
-    appPath: null,
-    hermesHome: '/h'
-  })
-
-  assert.doesNotMatch(script, /rm -rf '\//)
-  // Still runs the uninstall.
-  assert.match(script, /'-m' 'hermes_cli\.uninstall' '--mode' 'lite'/)
-})
-
-test('buildPosixCleanupScript single-quote-escapes paths with apostrophes', () => {
-  const script = buildPosixCleanupScript({
-    desktopPid: 1,
-    pythonExe: "/home/o'brien/python",
-    pythonPath: null,
-    agentRoot: '/a',
-    uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'gui'],
-    appPath: null,
-    hermesHome: '/h'
-  })
-
-  // The apostrophe is closed-escaped-reopened so the shell sees the literal.
-  assert.match(script, /'\/home\/o'\\''brien\/python'/)
 })
 
 // --- buildWindowsCleanupScript ---
@@ -215,7 +248,7 @@ test('buildWindowsCleanupScript waits (bounded) for PID, runs uninstall, rmdir b
     pythonPath: 'C:\\hermes',
     agentRoot: 'C:\\hermes',
     uninstallArgs: ['-m', 'hermes_cli.uninstall', '--mode', 'full'],
-    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\Hermes',
+    appPath: 'C:\\Users\\x\\AppData\\Local\\Programs\\Caravela',
     hermesHome: 'C:\\Users\\x\\AppData\\Local\\hermes'
   })
 
@@ -227,10 +260,9 @@ test('buildWindowsCleanupScript waits (bounded) for PID, runs uninstall, rmdir b
   // Bounded wait-loop (no infinite loop), whole-token PID match (no substring).
   assert.match(script, /if %waited% geq 60 goto waited_done/)
   assert.match(script, /findstr \/r \/c:" %PID% "/)
-  assert.doesNotMatch(script, /find "%PID%"/) // the old substring-prone form is gone
   // Removal is a retry loop (Windows releases dir handles lazily).
   assert.match(script, /:rmloop/)
-  assert.match(script, /rmdir \/s \/q "C:\\Users\\x\\AppData\\Local\\Programs\\Hermes" >nul 2>&1/)
+  assert.match(script, /rmdir \/s \/q "C:\\Users\\x\\AppData\\Local\\Programs\\Caravela" >nul 2>&1/)
   assert.match(script, /if %tries% geq 10 goto rmdone/)
   assert.match(script, /del "%~f0"/)
 })

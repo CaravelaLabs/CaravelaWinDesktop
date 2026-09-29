@@ -3,7 +3,7 @@
  *
  * Why this exists
  * ───────────────
- * Hermes desktop can request a "repair" of its bundled backend when the
+ * Caravela desktop can request a "repair" of its bundled backend when the
  * renderer observes a transient backend failure (see issue #74874). The
  * classic failure fingerprint:
  *

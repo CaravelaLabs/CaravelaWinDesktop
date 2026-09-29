@@ -151,7 +151,7 @@ async function connectionScope(
     }
 
     // Remote profile is intentionally excluded: profiles mapped into the same
-    // remote Hermes home form one interaction scope. Key/identity-file paths are
+    // remote Caravela home form one interaction scope. Key/identity-file paths are
     // credentials and likewise stay out of the scope material.
     return {
       key: [

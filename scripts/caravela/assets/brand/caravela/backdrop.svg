@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1200" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Caravela atmospheric backdrop">
+  <defs>
+    <!-- Faint nautical chart grid -->
+    <pattern id="cv-grid-minor" x="0" y="0" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#0A2540" stroke-width="0.6" opacity="0.06"/>
+    </pattern>
+    <pattern id="cv-grid-major" x="0" y="0" width="160" height="160" patternUnits="userSpaceOnUse">
+      <rect width="160" height="160" fill="url(#cv-grid-minor)"/>
+      <path d="M 160 0 L 0 0 0 160" fill="none" stroke="#0A2540" stroke-width="1" opacity="0.10"/>
+    </pattern>
+
+    <!-- Waypoint diamond marker (Caravela's only bullet) -->
+    <symbol id="cv-waypoint" viewBox="0 0 32 32">
+      <g transform="translate(16 16) rotate(45)">
+        <rect x="-6" y="-6" width="12" height="12" fill="#E86A1C"/>
+        <rect x="-2.5" y="-2.5" width="5" height="5" fill="#F4EEE3"/>
+      </g>
+    </symbol>
+  </defs>
+
+  <!-- Layer 1: nautical chart grid (very subtle) -->
+  <rect width="1920" height="1200" fill="url(#cv-grid-major)"/>
+
+  <!-- Layer 2: scattered waypoint markers along an implied bearing -->
+  <g opacity="0.22">
+    <use href="#cv-waypoint" x="180" y="180" width="14" height="14"/>
+    <use href="#cv-waypoint" x="420" y="280" width="18" height="18"/>
+    <use href="#cv-waypoint" x="700" y="200" width="12" height="12"/>
+    <use href="#cv-waypoint" x="950" y="380" width="16" height="16"/>
+    <use href="#cv-waypoint" x="1280" y="180" width="14" height="14"/>
+    <use href="#cv-waypoint" x="1520" y="320" width="20" height="20"/>
+    <use href="#cv-waypoint" x="1700" y="540" width="14" height="14"/>
+    <use href="#cv-waypoint" x="260" y="780" width="12" height="12"/>
+    <use href="#cv-waypoint" x="560" y="900" width="16" height="16"/>
+    <use href="#cv-waypoint" x="880" y="1020" width="14" height="14"/>
+    <use href="#cv-waypoint" x="1180" y="860" width="18" height="18"/>
+    <use href="#cv-waypoint" x="1480" y="980" width="14" height="14"/>
+  </g>
+
+  <!-- Layer 3: faint great-circle bearing line at 028° (Caravela's signature heading) -->
+  <g opacity="0.14" stroke="#0A2540" stroke-width="1.5" stroke-dasharray="4 10" fill="none">
+    <line x1="100" y1="1100" x2="1820" y2="200"/>
+  </g>
+</svg>

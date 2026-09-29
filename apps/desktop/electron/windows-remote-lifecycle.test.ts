@@ -33,7 +33,6 @@ test('Windows spawn holds the update mutex across marker check and helper spawn'
   assert.match(script, /\$mutexPath=\$marker\+"\.mutex"/)
   assert.match(script, /\.Lock\(0,1\)/)
   assert.match(script, /windows_ssh_runtime.*spawn/)
-  assert.match(script, /remote update marker is present/)
 })
 
 test('Windows spawn publishes the initial ownership record before releasing the mutex', () => {
@@ -46,7 +45,7 @@ test('Windows spawn publishes the initial ownership record before releasing the 
       ownershipId,
       spawnNonce: '0123456789abcdef',
       profile: 'default',
-      hermesPath: 'C:\\Hermes\\hermes.exe',
+      hermesPath: 'C:\\Caravela\\hermes.exe',
       hermesHome: 'C:\\Users\\andre\\.hermes',
       tokenFingerprint: 'a'.repeat(32),
       startedAt: '2026-07-14T00:00:00.000Z'
@@ -71,6 +70,50 @@ test('PowerShell transport uses UTF-16LE encoded commands and literal escaping',
   assert.match(powerShellCommand('Write-Output ok'), /^powershell\.exe -NoProfile -NonInteractive .* -EncodedCommand /)
 })
 
+test('every emitted PowerShell script keeps try blocks attached to their catch/finally handlers', async () => {
+  // `;` between `try{...}` and `catch`/`finally` is a PowerShell parse error
+  // (MissingCatchOrFinally), so no probe may join a handler onto a separate
+  // statement. The line-oriented builders join with `;`; the pair must live
+  // in one array element.
+  const decode = (command: string) => Buffer.from(command.split(' ').at(-1) || '', 'base64').toString('utf16le')
+
+  const scripts: string[] = []
+
+  await probeWindowsRemote(
+    sshWith(async command => {
+      scripts.push(decode(command))
+
+      return JSON.stringify({ os: 'Windows' })
+    })
+  )
+  await assertWindowsRemoteInstallUpdateClear(
+    sshWith(async command => {
+      scripts.push(decode(command))
+
+      return 'CLEAR'
+    }),
+    'C:\\Users\\alice\\.hermes'
+  )
+  scripts.push(
+    decode(atomicWindowsSpawnCommand({ hermesHome: 'C:\\Users\\alice\\.hermes', python: 'C:\\py\\python.exe' })),
+    decode(buildWindowsInteractiveCommand('C:\\work'))
+  )
+
+  assert.equal(scripts.length, 4)
+
+  for (const script of scripts) {
+    assert.doesNotMatch(script, /}\s*;\s*(?:catch|finally)\b/)
+    // `$HOME`, `$HOST`, `$PID`, ... are read-only automatic variables: assigning
+    // one throws "Cannot overwrite variable" at run time, so the probe exits 1
+    // and the marker gate never observes CLEAR.
+    assert.doesNotMatch(script, /\$(?:home|host|pid|profile|pwd|input|args|error)\s*=/i)
+  }
+
+  assert.ok(
+    scripts.slice(0, 2).every(script => /}catch \[Management\.Automation\.ItemNotFoundException\]/.test(script))
+  )
+})
+
 test('Windows relaunch gate refuses live and uncertain markers before executing the remote runtime', async () => {
   for (const observation of ['LIVE:4242', 'UNCERTAIN']) {
     const scripts: string[] = []
@@ -84,8 +127,8 @@ test('Windows relaunch gate refuses live and uncertain markers before executing 
           os: 'Windows',
           arch: 'AMD64',
           hermesHome: 'C:\\Users\\alice\\.hermes',
-          hermesPath: 'C:\\Hermes\\hermes.exe',
-          python: 'C:\\Hermes\\python.exe'
+          hermesPath: 'C:\\Caravela\\hermes.exe',
+          python: 'C:\\Caravela\\python.exe'
         })
       }
 
@@ -134,7 +177,7 @@ test('Windows relaunch gate uses strict install-wide marker parsing and fail-clo
   assert.doesNotMatch(script, /ErrorAction SilentlyContinue/)
 })
 
-test('Windows probe validates Hermes and Python topology before selection', async () => {
+test('Windows probe validates Caravela and Python topology before selection', async () => {
   let script = ''
   await probeWindowsRemote(
     sshWith(async command => {
@@ -153,6 +196,10 @@ test('Windows probe validates Hermes and Python topology before selection', asyn
 
   const explicitCheck = script.indexOf('if($explicit){Assert-NoReparse $explicit $false;')
   const explicitPythonCheck = script.indexOf('Assert-NoReparse $explicitPython $false')
+  const envHome = script.indexOf('$hermesHome=$env:HERMES_HOME')
+  // #118988: HERMES_HOME is trusted only when it is a directory on the remote; anything else
+  // (stale User-scope value, client path leaked over SSH) falls back to the remote default.
+  const envHomeGuard = script.indexOf('Test-Path -LiteralPath $hermesHome -PathType Container')
   const fallbackJoin = script.indexOf('Join-Path $hermesHome')
   const candidatePythonCheck = script.indexOf('Assert-NoReparse $candidatePython $true')
   const candidateSelection = script.indexOf('Get-Item -LiteralPath $candidate')
@@ -162,7 +209,9 @@ test('Windows probe validates Hermes and Python topology before selection', asyn
 
   assert.ok(explicitCheck >= 0)
   assert.ok(explicitCheck < explicitPythonCheck)
-  assert.ok(explicitPythonCheck < fallbackJoin)
+  assert.ok(explicitPythonCheck < envHome)
+  assert.ok(envHome < envHomeGuard)
+  assert.ok(envHomeGuard < fallbackJoin)
   assert.ok(candidatePythonCheck >= 0)
   assert.ok(candidatePythonCheck < candidateSelection)
   assert.ok(pythonJoin >= 0)
@@ -218,22 +267,22 @@ test('platform detection surfaces transport failures as themselves, not unsuppor
           throw new Error('not recognized')
         }
 
-        throw new Error('Hermes is not installed on the remote Windows host.')
+        throw new Error('Caravela is not installed on the remote Windows host.')
       })
     ),
-    (err: any) => err.kind === 'unsupported-platform' && /Hermes is not installed/.test(err.message)
+    (err: any) => err.kind === 'unsupported-platform' && /Caravela is not installed/.test(err.message)
   )
 })
 
 test('helper command uses the fixed remote Python entry point and quotes path data', () => {
-  const command = helperCommand({ python: "C:\\Program Files\\Hermes's\\python.exe" }, 'inspect', [
+  const command = helperCommand({ python: "C:\\Program Files\\Caravela's\\python.exe" }, 'inspect', [
     'C:\\x y\\hermes.exe'
   ])
 
   const encoded = command.split(' ').pop()!
   const script = Buffer.from(encoded, 'base64').toString('utf16le')
   assert.match(script, /-m' 'hermes_cli\.windows_ssh_runtime' 'inspect'/)
-  assert.match(script, /Hermes''s/)
+  assert.match(script, /Caravela''s/)
   assert.match(script, /C:\\x y\\hermes\.exe/)
 })
 

@@ -7,7 +7,7 @@
  * connection → backend targetProfile "default") lost its name the moment the
  * hosted session activated, because the row that came back was keyed
  * (cloud-abc, default) — a different identity than the alias meta. It read as
- * the raw Cloud hostname, or as generic "Hermes" when Cloud was the only
+ * the raw Cloud hostname, or as generic "Caravela" when Cloud was the only
  * source.
  *
  * Drives the real `routing` + `labels` modules; only the SDK `host` is mocked.
@@ -21,6 +21,7 @@ import {
   beginAliasRouteIndex,
   botConnectionRoute,
   botRosterMeta,
+  groupTranscriptSpeakerMeta,
   indexAliasRoutes,
   requestForBot,
   resolveBotConnectionRoute
@@ -85,7 +86,7 @@ describe('alias identity survives the hosted handoff (#89131)', () => {
     expect(displayName(hostedRow, botRosterMeta(hostedRow, metaV1))).toBe('Moxie ✨')
   })
 
-  it('renders the sole Cloud-only default as the alias, not "Hermes"', () => {
+  it('renders the sole Cloud-only default as the alias, not "Caravela"', () => {
     // Global route is Cloud: the active gateway IS the Cloud connection and
     // profiles.list returns one unannotated rich `default` row.
     hostMock.state.connectionId.get.mockReturnValue('cloud-abc')
@@ -108,8 +109,8 @@ describe('alias identity survives the hosted handoff (#89131)', () => {
 
     expect(aliasIdentityFor(otherDefault)).toBeNull()
     expect(displayName(otherDefault, null)).toBe('Personal')
-    // Local default while the ACTIVE gateway is local: untouched "Hermes".
-    expect(displayName({ name: 'default' }, null)).toBe('Hermes')
+    // Local default while the ACTIVE gateway is local: untouched "Caravela".
+    expect(displayName({ name: 'default' }, null)).toBe('Caravela')
   })
 
   it('fails closed when two aliases claim one backend row', () => {
@@ -255,10 +256,13 @@ describe('requestForBot rides the bot’s own source', () => {
       soul: '# hi'
     })
 
-    expect(hostMock.requestProfile).toHaveBeenCalledWith(MOXIE_ROUTE, 'profiles.configure', {
-      name: 'default',
-      soul: '# hi'
-    })
+    expect(hostMock.requestProfile).toHaveBeenCalledWith(
+      MOXIE_ROUTE,
+      'profiles.configure',
+      { name: 'default', soul: '# hi' },
+      undefined,
+      { spawnPriority: 'foreground' }
+    )
   })
 
   it('fails closed rather than falling back to the ambient request', async () => {
@@ -284,5 +288,49 @@ describe('requestForBot rides the bot’s own source', () => {
     expect(error).toBeInstanceOf(Error)
     expect(typeof (error as Error).name).toBe('string')
     expect((error as Error).message).toBe('profile busy')
+  })
+})
+
+describe('group transcript speaker meta (#96432)', () => {
+  const localDefault = { name: 'default' } as RosterRow
+
+  const remoteDefault = {
+    name: 'default',
+    connectionId: 'spark',
+    connectionLabel: 'spark',
+    remoteSource: true,
+    sourceScoped: true
+  } as RosterRow
+
+  const allMeta = {
+    default: { title: 'Local Default', image: 'local.png' },
+    'spark::default': { title: 'Remote Default', image: 'remote.png' }
+  }
+
+  it('gives user lines no bot meta', () => {
+    expect(
+      groupTranscriptSpeakerMeta({ from: { kind: 'user', name: 'You' } }, [localDefault, remoteDefault], allMeta)
+    ).toBeNull()
+  })
+
+  it('keeps local meta for a local same-name speaker', () => {
+    const meta = groupTranscriptSpeakerMeta(
+      { from: { kind: 'member', name: 'default' } },
+      [localDefault, remoteDefault],
+      allMeta
+    )
+
+    expect(meta?.image).toBe('local.png')
+  })
+
+  it('keeps owner meta for a remote same-name speaker instead of null or the local twin', () => {
+    const meta = groupTranscriptSpeakerMeta(
+      { from: { kind: 'member', name: 'default', source: 'spark' } },
+      [localDefault, remoteDefault],
+      allMeta
+    )
+
+    expect(meta?.image).toBe('remote.png')
+    expect(meta?.title).toBe('Remote Default')
   })
 })

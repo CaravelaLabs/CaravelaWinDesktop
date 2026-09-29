@@ -85,6 +85,17 @@ export interface DesktopTerminalPalette {
   brightWhite?: string
 }
 
+
+/** Window title, sidebar mark, backdrop, wordmark. Other themes omit this. */
+export interface DesktopBranding {
+  productName?: string
+  brandMarkUrl?: string
+  backdropUrl?: string
+  wordmarkUrl?: string
+  /** 'motif' renders the asset full-cover with no photo invert/blend. */
+  backdropMode?: 'photo' | 'motif'
+}
+
 export interface DesktopTheme {
   name: string
   label: string
@@ -98,28 +109,31 @@ export interface DesktopTheme {
   terminal?: DesktopTerminalPalette
   /** Dark-variant terminal ANSI palette. Falls back to `terminal`. */
   darkTerminal?: DesktopTerminalPalette
-  /** Optional brand overrides — window title, sidebar mark, backdrop motif. */
+  /** Raw CSS injected as a scoped <style> tag on theme apply.
+   *  Persists across updates because it lives in ~/.hermes/skins/,
+   *  not inside app.asar. */
+  customCSS?: string
   branding?: DesktopBranding
 }
 
-/**
- * Brand override slot — lets a theme replace the in-app identity assets
- * (window title, sidebar mark, atmospheric backdrop, wordmark) without
- * forking the chrome components. All fields are optional; renderer
- * components fall back to the default Hermes assets when omitted.
- *
- *   productName  — window title and any productName surface
- *   brandMarkUrl — sidebar/badge mark (square, fills its tile)
- *   backdropUrl  — atmospheric background image
- *   wordmarkUrl  — full wordmark (used in onboarding / about)
- *   backdropMode — 'photo' (default) applies invert/saturate filter math
- *                  tuned for the Nous statue photo; 'motif' renders the
- *                  asset as-is (right for SVG illustrations / brand motifs)
- */
-export interface DesktopBranding {
-  productName?: string
-  brandMarkUrl?: string
-  backdropUrl?: string
-  wordmarkUrl?: string
-  backdropMode?: 'photo' | 'motif'
+// The minimal set of color keys a stored theme must carry to be usable. We keep
+// this loose — `applyTheme` tolerates missing optionals via fallbacks — but a
+// theme with no background/foreground/primary is junk and gets dropped.
+const REQUIRED_COLOR_KEYS: ReadonlyArray<keyof DesktopThemeColors> = ['background', 'foreground', 'primary']
+
+/** Shape check for a theme read back from storage or a contribution. */
+export function isValidTheme(value: unknown): value is DesktopTheme {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const theme = value as Partial<DesktopTheme>
+
+  if (typeof theme.name !== 'string' || typeof theme.label !== 'string' || !theme.colors) {
+    return false
+  }
+
+  const colors = theme.colors as unknown as Record<string, unknown>
+
+  return REQUIRED_COLOR_KEYS.every(key => typeof colors[key] === 'string')
 }

@@ -1,12 +1,19 @@
 import { atom } from 'nanostores'
 
 import { persistBoolean, storedBoolean } from '@/lib/storage'
+import { modeBound } from '@/store/interface-mode'
 
 const TAKEOVER_KEY = 'hermes.desktop.terminalTakeover'
 
-export const $terminalTakeover = atom(storedBoolean(TAKEOVER_KEY, false))
+// Simple mode rests the terminal closed without touching this preference; ⌃`
+// still brings it up for the session.
+const $terminalTakeoverPref = atom(storedBoolean(TAKEOVER_KEY, false))
 
-$terminalTakeover.subscribe(active => persistBoolean(TAKEOVER_KEY, active))
+$terminalTakeoverPref.subscribe(active => persistBoolean(TAKEOVER_KEY, active))
+
+export const $terminalTakeover = modeBound('terminalOpen', $terminalTakeoverPref, active =>
+  $terminalTakeoverPref.set(active)
+)
 
 export const setTerminalTakeover = (active: boolean) => $terminalTakeover.set(active)
 
@@ -16,8 +23,8 @@ export const setTerminalTakeover = (active: boolean) => $terminalTakeover.set(ac
 export const $terminalInjection = atom<null | string>(null)
 
 /** Open the terminal pane and run a command in it. Used to disconnect external
- *  (CLI-managed) providers, which Hermes can't clear via the API — the user
- *  sees exactly what runs instead of Hermes silently deleting their creds. */
+ *  (CLI-managed) providers, which Caravela can't clear via the API — the user
+ *  sees exactly what runs instead of Caravela silently deleting their creds. */
 export const runInTerminal = (command: string) => {
   const trimmed = command.trim()
 

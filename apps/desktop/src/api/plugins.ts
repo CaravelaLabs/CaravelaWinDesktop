@@ -1,5 +1,6 @@
+import { reconnectBackoffDelayMs } from '@hermes/shared'
+
 import type { HermesConnection } from '@/global'
-import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 
 import { getApiRequestConnection, getApiRequestProfile, hermesApi, profileScoped } from './client'
@@ -70,7 +71,7 @@ function pluginPathSuffix(caller: string, path: string): string {
  *  declared-capability seam; today the namespace IS the boundary. */
 export async function pluginRest<T>(pluginId: string, path: string, opts: PluginRestOptions = {}): Promise<T> {
   if (!window.hermesDesktop?.api) {
-    throw new Error('Hermes desktop bridge unavailable')
+    throw new Error('Caravela desktop bridge unavailable')
   }
 
   const suffix = pluginPathSuffix('pluginRest', path)

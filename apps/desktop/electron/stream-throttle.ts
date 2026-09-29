@@ -5,7 +5,7 @@
 // costs far more than that feature needs: it pins the renderer's
 // `document.visibilityState` to 'visible' for the life of the window, which
 // turns every visibility-gated poll and clock tick in the renderer into an
-// always-on timer. An idle, hidden Hermes burned ~20% CPU forever.
+// always-on timer. An idle, hidden Caravela burned ~20% CPU forever.
 //
 // So throttling is a runtime dial instead: the renderers already report
 // "which chats are mid-turn" for the quit guard (`hermes:active-work`), and

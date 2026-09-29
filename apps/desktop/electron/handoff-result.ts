@@ -13,7 +13,7 @@
  * manual:true results are exempt from the freshness window. They are the
  * durable action-required channel — on a browserless Linux box with no
  * working notifier, the boot dialog is the FIRST and ONLY place the message
- * ever surfaces, and the user may not reopen Hermes within 30 minutes.
+ * ever surfaces, and the user may not reopen Caravela within 30 minutes.
  * Dropping it as stale strands exactly the machine it exists to serve. It is
  * still consumed once (the file is unlinked before any age check), so it
  * cannot resurface on a later boot.

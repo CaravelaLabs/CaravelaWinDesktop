@@ -96,8 +96,30 @@ def patch_product_identity(desktop: Path) -> None:
             "'Native desktop shell for Hermes Agent.'",
             "'Caravela — chart the course.'",
         )
+        # Local packs must not talk to GitHub. electron-builder 27 still
+        # constructs the github publisher from this block after the AppImage
+        # exists, and dies if GH_TOKEN is unset. The release upload is `gh`,
+        # not electron-builder. A leaked token is worse: it auto-publishes.
+        old_publish = """  publish: channelRequest ? null : !channel
+    ? null
+    : [
+        publicUrl
+          ? { provider: 'generic', url: publicUrl, channel }
+          : { provider: 'github', owner, repo, channel }
+      ],"""
+        if old_publish not in text:
+            raise SystemExit(
+                "electron-builder.config.cjs publish block moved — "
+                "update rebrand.py before packaging, or the build will "
+                "die on a missing GH_TOKEN after the AppImage is written."
+            )
+        text = text.replace(
+            old_publish,
+            "  publish: null,\n  nativeModules: { npmRebuild: false },",
+            1,
+        )
         cfg.write_text(text)
-        print(f"[ok] rebranded {cfg}")
+        print(f"[ok] rebranded {cfg} (publish disabled)")
 
 
 def patch_package_json(pkg_path: Path) -> None:

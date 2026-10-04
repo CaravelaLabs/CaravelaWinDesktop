@@ -60,66 +60,6 @@ export const ru = defineLocale({
     stripChoices: { share: 'Отправлять в Nous', local: 'Только локально', off: 'Нет, спасибо' },
     stripDetails: 'Подробнее'
   },
-  catalog: {
-    add: 'Добавить',
-    added: 'Добавлено',
-    discover: 'Открывайте новое',
-    featured: 'Рекомендуемые',
-    explorePlugins: 'Обзор плагинов',
-    exploreSkills: 'Обзор навыков',
-    mostStarred: 'Больше всего звёзд',
-    newest: 'Новинки',
-    recentlyUpdated: 'Недавно обновлённые',
-    alphabetical: 'Название',
-    sortBy: 'Сортировать по',
-    seeAll: 'Показать все',
-    related: 'Похожие',
-    tags: 'Теги',
-    screenshots: 'Снимки экрана',
-    listView: 'Список',
-    cardView: 'Карточки',
-    installTitle: (name: string) => `Установить «${name}»?`,
-    installDescription: 'Навык будет доступен в новых сессиях. Устанавливайте только из источников, которым доверяете.',
-    installTo: 'Установить в',
-    thisComputer: 'Этот компьютер',
-    installing: 'Установка…',
-    installComplete: (name: string) => `«${name}» установлен`,
-    destinationChanged: 'Место установки изменилось. Закройте диалог и снова откройте ссылку установки.',
-    installed: 'Установленные',
-    searchSkills: 'Поиск навыков',
-    searchPlugins: 'Поиск плагинов',
-    allSources: 'Все источники',
-    allCategories: 'Все категории',
-    about: 'Описание',
-    author: 'Автор',
-    source: 'Источник',
-    category: 'Категория',
-    version: 'Версия',
-    platforms: 'Платформы',
-    requires: 'Требования',
-    tools: 'Инструменты',
-    hooks: 'Хуки',
-    middleware: 'Промежуточное ПО',
-    commands: 'Команды',
-    license: 'Лицензия',
-    addedDate: 'Добавлено',
-    updatedDate: 'Обновлено',
-    repository: 'Репозиторий',
-    documentation: 'Документация',
-    noResults: 'Совпадений нет',
-    tryAnother: 'Попробуйте другой запрос или сбросьте фильтры.',
-    clearFilters: 'Сбросить фильтры',
-    filters: 'Фильтры',
-    loadFailed: 'Не удалось загрузить каталог',
-    retry: 'Попробовать снова',
-    more: 'Показать ещё',
-    pinned: 'Проверенный коммит',
-    snapshotHint: 'Из каталога Caravela. При просмотре нет обращений к исходным репозиториям.',
-    installHint: 'Проверьте исходный код перед установкой. Изменения применяются к новым сессиям.',
-    results: (count: number) =>
-      `${count.toLocaleString('ru')} ${RU_PLURAL(count, 'результат', 'результата', 'результатов')}`,
-    back: 'Назад к результатам'
-  },
   sessionImport: {
     title: 'Продолжить из другого приложения',
     subtitle: 'Перенесите разговор в Caravela и продолжите с того места, где остановились.',
@@ -720,6 +660,9 @@ export const ru = defineLocale({
       system: { label: 'Системная', description: 'Следовать настройкам ОС' }
     },
     appearance: {
+      chatTextScaleTitle: 'Размер текста чата',
+      chatTextScaleDesc:
+        'Масштабирует текст беседы и поле ввода относительно масштаба интерфейса. Размер боковых панелей и элементов управления не меняется.',
       title: 'Внешний вид',
       intro: 'Только для приложения. Режим — это яркость, тема — палитра и оформление чата.',
       colorMode: 'Цветовой режим',
@@ -1163,7 +1106,10 @@ export const ru = defineLocale({
         'Удалить все включённые наборы инструментов? Это отключит память, терминал, веб-поиск, делегирование и большинство других инструментов, пока вы не включите их снова.',
       keepAwakeTitle: 'Не давать компьютеру засыпать',
       keepAwakeDesc:
-        'Не даёт этой машине засыпать, чтобы долгие или ночные прогоны продолжались. Экран при этом может гаснуть.',
+        'Не давать этому компьютеру засыпать. «Во время работы» держит его только пока выполняется ход — ночные запуски переживут сон, а ноутбук не останется включённым всю неделю. Экран по‑прежнему может гаснуть.',
+      keepAwakeOff: 'Выкл',
+      keepAwakeWhileWorking: 'Во время работы',
+      keepAwakeAlways: 'Всегда',
       disableF12Title: 'Отключить F12 DevTools',
       disableF12Desc:
         'Блокирует открытие Developer Tools по F12. Ctrl+Shift+I (на Mac — Cmd+Opt+I) продолжает работать.',
@@ -1722,6 +1668,17 @@ export const ru = defineLocale({
         needsSetupConfirmAction: 'Выбрать всё равно'
       }
     }
+  },
+  skillDeepLink: {
+    installTitle: (name: string) => `Установить «${name}»?`,
+    installDescription: 'Навык будет доступен в новых сессиях. Устанавливайте только из источников, которым доверяете.',
+    installTo: 'Установить в',
+    thisComputer: 'Этот компьютер',
+    installing: 'Установка…',
+    installComplete: (name: string) => `«${name}» установлен`,
+    destinationChanged: 'Место установки изменилось. Закройте диалог и снова откройте ссылку установки.',
+    installed: 'Установленные',
+    source: 'Источник'
   },
   skills: {
     plugins: {
@@ -2778,6 +2735,8 @@ export const ru = defineLocale({
       reveal: 'Показать в папке',
       copyPath: 'Копировать путь',
       removeFromSidebar: 'Скрыть из боковой панели',
+      createdInPreviousContext:
+        'Проект создан в прежнем подключении или профиле. Вернитесь к нему; файл IDEA.md не был записан.',
       createFailed: 'Не удалось создать проект',
       staleBackend:
         'Обновите бэкенд Caravela, чтобы создавать проекты — ваш бэкенд старше этого desktop-приложения (Настройки → Обновления → Бэкенд).',
@@ -3005,7 +2964,7 @@ export const ru = defineLocale({
       '/init': 'Просканировать репозиторий и создать или обновить инструкции AGENTS.md',
       '/suggestions': 'Просмотреть, принять или отклонить предложенные автоматизации',
       '/blueprint': 'Настроить автоматизацию по шаблону',
-      '/browser': 'Управлять CDP-подключением браузера [connect|disconnect|status] (только локальный шлюз)',
+      '/browser': 'Управлять браузером агента [connect|disconnect|status|use]',
       '/palette': 'Открыть палитру команд',
       '/usage': 'Показать расход токенов и лимиты; reset использует накопленный сброс лимита Codex',
       '/subscription': 'Показать план Nous и изменить его в браузере',
@@ -3613,6 +3572,10 @@ export const ru = defineLocale({
       editModels: 'Изменить модели…',
       followDefault: 'Использовать модель по умолчанию из настроек',
       refreshModels: 'Обновить модели',
+      favorites: 'Избранное',
+      addFavorite: 'Добавить в избранное',
+      removeFavorite: 'Убрать из избранного',
+      favoriteShortcut: '⇧ Клик',
       fast: 'Быстрая',
       free: 'бесплатно',
       cacheRead: 'чтение из кэша',
@@ -3754,6 +3717,10 @@ export const ru = defineLocale({
     }
   },
   rightSidebar: {
+    terminalReadOnly: 'Вывод только для чтения',
+    terminalReadOnlyHelp:
+      'Чтобы ответить на запрос, остановите фоновую команду и запустите её в новом терминале. Он откроет отдельную оболочку и не подключится к этому процессу.',
+    terminalOpenInteractive: 'Открыть новый терминал',
     aria: 'Правая боковая панель',
     panelsAria: 'Панели правой боковой панели',
     files: 'Файловая система',
@@ -3798,6 +3765,8 @@ export const ru = defineLocale({
   },
   preview: {
     tab: 'Предпросмотр',
+    pin: 'Закрепить в рабочем пространстве',
+    unpin: 'Открепить от рабочего пространства',
     closePane: 'Закрыть панель предпросмотра',
     loading: 'Загрузка предпросмотра',
     unavailable: 'Предпросмотр недоступен',
@@ -3823,6 +3792,7 @@ export const ru = defineLocale({
     editing: 'Изменение',
     unsavedChanges: 'Несохранённые изменения',
     saveFailed: message => `Не удалось сохранить: ${message}`,
+    saveScopeChanged: 'Чтобы сохранить этот черновик, вернитесь к исходному подключению и профилю.',
     diskChangedTitle: 'Файл изменился на диске',
     diskChangedBody:
       'Этот файл изменился с момента открытия. Перезаписать его вашей версией или сбросить правки и перезагрузить?',
@@ -4053,6 +4023,8 @@ export const ru = defineLocale({
       skipped: 'Пропущено',
       noAnswer: 'Нет ответа',
       confirmAndContinueLabel: 'Подтвердить и продолжить',
+      singleSelectHint: 'Выберите один',
+      multiSelectHint: 'Выберите все подходящие',
       questionProgress: (answered, total) => `Ответ дан на ${answered} из ${total}`,
       notDelivered:
         'Этот вопрос не дошёл до приложения, поэтому ответить здесь нельзя. Нажмите «Стоп», чтобы завершить ход, и ответьте в чате.'

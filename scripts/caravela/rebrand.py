@@ -523,18 +523,53 @@ def patch_install_ps1_desktop_exe(root: Path) -> None:
         "$desktopDir\\release\\win-unpacked\\Hermes.exe",
         "$desktopDir\\release\\win-arm64-unpacked\\Hermes.exe"
     )'''
-    if "win-unpacked\\Caravela.exe" in src:
+    if "win-unpacked\\\\Caravela.exe" in src:
         print(f"[ok] install.ps1 already accepts Caravela.exe in {path}")
-    elif old_cands not in src:
-        print(f"[warn] install.ps1 exe candidate block not found in {path}")
     else:
-        src = src.replace(old_cands, new_cands, 1)
-        src = src.replace(
-            "throw \"Desktop build completed but no Hermes.exe was found under $desktopDir\\release\\*-unpacked\\\"",
-            "throw \"Desktop build completed but no Caravela.exe/Hermes.exe was found under $desktopDir\\release\\*-unpacked\\\"",
-            1,
-        )
-        print(f"[ok] install.ps1 accepts Caravela.exe in {path}")
+        old_confirm = '''        $candidates = @(
+            (Join-Path $desktopDir "release\\win-unpacked\\Hermes.exe"),
+            (Join-Path $desktopDir "release\\win-ia32-unpacked\\Hermes.exe"),
+            (Join-Path $desktopDir "release\\win-arm64-unpacked\\Hermes.exe")
+        )'''
+        new_confirm = '''        $candidates = @(
+            (Join-Path $desktopDir "release\\win-unpacked\\Caravela.exe"),
+            (Join-Path $desktopDir "release\\win-ia32-unpacked\\Caravela.exe"),
+            (Join-Path $desktopDir "release\\win-arm64-unpacked\\Caravela.exe"),
+            (Join-Path $desktopDir "release\\win-unpacked\\Hermes.exe"),
+            (Join-Path $desktopDir "release\\win-ia32-unpacked\\Hermes.exe"),
+            (Join-Path $desktopDir "release\\win-arm64-unpacked\\Hermes.exe")
+        )'''
+        if old_confirm in src:
+            src = src.replace(old_confirm, new_confirm, 1)
+            src = src.replace(
+                'Fail "desktop build produced no Hermes.exe under $desktopDir\\release\\*-unpacked"',
+                'Fail "desktop build produced no Caravela.exe or Hermes.exe under $desktopDir\\release\\*-unpacked"',
+                1,
+            )
+            print(f"[ok] install.ps1 Confirm-DesktopArtifact accepts Caravela.exe in {path}")
+        elif old_cands in src:
+            src = src.replace(old_cands, new_cands, 1)
+            src = src.replace(
+                "throw \\\"Desktop build completed but no Hermes.exe was found under $desktopDir\\\\release\\\\*-unpacked\\\\\\\"",
+                "throw \\\"Desktop build completed but no Caravela.exe/Hermes.exe was found under $desktopDir\\\\release\\\\*-unpacked\\\\\\\"",
+                1,
+            )
+            print(f"[ok] install.ps1 accepts Caravela.exe in {path}")
+        else:
+            print(f"[warn] install.ps1 exe candidate block not found in {path}")
+    old_stage = "    $desktop = [bool]$IncludeDesktop -or [bool](Test-DesktopProductPresent)\n"
+    new_stage = (
+        "    # Caravela installs always compile the desktop. -IncludeDesktop was\n"
+        "    # opt-in, so a fresh install stopped before the pack.\n"
+        "    $desktop = $true\n"
+    )
+    if "$desktop = $true" in src and "Caravela installs always compile" in src:
+        print(f"[ok] install.ps1 always compiles the desktop in {path}")
+    elif old_stage in src:
+        src = src.replace(old_stage, new_stage, 1)
+        print(f"[ok] install.ps1 always compiles the desktop in {path}")
+    else:
+        print(f"[warn] install.ps1 Stage-Products desktop gate not found in {path}")
     old_lnk = '''            (Join-Path ([Environment]::GetFolderPath('Programs')) 'Hermes.lnk'),
             (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Hermes.lnk')'''
     new_lnk = '''            (Join-Path ([Environment]::GetFolderPath('Programs')) 'Caravela.lnk'),

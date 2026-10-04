@@ -292,7 +292,7 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
             if db is None:
                 return
             _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
-                            source=source, cwd=record["cwd"],
+                            source=source, cwd=None if _is_remote_launch_cwd(record) else record["cwd"],
                             profile_name=profile_name_for_home(profile_home) or _current_profile_name(),
                             model=_session_default_model(record), compensate=True, title_source="derived", user_id=_session_auth_user_id(record))
             record["pending_title"] = None
@@ -328,24 +328,6 @@ def _seed_row(record: dict) -> None:
                     record["pending_title"] = None
     except Exception:
         logger.debug("seeded-session title write failed for %s; pending_title stays queued", key, exc_info=True)
-
-
-def _create_overrides(params: dict) -> tuple:
-    """PER-SESSION (model, reasoning, service_tier) overrides from the composer — never a global config
-    write. ``fast`` presence is the contract: omitted inherits, true pins priority, false pins normal ("")."""
-    create_model = _str_param(params, "model")
-    model_override = None
-    if create_model:
-        model_override = {"model": create_model, "provider": _str_param(params, "provider") or None}
-    reasoning_override = None
-    if effort := _str_param(params, "reasoning_effort"):
-        with contextlib.suppress(Exception):
-            from hermes_constants import parse_reasoning_effort
-            reasoning_override = parse_reasoning_effort(effort)
-    service_tier_override = None
-    if "fast" in params:
-        service_tier_override = "priority" if is_truthy_value(params.get("fast")) else ""
-    return model_override, reasoning_override, service_tier_override
 
 
 def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> dict:
@@ -425,7 +407,11 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
     with contextlib.suppress(Exception):
         explicit_cwd = bool(raw_cwd) and (remote_cwd or os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd))))
     _enable_gateway_prompts()
-    session_model_override, create_reasoning_override, create_service_tier_override = _create_overrides(params)
+    from .methods_session_model_guard import create_overrides
+    try:
+        session_model_override, create_reasoning_override, create_service_tier_override = create_overrides(params)
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
     composer_override_profile = None
     if session_model_override and _flag(params, "follow_profile_config"):
         # Same provenance a mid-chat switch records (_apply_model_switch): without the OWNING profile's
@@ -1062,7 +1048,8 @@ def _(rid, params: dict) -> dict:
         _resume_follow_tip(ctx)
         if (resp := _resume_guard(ctx)) is not None:
             return resp
-        ctx.profile_resume_cwd = _str_param(ctx.found, "cwd") or _profile_workspace_cwd(ctx.profile_home)
+        ctx.profile_resume_cwd = (_resumable_stored_cwd(_str_param(ctx.found, "cwd"), ctx.profile_home)
+                                  or _profile_workspace_cwd(ctx.profile_home))
         # Fast path: reuse a session live IN THIS PROFILE (never another profile's runtime).
         with _session_resume_lock:
             live = _find_live_session_by_key(ctx.target, ctx.profile_home)
@@ -2296,7 +2283,8 @@ def _branch_live(rid, params: dict, session: dict, *, omit_messages: bool = Fals
         try:
             title = params.get("name", "") or _branch_title(db, old_key)
             home = session.get("profile_home")
-            _persist_branch(db, new_key, old_key, title, history, source=source, cwd=_session_cwd(session),
+            _persist_branch(db, new_key, old_key, title, history, source=source,
+                            cwd=None if _is_remote_launch_cwd(session) else _session_cwd(session),
                             profile_name=profile_name_for_home(home) or _current_profile_name(),
                             model=_session_default_model(session), copy_fields=_BRANCH_COPY_FIELDS,
                             title_source="user" if params.get("name") else "derived",

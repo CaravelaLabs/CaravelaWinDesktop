@@ -1031,7 +1031,9 @@ function Test-DesktopProductPresent {
 }
 
 function Stage-Products {
-    $desktop = [bool]$IncludeDesktop -or [bool](Test-DesktopProductPresent)
+    # Caravela installs always compile the desktop. -IncludeDesktop was
+    # opt-in, so a fresh install stopped before the pack.
+    $desktop = $true
     Invoke-SourceCompletion $desktop
     Publish-UserCommand
     if ($desktop) { Confirm-DesktopArtifact }
@@ -1122,6 +1124,9 @@ function Confirm-DesktopArtifact {
     try {
         $desktopDir = Join-Path $InstallDir "apps\desktop"
         $candidates = @(
+            (Join-Path $desktopDir "release\win-unpacked\Caravela.exe"),
+            (Join-Path $desktopDir "release\win-ia32-unpacked\Caravela.exe"),
+            (Join-Path $desktopDir "release\win-arm64-unpacked\Caravela.exe"),
             (Join-Path $desktopDir "release\win-unpacked\Hermes.exe"),
             (Join-Path $desktopDir "release\win-ia32-unpacked\Hermes.exe"),
             (Join-Path $desktopDir "release\win-arm64-unpacked\Hermes.exe")
@@ -1131,7 +1136,7 @@ function Confirm-DesktopArtifact {
             if (Test-Path $cand) { $desktopExe = $cand; break }
         }
         if (-not $desktopExe) {
-            Fail "desktop build produced no Hermes.exe under $desktopDir\release\*-unpacked"
+            Fail "desktop build produced no Caravela.exe or Hermes.exe under $desktopDir\release\*-unpacked"
         }
         Write-Ok "Desktop ready: $desktopExe"
 

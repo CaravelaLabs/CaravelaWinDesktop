@@ -329,8 +329,8 @@
             "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11146/llama-b11146-bin-ubuntu-arm64.tar.gz"
           },
           {
-            "sha256": "3f777eac64c87e2db843675b229efd16efe2ac1ae977318d687b39b812747863",
-            "url": "https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-14/libgomp1_14-20240412-0ubuntu1_arm64.deb"
+            "sha256": "c1719335234ccdef7558e97b37b1f6baf069911ce2f26d2789336051a7c929cd",
+            "url": "https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libgomp1_12-20220319-1ubuntu1_arm64.deb"
           }
         ],
         "linux-x64": [
@@ -339,8 +339,8 @@
             "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11146/llama-b11146-bin-ubuntu-x64.tar.gz"
           },
           {
-            "sha256": "cc2ca1193d2c11d7383bdb03dd333cc621d128237b82dafeb8d7f2bd8302f3dd",
-            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-14/libgomp1_14-20240412-0ubuntu1_amd64.deb"
+            "sha256": "8627999dd5f3d38473774ce7924a62af9a2840b2238bc52611e38257bc140b5d",
+            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/libgomp1_12-20220319-1ubuntu1_amd64.deb"
           }
         ],
         "win32-arm64": {
@@ -366,8 +366,8 @@
             "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11146/cudart-llama-b11146-bin-ubuntu-cuda-13.4-arm64.tar.gz"
           },
           {
-            "sha256": "3f777eac64c87e2db843675b229efd16efe2ac1ae977318d687b39b812747863",
-            "url": "https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-14/libgomp1_14-20240412-0ubuntu1_arm64.deb"
+            "sha256": "c1719335234ccdef7558e97b37b1f6baf069911ce2f26d2789336051a7c929cd",
+            "url": "https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libgomp1_12-20220319-1ubuntu1_arm64.deb"
           }
         ],
         "linux-x64": [
@@ -380,8 +380,8 @@
             "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11146/cudart-llama-b11146-bin-ubuntu-cuda-13.4-x64.tar.gz"
           },
           {
-            "sha256": "cc2ca1193d2c11d7383bdb03dd333cc621d128237b82dafeb8d7f2bd8302f3dd",
-            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-14/libgomp1_14-20240412-0ubuntu1_amd64.deb"
+            "sha256": "8627999dd5f3d38473774ce7924a62af9a2840b2238bc52611e38257bc140b5d",
+            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/libgomp1_12-20220319-1ubuntu1_amd64.deb"
           }
         ],
         "win32-arm64": [
@@ -415,8 +415,8 @@
             "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11146/llama-b11146-bin-ubuntu-rocm-10.0-x64.tar.gz"
           },
           {
-            "sha256": "cc2ca1193d2c11d7383bdb03dd333cc621d128237b82dafeb8d7f2bd8302f3dd",
-            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-14/libgomp1_14-20240412-0ubuntu1_amd64.deb"
+            "sha256": "8627999dd5f3d38473774ce7924a62af9a2840b2238bc52611e38257bc140b5d",
+            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/libgomp1_12-20220319-1ubuntu1_amd64.deb"
           }
         ],
         "win32-x64": {
@@ -447,8 +447,8 @@
             "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11146/llama-b11146-bin-ubuntu-vulkan-arm64.tar.gz"
           },
           {
-            "sha256": "3f777eac64c87e2db843675b229efd16efe2ac1ae977318d687b39b812747863",
-            "url": "https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-14/libgomp1_14-20240412-0ubuntu1_arm64.deb"
+            "sha256": "c1719335234ccdef7558e97b37b1f6baf069911ce2f26d2789336051a7c929cd",
+            "url": "https://ports.ubuntu.com/ubuntu-ports/pool/main/g/gcc-12/libgomp1_12-20220319-1ubuntu1_arm64.deb"
           }
         ],
         "linux-x64": [
@@ -457,8 +457,8 @@
             "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11146/llama-b11146-bin-ubuntu-vulkan-x64.tar.gz"
           },
           {
-            "sha256": "cc2ca1193d2c11d7383bdb03dd333cc621d128237b82dafeb8d7f2bd8302f3dd",
-            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-14/libgomp1_14-20240412-0ubuntu1_amd64.deb"
+            "sha256": "8627999dd5f3d38473774ce7924a62af9a2840b2238bc52611e38257bc140b5d",
+            "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-12/libgomp1_12-20220319-1ubuntu1_amd64.deb"
           }
         ],
         "win32-x64": {

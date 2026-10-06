@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
+import { PanelRight, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useSearchParams } from "react-router";
@@ -37,6 +37,7 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { readStoredWorkspace, writeStoredWorkspace } from "@/lib/chat-workspaces";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { readChatPanelCollapsed, toggleChatPanelCollapsed } from "@/lib/chat-panel-collapsed";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
@@ -76,11 +77,9 @@ import {
   parseResumeControlMessage,
   shouldFollowPtyOutput,
 } from "@/lib/pty-scroll";
-import {
-  imageFilesFromTransfer,
-  transferMayContainImage,
-  uploadChatImage,
-} from "@/lib/chatImagePaste";
+import { installTerminalTouchScroll } from "@/lib/terminal-touch-scroll";
+import { uploadChatImage } from "@/lib/chatImagePaste";
+import { attachChatImageDropListeners } from "@/lib/chat-image-drop";
 import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
 import {
   PTY_GAVE_UP_BANNER,
@@ -98,6 +97,14 @@ import {
   refitWhenTerminalFontLoads,
   TERMINAL_FONT_FAMILY,
 } from "@/lib/terminal-font-refit";
+import { generateChannelId } from "@/lib/chat-channel-id";
+import { sendCopyLastCommand } from "@/lib/chat-copy-last";
+import { CopyLastButton } from "@/lib/chat-copy-last-button";
+import {
+  probeWebglSupport,
+  shouldUseWebglRenderer,
+  textNeedsDomShaping,
+} from "@/lib/xterm-webgl-gating";
 import { loseWebglContexts } from "@/lib/xterm-webgl-release";
 import {
   buildTerminalTheme,
@@ -111,24 +118,11 @@ import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { errorMessage } from "@/lib/api-error";
+import { SGR_MOUSE_RE } from "@/lib/pty-mouse-report";
 
 // Per-tab keep-alive identity (`?attach=`): lives in pty-attach-token.ts so a
 // second tab — including a Chrome "Duplicate tab" — gets its own PTY instead of
 // taking over this one. See #115304.
-
-// Channel id ties this chat tab's PTY child (publisher) to its sidebar
-// (subscriber).  Generated once per mount so a tab refresh starts a fresh
-// channel — the previous PTY child terminates with the old WS, and its
-// channel auto-evicts when no subscribers remain.
-function generateChannelId(scope?: string): string {
-  const prefix = scope ? "chat" : "chat-fresh";
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return `${prefix}-${crypto.randomUUID()}`;
-  }
-  return `${prefix}-${Math.random().toString(36).slice(2)}-${Date.now().toString(
-    36,
-  )}`;
-}
 
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -206,8 +200,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const connectingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyInputLineRef = useRef("");
   const mobileReplacementInputUntilRef = useRef(0);
-  const [ptyState, setPtyState] =
-    useState<PtyConnectionState>("connecting");
+  const [ptyState, setPtyState] = useState<PtyConnectionState>("connecting");
   const ptyStateRef = useRef<PtyConnectionState>("connecting");
   // True until the first real PTY payload arrives for a resumed session.
   // Covers the blank terminal + blinking-cursor window so users don't think
@@ -296,14 +289,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // Collapse toggle for the desktop chat side panel (model + sessions),
   // persisted in localStorage so the choice survives reloads.
   const [chatPanelCollapsed, setChatPanelCollapsed] = useState(
-    () => localStorage.getItem("hermes-chat-panel-collapsed") === "1",
+    readChatPanelCollapsed,
   );
   const toggleChatPanel = useCallback(() => {
-    setChatPanelCollapsed((prev) => {
-      const next = !prev;
-      localStorage.setItem("hermes-chat-panel-collapsed", next ? "1" : "0");
-      return next;
-    });
+    setChatPanelCollapsed(toggleChatPanelCollapsed);
   }, []);
   const { setEnd, setTitle } = usePageHeader();
   const [sessionTitleState, setSessionTitleState] = useState<{
@@ -494,22 +483,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
   const handleCopyLast = () => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Send the slash as a burst, wait long enough for Ink's tokenizer to
-    // emit a keypress event for each character (not coalesce them into a
-    // paste), then send Return as its own event.  The timing here is
-    // empirical — 100ms is safely past Node's default stdin coalescing
-    // window and well inside UI responsiveness.
-    ws.send("/copy");
-    setTimeout(() => {
-      const s = wsRef.current;
-      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
-    }, 100);
-    setCopyState("copied");
-    if (copyResetRef.current) clearTimeout(copyResetRef.current);
-    copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
-    termRef.current?.focus();
+    sendCopyLastCommand({
+      wsRef,
+      termRef,
+      copyResetRef,
+      onCopied: () => setCopyState("copied"),
+      onCopyReset: () => setCopyState("idle"),
+    });
   };
 
   useEffect(() => {
@@ -665,28 +645,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         await driveImageAttach(paths);
       })().catch(reportImageUploadError);
     };
-    const handleBrowserPaste = (ev: ClipboardEvent) => {
-      const files = imageFilesFromTransfer(ev.clipboardData);
-      if (!files.length) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      uploadAndAttachImages(files);
-    };
-    const handleBrowserDragOver = (ev: DragEvent) => {
-      if (!transferMayContainImage(ev.dataTransfer)) return;
-      ev.preventDefault();
-      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
-    };
-    const handleBrowserDrop = (ev: DragEvent) => {
-      const files = imageFilesFromTransfer(ev.dataTransfer);
-      if (!files.length) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      uploadAndAttachImages(files);
-    };
-    host.addEventListener("paste", handleBrowserPaste, { capture: true });
-    host.addEventListener("dragover", handleBrowserDragOver, { capture: true });
-    host.addEventListener("drop", handleBrowserDrop, { capture: true });
+    const handleBrowserDropCleanup = attachChatImageDropListeners(
+      host,
+      uploadAndAttachImages,
+      (text) => term.paste(text),
+    );
 
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
@@ -817,6 +780,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ev.stopPropagation();
       return false;
     });
+    const cleanupTouchScroll = installTerminalTouchScroll(host, term);
 
     const unicode11 = new Unicode11Addon();
     term.loadAddon(unicode11);
@@ -896,13 +860,28 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // in DevTools device mode that often produces *visually* much larger cells
     // than `fontSize` suggests — users see "huge" text even at 7–9px settings.
     // The canvas/DOM renderer tracks `fontSize` faithfully; use it for narrow
-    // hosts.  Wide layouts still get WebGL for crisp box-drawing.
-    const useWebgl = terminalTierWidthPx(host) >= 768;
+    // hosts.  Wide layouts still get WebGL for crisp box-drawing — but only
+    // where WebGL actually works. Safari's atlas garbles box-drawing glyphs
+    // (#18773), hosts whose only GL is a software rasterizer (llvmpipe,
+    // SwiftShader) crash the addon with "(regl) webgl not supported"
+    // (#45520), and without any GL context there is nothing to load at all.
+    // Everything else falls back to the default DOM renderer.
+    const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
+    const useWebgl = shouldUseWebglRenderer({
+      layoutWidthPx: terminalTierWidthPx(host),
+      userAgent,
+      support: probeWebglSupport(document),
+    });
+    // Set once the addon is live; the PTY write path below drops it again if
+    // shaping-requiring text (Bengali conjuncts, Devanagari, Khmer…) arrives,
+    // so xterm re-renders through the DOM renderer (#58685).
+    let webglAddon: { dispose(): void } | null = null;
     if (useWebgl) {
       try {
         const webgl = new WebglAddon();
         webgl.onContextLoss(() => webgl.dispose());
         term.loadAddon(webgl);
+        webglAddon = webgl;
       } catch (err) {
         console.warn(
           "[hermes-chat] WebGL renderer unavailable; falling back to default",
@@ -1387,6 +1366,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       )
         ? () => termRef.current?.scrollToBottom()
         : undefined;
+      // Complex scripts (Bengali conjuncts etc.) cannot be drawn from a
+      // per-glyph atlas — the first such payload swaps to the DOM renderer,
+      // whose text shaping renders them properly (#58685). Disposing the
+      // addon makes xterm fall back and redraw on its own.
+      if (webglAddon && textNeedsDomShaping(text)) {
+        try {
+          webglAddon.dispose();
+        } catch {
+          /* already gone */
+        }
+        webglAddon = null;
+      }
       term.write(rendered, followScroll);
       noteResumePtyChunk(rendered);
     };
@@ -1488,9 +1479,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // mouse reporting, so we drop SGR mouse reports entirely instead of
     // forwarding them into Hermes. Keyboard input, paste, and resize still
     // behave normally.
-      // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
-      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
-      const forwardPtyData = (data: string, useMobileReplacement = true) => {
+    const forwardPtyData = (data: string, useMobileReplacement = true) => {
         // Mouse reports (scroll wheel etc.) are not typed input — swallow
         // them before the blocked-input check so scrolling a disconnected
         // terminal doesn't trip the "reconnecting" notice.
@@ -1566,9 +1555,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onScrollDisposable?.dispose();
       mobileInputCleanup?.();
       compositionForwarder.dispose();
-      host.removeEventListener("paste", handleBrowserPaste, true);
-      host.removeEventListener("dragover", handleBrowserDragOver, true);
-      host.removeEventListener("drop", handleBrowserDrop, true);
+      cleanupTouchScroll();
+      handleBrowserDropCleanup();
       if (metricsDebounce) clearTimeout(metricsDebounce);
       window.removeEventListener("resize", scheduleSyncTerminalMetrics);
       window.clearTimeout(keyboardRevealTimer);
@@ -1866,6 +1854,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             </div>
             <ChatSessionList
               activeSessionId={resumeParam}
+              isActive={isActive}
               profile={scopedProfile}
               onPicked={closeMobilePanel}
               onNewChat={startFreshDashboardChat}
@@ -1995,30 +1984,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             </div>
           )}
 
-          <Button
-            ghost
+          <CopyLastButton
             onClick={handleCopyLast}
-            title="Copy last assistant response as raw markdown"
-            aria-label="Copy last assistant response"
-            className={cn(
-              "absolute z-10",
-              "normal-case tracking-normal font-normal",
-              "rounded border border-current/30",
-              "bg-black/20",
-              "opacity-70 hover:opacity-100 hover:border-current/60",
-              "transition-opacity duration-150",
-              "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
-              "lg:bottom-4 lg:right-4",
-            )}
-            style={{ color: terminalFg }}
-          >
-            <span className="inline-flex items-center gap-1.5">
-              <Copy className="h-3 w-3 shrink-0" />
-              <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
-              </span>
-            </span>
-          </Button>
+            copied={copyState === "copied"}
+            color={terminalFg}
+          />
 
           {chatPanelCollapsed && (
             <Button
@@ -2080,6 +2050,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             <div className="min-h-0 flex-1 overflow-hidden">
               <ChatSessionList
                 activeSessionId={resumeParam}
+                isActive={isActive}
                 profile={scopedProfile}
                 onNewChat={startFreshDashboardChat}
                 workspaceCwd={workspaceCwd}

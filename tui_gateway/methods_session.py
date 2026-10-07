@@ -400,14 +400,10 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
                 return _err(rid, 4008, f"nothing to branch — {exc}")
         history = _visible_branch_history(display_history)
         if not history:
-            return _err(rid, 4008, "nothing to branch — send a message first")
-    # Only an explicitly chosen existing workspace persists as cwd; the launch-dir fallback is "No workspace".
-    explicit_cwd = False
-    raw_cwd = _str_param(params, "cwd")  # unguarded, as on BASE: only the path check is best-effort
-    # An ssh profile's cwd lives on the remote host, where the host isdir check cannot vouch for it.
-    remote_cwd = bool(raw_cwd) and _is_remote_cwd_shape(raw_cwd) and _cwd_is_remote(profile_home)
-    with contextlib.suppress(Exception):
-        explicit_cwd = bool(raw_cwd) and (remote_cwd or os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd))))
+            return _err(rid, 4008, "send a message first")
+    # Only a chosen workspace persists as cwd; the launch-dir fallback is "No workspace"
+    # (#108205: the desktop arm lets the client vouch for a host-invisible path, #52589 provenance).
+    explicit_cwd, session_cwd, remote_cwd = _resolve_create_cwd(params, source, profile_home)
     _enable_gateway_prompts()
     from .methods_session_model_guard import create_overrides
     try:
@@ -431,7 +427,7 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
             "explicit_cwd": explicit_cwd,
             "history": history, "history_lock": threading.Lock(), "history_version": 0, "image_counter": 0,
             "seeded": bool(history),  # gates _persist_branch_seed: only create-time history is unpersisted
-            "cwd": _completion_cwd(params), "inflight_turn": None, "last_active": now,
+            "cwd": session_cwd, "inflight_turn": None, "last_active": now,
             "model_override": session_model_override,
             "composer_override_profile": composer_override_profile,
             "create_reasoning_override": create_reasoning_override,

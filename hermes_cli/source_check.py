@@ -65,7 +65,7 @@ def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, t
     try:
         return subprocess.run(
             [git, *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
-            **(_GIT_TEXT_KW if text else {}), **kwargs)
+            **(_GIT_TEXT_KW if text else {}), **kwargs, check=False)
     except Exception:
         return None
 
@@ -123,9 +123,14 @@ def _request(url: str, accept: str = "application/vnd.github+json") -> str:
         return _request_with(url, accept, token)
     except urllib.error.HTTPError as exc:
         if token is None or exc.code != 401:
+            exc.hermes_authenticated = token is not None  # which quota a 403/429 spent
             raise
         logger.debug("GitHub rejected the configured token; retrying anonymously")
+    try:
         return _request_with(url, accept, None)
+    except urllib.error.HTTPError as exc:
+        exc.hermes_authenticated = False
+        raise
 
 
 def _request_with(url: str, accept: str, token: str | None) -> str:

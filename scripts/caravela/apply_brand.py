@@ -143,6 +143,28 @@ def die(msg: str) -> None:
     raise SystemExit(1)
 
 
+def matching_close(text: str, open_at: int) -> int:
+    """Index of the `}` that closes the `{` at or after open_at. -1 if none.
+
+    Anchoring on a specific last field (customCSS) dies the moment upstream
+    adds another property. DesktopTheme gained accentOf after customCSS.
+    """
+    i = text.find("{", open_at)
+    if i < 0:
+        return -1
+    depth = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 def write(path: Path, text: str) -> None:
     path.write_text(text)
     print(f"[ok] {path}")
@@ -156,14 +178,11 @@ def ensure_types(path: Path) -> None:
             die(f"DesktopTheme interface missing in {path}")
         text = text.replace(needle, BRANDING_TYPES + needle, 1)
     if "branding?: DesktopBranding" not in text:
-        needle = "  customCSS?: string\n}"
-        if needle not in text:
-            die(f"customCSS field missing in {path}; cannot attach branding")
-        text = text.replace(
-            needle,
-            "  customCSS?: string\n  branding?: DesktopBranding\n}",
-            1,
-        )
+        start = text.find("export interface DesktopTheme {")
+        close = matching_close(text, start)
+        if close < 0:
+            die(f"DesktopTheme interface has no closing brace in {path}; cannot attach branding")
+        text = text[:close] + "  branding?: DesktopBranding\n" + text[close:]
     write(path, text)
 
 
@@ -175,11 +194,15 @@ def ensure_theme(path: Path) -> None:
             die(f"BUILTIN_THEMES missing in {path}")
         text = text.replace(needle, THEME_BLOCK + needle, 1)
     if "caravela: caravelaTheme" not in text:
-        text = text.replace(
-            "cyberpunk: cyberpunkTheme\n}",
-            "cyberpunk: cyberpunkTheme,\n  caravela: caravelaTheme\n}",
-            1,
-        )
+        marker = "export const BUILTIN_THEMES"
+        start = text.find(marker)
+        close = matching_close(text, start) if start >= 0 else -1
+        if close < 0:
+            die("could not register caravela in BUILTIN_THEMES")
+        before = text[:close].rstrip()
+        if not before.endswith(","):
+            before += ","
+        text = before + "\n  caravela: caravelaTheme\n" + text[close:]
         if "caravela: caravelaTheme" not in text:
             die("could not register caravela in BUILTIN_THEMES")
     text = re.sub(

@@ -54,6 +54,8 @@ class LiveSession:
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
     # still see the claim as started, so no snapshot shows a terminal row without its completion.
     settling: dict = field(default_factory=dict)
+    # A viewer attached while a guarded deferred pick awaits consent: the next boundary asks again.
+    reask_pick: bool = False
 
     def __post_init__(self):
         self.controls = PendingControls(self.event_stream)
@@ -138,15 +140,22 @@ class SessionAuthority:
                 and source.user_id != actor.subject and 'session:operator' not in actor.capabilities):
             raise RuntimeStoreError('permission_denied')
 
-    def _require_admission_open(self):
-        if self.runner._draining or self.retiring:
+    def _require_admission_open(self, *, queue_only=False):
+        """``queue_only``: the caller only COMMITS a queued row (never claims or runs it). A restart's
+        after-turn wait accepts those (#139041): the row is durable FIFO input the next owner runs
+        exactly once, while this owner's claim path stays refused."""
+        if self.retiring:
             raise RuntimeStoreError('runtime_draining')
+        if self.runner._draining:
+            from gateway.drain_control import restart_wait_open
+            if not (queue_only and restart_wait_open(self.runner)):
+                raise RuntimeStoreError('runtime_draining')
 
-    def _admission_gate(self, authorize=None):
+    def _admission_gate(self, authorize=None, *, queue_only=False):
         """The admission gate re-checked inside an off-loop write transaction (with the caller's
         own guard), so a drain that began while the write waited on the writer still refuses it."""
         def guard(conn):
-            self._require_admission_open()
+            self._require_admission_open(queue_only=queue_only)
             if authorize is not None:
                 authorize(conn)
         return guard
@@ -228,9 +237,12 @@ class SessionAuthority:
             active_generation = handle.execution_generation if handle.execution_state == "running" else None
             prompts = live.controls.snapshot(ref.session_id, active_generation)
             epoch, sequence = live.event_stream.watermark()
-            return SubscriptionSnapshot(subscription, handle, epoch,
+            snapshot = SubscriptionSnapshot(subscription, handle, epoch,
                                         sequence, tuple(local_history(self, ref)),
                                         tuple(self._pending_receipt(r) for r in self._pending_rows(ref)), prompts)
+        from gateway.session_deferred_pick import reask_on_attach
+        await reask_on_attach(self, ref, live)
+        return snapshot
 
     def _retire_overflowed(self, session_id, transport):
         """The fanout dropped this peer's backlog: its subscription is over even though the
@@ -424,17 +436,22 @@ class SessionAuthority:
                 results[sid] = exc.reason
         return results
 
-    async def submit(self, actor: Principal, request: Submission, *, _authorize_write=None):
+    async def submit(self, actor: Principal, request: Submission, *, _authorize_write=None, queue_while_restarting=False):
+        """``queue_while_restarting``: the caller is an interactive client attached to a restart's
+        after-turn wait, which commits the input queued for the next owner. Machine callers (a2a,
+        kanban, hosted rooms) keep the plain ``runtime_draining`` refusal and retry against the next
+        owner with their own stable request id; none of them reads a released waiter as queued."""
         self.authorize(actor, request.ref, 'session:submit')
         async with self.sessions[request.ref.session_id].mutation_lock:
             # Deletion can retire this session while the caller waits on its writer.
             self.authorize(actor, request.ref, 'session:submit')
             from gateway.session_ingress_media import capture_lease
             with capture_lease():  # captured bytes are held from capture until commit or refusal
-                return await self._submit(actor, request, _authorize_write=_authorize_write)
+                return await self._submit(actor, request, _authorize_write=_authorize_write,
+                                          queue_only=queue_while_restarting is True)
 
-    async def _submit(self, actor, request, *, _authorize_write=None):
-        self._require_admission_open()
+    async def _submit(self, actor, request, *, _authorize_write=None, queue_only=False):
+        self._require_admission_open(queue_only=queue_only)
         if (request.intent != 'queue' or not {'text'} <= set(request.payload) <= {
                 'text', 'attachments', 'finite', 'unattended', 'surface', 'voice_context', 'interrupted',
                 'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
@@ -469,7 +486,7 @@ class SessionAuthority:
                 return admit_session_input(self.db, epoch=self.epoch, principal_id=actor.subject,
                                            session_id=request.ref.session_id, request_id=request.request_id,
                                            payload=payload, intent=request.intent,
-                                           _authorize_write=self._admission_gate(_authorize_write))
+                                           _authorize_write=self._admission_gate(_authorize_write, queue_only=queue_only))
             except Exception:
                 self._release_refused_capture(request, payload)
                 raise
@@ -775,6 +792,10 @@ class SessionAuthority:
                 raise RuntimeStoreError('unknown_execution')
             first = next((row for row in pending if row['status'] == 'queued'), None)
             from gateway.config import Platform
+            if live.source.platform == Platform.LOCAL:
+                # A model pick made while the previous turn ran lands here, at the turn boundary.
+                from gateway.session_deferred_pick import apply_deferred_pick
+                await apply_deferred_pick(self, ref, live)
             if first is not None and live.source.platform == Platform.LOCAL:
                 from gateway.session_local_recovery import restore_local_session
                 restore_local_session(self, ref.session_id)

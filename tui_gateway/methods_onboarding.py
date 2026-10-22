@@ -86,14 +86,11 @@ def _stat(path):
 
 
 def start_due_boot() -> None:
-    """Serve boot, desktop's local backend: work out the due answer off the RPC path, after the setup
-    bootstrap has recorded a fresh install and kept an existing guest's trial."""
+    """Work out the local Desktop's due answer off the RPC path, after the setup bootstrap has recorded
+    a fresh install (``begin_local_desktop_boot``)."""
     from agent.memory_provider import spawn_context_thread
     from hermes_cli import free_tier_bootstrap, onboarding_due
-    from hermes_cli.anon_auth import on_local_desktop_backend
 
-    if not on_local_desktop_backend():
-        return
     finish = onboarding_due.begin_boot(_due_stamp)
 
     def compute() -> dict[str, bool]:
@@ -102,6 +99,28 @@ def start_due_boot() -> None:
 
     # finish() marks the boot done even when compute raises, so no reader waits on a dead thread.
     spawn_context_thread(finish, name="onboarding-due", args=(compute,)).start()
+
+
+_local_desktop_boot_lock = threading.Lock()
+_local_desktop_boot_started = False
+
+
+def begin_local_desktop_boot() -> None:
+    """The local Desktop's first accepted connection to this process: record a fresh install, settle an
+    interrupted claim, the setup record and the due answer, once, as work for that Desktop."""
+    global _local_desktop_boot_started
+    from hermes_cli import free_tier_bootstrap
+    from hermes_cli.process_identity import serving_local_desktop
+    from tui_gateway.launch_profile_policy import launch_profile_scope_if_multiplexed
+
+    with _local_desktop_boot_lock:
+        if _local_desktop_boot_started:
+            return
+        _local_desktop_boot_started = True
+    # The record and the latch are the launch profile's; the connecting profile may be another one.
+    with launch_profile_scope_if_multiplexed(), serving_local_desktop(True):  # threads copy this context
+        free_tier_bootstrap.start_background_bootstrap()
+        start_due_boot()
 
 
 # ── first-run onboarding: one chat in the default profile, driven by setup_beat ───────────────
@@ -276,74 +295,12 @@ def _setup_beat_request(sid: str, payload: dict) -> dict | None:
     return server_requests.send("setup_beat", sid, dict(payload), timeout=CARD_TIMEOUT_S)
 
 
-def _builds_onboarding(agent) -> bool:
-    return "setup_beat" in (getattr(agent, "valid_tool_names", None) or ())
-
-
-def _onboarding_toolsets(enabled, db, session_id: str):
-    """*enabled* plus ``onboarding`` for a chat whose run is in progress. Decided once, at agent build:
-    the tool array is part of the cached prefix, so a finished run keeps setup_beat (as a refusal)
-    until the session is rebuilt."""
-    from agent.onboarding_flow import is_active
-    from agent.onboarding_record import load
-    if _keeps_toolsets(enabled):
-        return enabled
-    return _with_onboarding(enabled) if is_active(load(db if db is not None else _get_db(), session_id)) else enabled
-
-
-def _carry_onboarding_toolset(enabled, agent):
-    """A tool refresh keeps the onboarding toolset the agent was built with."""
-    if _keeps_toolsets(enabled) or "onboarding" not in (getattr(agent, "enabled_toolsets", None) or ()):
-        return enabled
-    return _with_onboarding(enabled)
-
-
-def _keeps_toolsets(enabled) -> bool:
-    """An explicit empty list is a zero-tool chat; None is unrestricted and still gets the fold-in."""
-    return enabled is not None and (not enabled or "onboarding" in enabled)
-
-
-def _with_onboarding(enabled) -> list[str]:
-    """*enabled* plus onboarding. None (every toolset outside the session-gated ones, which onboarding
-    is) is spelled out by name: the agent's other toolset gates read the names, as they read None."""
-    if enabled is None:
-        from toolsets import TOOLSET_SESSION_PLATFORMS, get_all_toolsets
-        enabled = [name for name in get_all_toolsets() if name not in TOOLSET_SESSION_PLATFORMS]
-    return [*enabled, "onboarding"]
-
-
-def _onboarding_prelude(agent, history: list):
-    """The opening's scripted step, greeting and name card, while the name beat was never shown. A
-    greeting already in the chat (a relaunch) is not said twice."""
-    from agent.onboarding_flow import PENDING, is_active
-    from agent.onboarding_record import load
-    from agent.onboarding_text import greeting
-    if not _builds_onboarding(agent):
-        return None
-    record = load(agent._session_db, agent.session_id)
-    if not is_active(record) or record["beats"]["name"] != PENDING:
-        return None
-    hello = greeting((record.get("facts") or {}).get("locale"))
-    said = any(m.get("role") == "assistant" and m.get("content") == hello for m in history)
-
-    def opening():
-        yield ("" if said else hello), "setup_beat", {"beat": "name"}
-    return opening()
-
-
 def _stage_onboarding_turn_note(sid: str, agent, history_empty: bool) -> None:
-    """Before a user turn in the onboarding chat, while no card waits: which card is closed and how to
-    bring it back. Rides the turn's API-only notes, like the first-contact note."""
-    from agent.onboarding_flow import is_active
-    from agent.onboarding_record import load
-    from agent.onboarding_text import turn_note
+    """Before a user turn in the onboarding chat (``agent.onboarding_session.onboarding_turn_note``)."""
+    from agent.onboarding_session import append_turn_note, onboarding_turn_note
     from tui_gateway import server_requests
-    if history_empty or not _builds_onboarding(agent) or server_requests.pending_kind(sid) == "setup_beat":
-        return
-    record = load(agent._session_db, agent.session_id)
-    if is_active(record) and (note := turn_note(record)):
-        prior = getattr(agent, "_gateway_turn_context_notes", "") or ""
-        agent._gateway_turn_context_notes = f"{prior}\n\n{note}" if prior else note
+    append_turn_note(agent, onboarding_turn_note(
+        agent, history_empty=history_empty, card_waiting=server_requests.pending_kind(sid) == "setup_beat"))
 
 
 def register(server) -> None:

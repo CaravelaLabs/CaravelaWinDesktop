@@ -6,7 +6,7 @@ import contextlib
 import pytest
 
 from hermes_cli import anon_auth, install_state, welcome_trial
-from tests.hermes_cli.anon_portal import as_local_desktop_backend, claimed_trial, install_portal
+from tests.hermes_cli.anon_portal import as_local_desktop_backend, claimed_trial, install_portal, off_local_desktop
 
 
 @pytest.fixture
@@ -68,12 +68,12 @@ def test_a_connector_guest_neither_claims_nor_carries_inference(portal, monkeypa
     assert [r["body"]["purpose"] for r in portal.token_requests] == ["connectors"]
 
 
-def test_a_claimed_guest_carries_inference_only_on_the_local_desktop_backend(portal, monkeypatch):
+def test_a_claimed_trial_carries_inference_outside_the_desktop_too(portal, monkeypatch):
     state = claimed_trial(monkeypatch)
-    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN")  # the same home, read by a CLI process
+    off_local_desktop(monkeypatch)  # the same home, read by a CLI process
 
-    assert not anon_auth.free_inference_active()
-    assert anon_auth.guest_without_free_tier(state)
+    assert anon_auth.free_inference_active()
+    assert not anon_auth.guest_without_free_tier(state)
 
 
 def _chat(db_path, model: str) -> None:
@@ -85,48 +85,6 @@ def _chat(db_path, model: str) -> None:
     db.close()
 
 
-def _legacy_guest() -> None:
-    """A guest minted before the claim existed: no welcome_claim key at all, in either store."""
-    from hermes_cli.auth import _load_auth_store, _load_provider_state, _save_auth_store, _store_provider_state
-    from hermes_cli.auth_nous import _write_shared_nous_state
-
-    anon_auth.ensure_portal_identity(explicit=True)
-    store = _load_auth_store()
-    state = dict(_load_provider_state(store, "nous"))
-    state.pop(anon_auth.WELCOME_CLAIM_FLAG, None)
-    _store_provider_state(store, "nous", state, set_active=False)
-    _save_auth_store(store)
-    _write_shared_nous_state(state)
-
-
-@pytest.mark.parametrize(("model", "kept"), [(anon_auth.GUEST_MODEL, True), ("anthropic/claude", False)])
-def test_a_guest_that_chatted_on_the_free_model_keeps_it(portal, monkeypatch, model, kept):
-    from hermes_constants import get_hermes_home
-
-    as_local_desktop_backend(monkeypatch)
-    _legacy_guest()  # grandfathering is only for guests minted before the key existed
-    _chat(get_hermes_home() / "state.db", model)
-
-    assert welcome_trial.grandfather_existing_guest() is kept
-    assert anon_auth.free_inference_active() is kept
-
-
-def test_grandfathering_never_overwrites_a_sign_in_from_another_profile(portal, monkeypatch):
-    from hermes_cli.auth_nous import _read_shared_nous_state, _write_shared_nous_state
-    from hermes_constants import get_hermes_home
-    from tests.hermes_cli.anon_portal import PORTAL
-
-    as_local_desktop_backend(monkeypatch)
-    _legacy_guest()                                    # this profile still holds the old guest
-    _chat(get_hermes_home() / "state.db", anon_auth.GUEST_MODEL)
-    _write_shared_nous_state({"auth_method": "oauth_device_code", "portal_base_url": PORTAL,
-                              "access_token": "at-signed-in", "refresh_token": "rt-signed-in"})
-
-    assert welcome_trial.grandfather_existing_guest() is False
-    assert _read_shared_nous_state()["refresh_token"] == "rt-signed-in"
-    assert anon_auth.WELCOME_CLAIM_FLAG not in anon_auth.current_nous_state()
-
-
 def test_a_lost_claim_is_not_replaced(portal, monkeypatch):
     claimed_trial(monkeypatch)
     anon_auth.clear_dead_guest("anon_credential_dead")
@@ -135,33 +93,19 @@ def test_a_lost_claim_is_not_replaced(portal, monkeypatch):
     assert portal.creates() == 1
 
 
-def test_a_reaped_claimant_replaced_by_a_connector_guest_is_not_grandfathered(portal, monkeypatch):
-    from hermes_constants import get_hermes_home
-
-    claimed_trial(monkeypatch)
-    _chat(get_hermes_home() / "state.db", anon_auth.GUEST_MODEL)
-    anon_auth.clear_dead_guest("anon_credential_dead")
-    anon_auth.ensure_portal_identity(explicit=True)  # a connector action mints the replacement
-
-    assert welcome_trial.grandfather_existing_guest() is False
-    assert not anon_auth.free_inference_active()
-
-
-def test_a_connector_guest_adopted_from_the_shared_store_is_not_grandfathered(portal, monkeypatch):
+def test_a_connector_guest_adopted_from_the_shared_store_carries_no_trial(portal, monkeypatch):
     from hermes_cli.auth import _load_auth_store, _save_auth_store
-    from hermes_constants import get_hermes_home
 
     as_local_desktop_backend(monkeypatch)
     anon_auth.ensure_portal_identity(explicit=True)  # connector mint: welcome_claim False, mirrored
     store = _load_auth_store()
     store["providers"].pop("nous")  # a profile whose own identity differs adopts the shared one
     _save_auth_store(store)
-    _chat(get_hermes_home() / "state.db", anon_auth.GUEST_MODEL)
 
     adopted = anon_auth.ensure_portal_identity(explicit=True)
 
     assert adopted[anon_auth.WELCOME_CLAIM_FLAG] is False
-    assert welcome_trial.grandfather_existing_guest() is False
+    assert not anon_auth.free_inference_active()
     assert portal.creates() == 1
 
 
@@ -189,7 +133,6 @@ def test_a_lost_trial_is_never_claimed_again_after_a_relaunch(portal, monkeypatc
 
     assert welcome_trial.claim_desktop_free_tier() is None
     assert portal.creates() == creates
-    assert welcome_trial.grandfather_existing_guest() is False
     assert not anon_auth.free_inference_active()
     with pytest.raises(AuthError):
         resolve_provider("auto")

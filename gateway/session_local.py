@@ -235,12 +235,22 @@ def staged_creation_follows(authority, actor, request_id):
     return isinstance(request, dict) and request.get('follow_profile_config') is True
 
 
+def _welcome_trial_model():
+    """The free model for a chat that has no configured one, while the welcome trial carries this
+    activity (the local Desktop, a claimed guest): what the agent pins on the welcome host anyway
+    (``anon_auth.pin_model_for_route``). Else None, and the create refuses."""
+    from hermes_cli import anon_auth
+    return anon_auth.GUEST_MODEL if anon_auth.free_inference_active() else None
+
+
 def stage_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None, skills_prompt=None,
-                        client_local=False):
+                        client_local=False, desktop_local=False):
     """Everything before the creation commit: the existing session's ref on an exact retry, else the
     receipt ``commit_local_session`` writes (the async RPC commits it off the owner loop).
     ``client_local``: the gateway's own proof that the client is on this host (its connection redeemed a
-    ticket minted over the private control socket), never a value the client sends."""
+    ticket minted over the private control socket), never a value the client sends. ``desktop_local``:
+    that client is also the Desktop app (``process_identity.local_desktop_client``); a Desktop chat
+    records it so its turns run as work for the local Desktop (``session_policy.local_desktop_turn``)."""
     if actor.profile_id != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
     if 'session:create' not in actor.capabilities:
@@ -272,8 +282,12 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
             policy = replace(policy, request_json=json.dumps(
                 {**json.loads(policy.request_json), 'model_requested': raw_model, 'route_derived': derived},
                 sort_keys=True))
+        if desktop_local and policy.source == 'gui':
+            import json
+            policy = replace(policy, request_json=json.dumps(
+                {**json.loads(policy.request_json), 'desktop_local': True}, sort_keys=True))
         if policy.model is None:
-            policy = replace(policy, model=_resolve_gateway_model(policy.config()))
+            policy = replace(policy, model=_resolve_gateway_model(policy.config()) or _welcome_trial_model())
     request_id = params.get('request_id', uuid.uuid4().hex)
     if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
         raise RuntimeStoreError('invalid_params', field='request_id',

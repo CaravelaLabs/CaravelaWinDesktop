@@ -1,11 +1,11 @@
-"""Serve-start record of who carries inference, for ``setup.status`` and ``setup.ready``.
+"""Record of who carries inference, for ``setup.status`` and ``setup.ready``.
 
-``hermes serve`` runs this once at boot on a daemon thread. It never creates an identity: the
-desktop's welcome-trial claim (``hermes_cli.welcome_trial``) and the first hosted connector action
-are the only creators. On the desktop's local backend it first records a fresh install's onboarding
-decision (``onboarding_run.latch_first_install``), settles a claim cut off before its marker write
-(``welcome_trial.settle_interrupted_claim``), then keeps the trial for a guest that already ran
-on the free model (``welcome_trial.grandfather_existing_guest``). Then it inventories
+It runs once per process on a daemon thread: at ``hermes serve`` boot, and on the gateway when the
+local Desktop first connects (``tui_gateway.methods_onboarding.begin_local_desktop_boot``). It never
+creates an identity: the desktop's welcome-trial claim (``hermes_cli.welcome_trial``) and the first
+hosted connector action are the only creators. For the desktop's local backend it first records a
+fresh install's onboarding decision (``onboarding_run.latch_first_install``) and settles a claim cut
+off before its marker write (``welcome_trial.settle_interrupted_claim``). Then it inventories
 credentials cheap-first, resolves which provider carries inference, records the answer in process
 memory, and tells every connected client with one ``setup.ready`` event. ``free_tier.status`` and
 ``setup.status`` read the record; provider resolution never reaches the portal.
@@ -186,7 +186,7 @@ def _build_record(*, other: bool) -> SetupRecord:
 
 
 def run_bootstrap(*, announce: bool = True) -> SetupRecord:
-    """Grandfather an existing free-model guest -> inventory -> resolve inference -> record ->
+    """Settle an interrupted claim -> inventory -> resolve inference -> record ->
     broadcast. Idempotent per process: a second call returns the existing record. Never raises.
     ``announce=False`` skips the ``setup.ready`` event."""
     global _record, _started
@@ -207,11 +207,10 @@ def run_bootstrap(*, announce: bool = True) -> SetupRecord:
     except Exception:  # the next boot tries again; onboarding.state still answers live
         logger.warning("onboarding: could not record the first-install decision", exc_info=True)
     try:
-        from hermes_cli.welcome_trial import grandfather_existing_guest, settle_interrupted_claim
+        from hermes_cli.welcome_trial import settle_interrupted_claim
         settle_interrupted_claim()
-        grandfather_existing_guest()
     except Exception:  # the record still says who carries inference without it
-        logger.warning("free tier: could not check for an existing free-model guest", exc_info=True)
+        logger.warning("free tier: could not settle an interrupted claim", exc_info=True)
     record = _build_record(other=_inventory_other_providers())
     with _lock:
         _record = record
@@ -251,7 +250,7 @@ def _broadcast(record: SetupRecord) -> None:
 
 
 def start_background_bootstrap() -> threading.Thread:
-    """``hermes serve`` entry: run on a daemon thread so the inventory never delays the socket."""
+    """Run on a daemon thread so the inventory never delays the socket."""
     from agent.memory_provider import spawn_context_thread
 
     thread = spawn_context_thread(run_bootstrap, name="free-tier-bootstrap")

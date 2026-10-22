@@ -965,6 +965,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
             if ctx.moa_config is not None:
                 kwargs["moa_config"] = ctx.moa_config
+            from gateway.session_onboarding import arm_onboarding_turn
+            prelude = arm_onboarding_turn(agent, self._approval_owner, agent_history)
+            if prelude is not None and _accepts_keyword(agent.run_conversation, "prelude"):
+                kwargs["prelude"] = prelude
             if persist_user_timestamp_override is not None:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
             # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user

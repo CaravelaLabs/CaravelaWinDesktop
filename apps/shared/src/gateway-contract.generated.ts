@@ -4527,6 +4527,7 @@ export interface PluginCatalogLookupEntry {
   repo: string
   sha: string
   subdir: string
+  tier?: string
 }
 export interface CanonicalShellExecParams {
   session_id: string

@@ -232,3 +232,137 @@ def test_the_desktop_boot_work_runs_for_the_launch_profile_whichever_profile_con
         reset_hermes_home_override(token)
         free_tier_bootstrap.reset_for_tests()
     assert seen == [launch]
+
+
+@pytest.mark.asyncio
+async def test_an_exact_create_retry_from_a_socket_not_yet_declared_local_resumes_the_chat(tmp_path, monkeypatch):
+    """After a reconnect the Desktop retries ``session.create`` with the same request_id, and its
+    declaration may not have landed on the new socket yet. The retry carries the same request, so it
+    gets the same chat, which still runs as the local Desktop's; no viewer sees the stamp."""
+    from contextlib import nullcontext
+    from gateway.session_local_recovery import local_source
+    from gateway.session_policy import local_desktop_turn
+    from hermes_cli.anon_auth import on_local_desktop_backend
+
+    conn = await _connect(tmp_path, monkeypatch,
+                          config="model:\n  provider: openrouter\n  default: anthropic/claude-sonnet-4\n")
+    try:
+        await _request(conn, 1, "client.capabilities", {"desktop_local": True})
+        first = await _request(conn, 2, "session.create", {"source": "gui", "request_id": "a"})
+        assert "result" in first, first
+        conn.transport.desktop_local = False
+        retry = await _request(conn, 3, "session.create", {"source": "gui", "request_id": "a"})
+        assert "result" in retry, retry
+        stored = first["result"]["stored_session_id"]
+        assert retry["result"]["stored_session_id"] == stored
+
+        source = local_source(conn.authority, stored, conn.connection.actor.subject)
+        with local_desktop_turn(conn.runner, source, nullcontext()):
+            assert on_local_desktop_backend() is True
+        from gateway.session_local import local_session_info
+        from gateway.session_contract import SessionRef
+        info = local_session_info(conn.authority, SessionRef(conn.authority.profile_id, stored))
+        assert "desktop_local" not in info["launch_request"]
+    finally:
+        await conn.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_chat_opened_on_the_trial_moves_to_the_provider_the_user_connects(tmp_path, monkeypatch):
+    """A trial-only chat runs on the free model; once the user connects a real provider, the same
+    chat's next turn runs on that provider's model instead of asking a paid route for nous/welcome."""
+    from hermes_cli import anon_auth
+    from hermes_state_local import local_receipt
+    from gateway.session_policy import restore_policy
+    guest = {"auth_method": anon_auth.ANON_AUTH_METHOD, anon_auth.WELCOME_CLAIM_FLAG: True}
+    monkeypatch.setattr(anon_auth, "current_nous_state", lambda *a, **k: guest)
+    conn = await _connect(tmp_path, monkeypatch)
+    try:
+        await _request(conn, 1, "client.capabilities", {"desktop_local": True})
+        created = await _request(conn, 2, "session.create", {"source": "gui", "request_id": "a"})
+        stored = created["result"]["stored_session_id"]
+
+        def next_model():
+            return restore_policy(local_receipt(conn.authority.db, stored)["policy"]).current_model(conn.authority)
+
+        assert next_model() == anon_auth.GUEST_MODEL
+        (Path(conn.authority.db.db_path).parent / "config.yaml").write_text(  # the owning profile's
+            "model:\n  provider: openrouter\n  default: anthropic/claude-sonnet-4\n", encoding="utf-8")
+        assert next_model() == "anthropic/claude-sonnet-4"
+    finally:
+        await conn.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_desktop_boot_that_could_not_record_the_install_tries_again_on_the_next_connection(
+        tmp_path, monkeypatch):
+    """The gateway outlives app launches. A first boot whose install record failed (a locked
+    config.yaml) is retried when the Desktop next connects, as the per-launch ``hermes serve`` did."""
+    from hermes_cli import free_tier_bootstrap, onboarding_run
+    from tui_gateway import server
+    attempts = []
+
+    def latch():
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise OSError("config.yaml is locked")
+        return True
+
+    monkeypatch.setattr(onboarding_run, "latch_first_install", latch)
+    monkeypatch.setattr(server, "_local_desktop_boot_started", False)
+    free_tier_bootstrap.reset_for_tests()
+    conn = await _connect(tmp_path, monkeypatch)
+    try:
+        await _request(conn, 1, "client.capabilities", {"desktop_local": True})
+        assert free_tier_bootstrap.wait_for_record(timeout=20) is not None
+        await _request(conn, 2, "client.capabilities", {"desktop_local": True})
+        await async_wait_until(lambda: len(attempts) == 2, timeout=20, what="the boot ran again")
+    finally:
+        await conn.connection.close()
+        free_tier_bootstrap.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_a_desktop_chat_saved_before_the_mark_moved_still_resumes_and_runs_as_the_local_desktops(
+        tmp_path, monkeypatch):
+    """An earlier build stamped ``desktop_local`` into the frozen create request. The Desktop's exact retry
+    after a reconnect never sends it, so it still gets that chat, and the chat's turns still run as
+    work for the local Desktop."""
+    import json
+    from contextlib import nullcontext
+    from gateway.session_local import publish_local_policy
+    from gateway.session_local_recovery import local_source
+    from gateway.session_policy import local_desktop_turn
+    from hermes_cli.anon_auth import on_local_desktop_backend
+    from hermes_state_local import POLICY_PREFIX
+
+    conn = await _connect(tmp_path, monkeypatch,
+                          config="model:\n  provider: openrouter\n  default: anthropic/claude-sonnet-4\n")
+    try:
+        await _request(conn, 1, "client.capabilities", {"desktop_local": True})
+        stored = (await _request(conn, 2, "session.create", {"source": "gui", "request_id": "a"}))[
+            "result"]["stored_session_id"]
+        db = conn.authority.db
+
+        def saved_the_old_way(c):
+            key = POLICY_PREFIX + stored
+            receipt = json.loads(c.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0])
+            policy = receipt["policy"]
+            config = json.loads(policy["config_json"])
+            config.pop("desktop_local")
+            policy["config_json"] = json.dumps(config)
+            policy["request_json"] = json.dumps({**json.loads(policy["request_json"]), "desktop_local": True},
+                                                sort_keys=True)
+            c.execute("UPDATE state_meta SET value=? WHERE key=?", (json.dumps(receipt), key))
+        db._execute_write(saved_the_old_way)
+        publish_local_policy(conn.authority, stored, evict=False)  # the chat as an owner restores it
+        conn.transport.desktop_local = False
+
+        retry = await _request(conn, 3, "session.create", {"source": "gui", "request_id": "a"})
+        assert "result" in retry, retry
+        assert retry["result"]["stored_session_id"] == stored
+        source = local_source(conn.authority, stored, conn.connection.actor.subject)
+        with local_desktop_turn(conn.runner, source, nullcontext()):
+            assert on_local_desktop_backend() is True
+    finally:
+        await conn.connection.close()

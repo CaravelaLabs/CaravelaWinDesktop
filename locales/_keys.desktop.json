@@ -590,6 +590,7 @@
     "catalog.featured",
     "catalog.filters",
     "catalog.hooks",
+    "catalog.install",
     "catalog.installComplete",
     "catalog.installDescription",
     "catalog.installHint",

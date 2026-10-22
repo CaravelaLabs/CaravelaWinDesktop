@@ -215,6 +215,13 @@ def free_inference_active(state: Any = None) -> bool:
     return is_guest_state(state) and state.get(WELCOME_CLAIM_FLAG) is True and guest_allowed()
 
 
+def trial_model() -> str:
+    """The last rung of model resolution, below every model the user named (``model.default``, a cron
+    or task pin): ``nous/welcome`` while the welcome trial carries inference, else ''. Never written to
+    config.yaml, so it stops applying the moment the user configures a real model."""
+    return GUEST_MODEL if free_inference_active() else ""
+
+
 def has_free_tier_account() -> bool:
     """True when the profile's Nous identity is a guest that carries inference here.
 

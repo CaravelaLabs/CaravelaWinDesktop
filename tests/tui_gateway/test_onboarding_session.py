@@ -49,7 +49,9 @@ def client(root, monkeypatch):
 
     monkeypatch.setitem(server._methods, "session.resume", resume)
     monkeypatch.setitem(server._methods, "prompt.submit", submit)
-    return calls
+    from hermes_cli.process_identity import serving_local_desktop
+    with serving_local_desktop(True):  # the local Desktop's requests: only it starts a first run
+        yield calls
 
 
 def _call(method: str, params: dict | None = None) -> dict:
@@ -391,3 +393,10 @@ def test_the_onboarding_facts_are_read_in_the_default_profile(root, client, monk
 
     _call("onboarding.start")
     assert homes == [root]
+
+
+def test_a_start_outside_the_local_desktop_schedules_nothing(root):
+    """A CLI or TUI calling onboarding.start is refused before ``onboarding.run`` is written."""
+    from hermes_cli.onboarding_run import _explicit_run
+    assert _call("onboarding.start")["error"]["code"] == 5080
+    assert _explicit_run() is None

@@ -106,19 +106,23 @@ _local_desktop_boot_started = False
 
 
 def begin_local_desktop_boot() -> None:
-    """The local Desktop's first accepted connection to this process: record a fresh install, settle an
-    interrupted claim, the setup record and the due answer, once, as work for that Desktop."""
+    """An accepted local Desktop connection to this process: record a fresh install, settle an
+    interrupted claim, the setup record and the due answer, once, as work for that Desktop. This
+    process outlives app launches, so a later connection retries the install steps a failed boot
+    left unsettled."""
     global _local_desktop_boot_started
+    from agent.memory_provider import spawn_context_thread
     from hermes_cli import free_tier_bootstrap
     from hermes_cli.process_identity import serving_local_desktop
     from tui_gateway.launch_profile_policy import launch_profile_scope_if_multiplexed
 
     with _local_desktop_boot_lock:
-        if _local_desktop_boot_started:
-            return
-        _local_desktop_boot_started = True
+        first, _local_desktop_boot_started = not _local_desktop_boot_started, True
     # The record and the latch are the launch profile's; the connecting profile may be another one.
     with launch_profile_scope_if_multiplexed(), serving_local_desktop(True):  # threads copy this context
+        if not first:
+            spawn_context_thread(free_tier_bootstrap.resettle_after_failed_boot, name="free-tier-resettle").start()
+            return
         free_tier_bootstrap.start_background_bootstrap()
         start_due_boot()
 
@@ -152,6 +156,8 @@ def _claim_before_run(scope: dict, *, assume_fresh: bool):
     from hermes_cli import anon_auth
     from hermes_cli.onboarding_run import set_run
     from hermes_cli.welcome_trial import claim_desktop_free_tier, provider_configured
+    if not anon_auth.on_local_desktop_backend():  # gateway/session_onboarding.py::_claim_before_run
+        raise _NoModelForTheRun("First-run onboarding starts only in the Desktop app on this machine.")
     set_run(True)
     with _session_profile_runtime_scope(scope):
         claimed = claim_desktop_free_tier(assume_fresh=assume_fresh)

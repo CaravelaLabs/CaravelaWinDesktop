@@ -244,6 +244,7 @@
   "catalog.installHint": ["de","es","fr"],
   "catalog.installTitle": ["de","es","fr"],
   "catalog.installTo": ["de","es","fr"],
+  "catalog.install": ["de","es","fr"],
   "catalog.installed": ["de","es","fr"],
   "catalog.installing": ["de","es","fr"],
   "catalog.license": ["de","es","fr"],

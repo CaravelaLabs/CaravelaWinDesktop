@@ -300,3 +300,72 @@ def test_one_due_answer_walks_the_provider_ladder_once(portal, monkeypatch):
 
     assert welcome_trial.inference_available() is True  # fresh: the trial is claimable
     assert len(calls) == 1
+
+
+def _cron_model() -> str:
+    from cron.scheduler import _load_cron_job_config
+
+    return _load_cron_job_config({"id": "j", "name": "j", "prompt": "x"}, "j", "j").model
+
+
+def _kanban_worker_model(monkeypatch, tmp_path) -> str:
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.config import load_config
+    from hermes_cli.kanban_db_connect import connect
+    from hermes_constants import get_hermes_home
+    from gateway.session_contract import Principal
+    from gateway.session_kanban import build_kanban_policy
+    from gateway.session_policy import restore_policy
+
+    home = str(get_hermes_home())
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda name: home)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb.create_board("trial")
+    with closing(connect(board="trial")) as conn:
+        task_id = kb.create_task(conn, title="t", assignee="default", workspace_kind="dir", workspace_path=str(workspace))
+        kb.recompute_ready(conn)
+        task = kb.claim_task(conn, task_id)
+    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=home), native_owner=True,
+                                 actor=Principal("owner", home, frozenset({"session:create"}), "transport"))
+    params = dict(board="trial", task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
+    policy, _ = build_kanban_policy(connection, params, load_config())
+    return restore_policy(asdict(policy)).model
+
+
+@pytest.fixture
+def unconfigured_trial(portal, monkeypatch):
+    """A fresh install whose Desktop claimed the trial, read by the scheduler or the Kanban
+    dispatcher (not Desktop work), with no model configured anywhere."""
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    claimed_trial(monkeypatch)
+    off_local_desktop(monkeypatch)
+    yield
+    from hermes_cli.config import load_config
+    assert not (load_config().get("model") or {}).get("default")  # never persisted: a later provider wins
+
+
+def test_a_claimed_trial_runs_a_default_cron_job_when_no_model_is_configured(unconfigured_trial):
+    assert _cron_model() == anon_auth.GUEST_MODEL
+
+
+def test_a_claimed_trial_runs_a_kanban_worker_when_no_model_is_configured(unconfigured_trial, monkeypatch, tmp_path):
+    assert _kanban_worker_model(monkeypatch, tmp_path) == anon_auth.GUEST_MODEL
+
+
+def test_a_configured_model_beats_the_trial_for_cron_jobs_and_kanban_workers(portal, monkeypatch, tmp_path):
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    claimed_trial(monkeypatch)
+    off_local_desktop(monkeypatch)
+    (get_hermes_home() / "config.yaml").write_text(
+        "model:\n  provider: openrouter\n  default: anthropic/claude-sonnet-4\n", encoding="utf-8")
+
+    assert _cron_model() == "anthropic/claude-sonnet-4"
+    assert _kanban_worker_model(monkeypatch, tmp_path) == "anthropic/claude-sonnet-4"

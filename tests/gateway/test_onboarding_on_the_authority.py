@@ -56,7 +56,9 @@ async def _desktop(tmp_path, monkeypatch, turns):
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id=str(home), instance_id="owner")
     transport = _Transport()
-    identity = {"user_id": "uid:1", "provider": "local", "profile_id": str(home), "instance_id": "owner"}
+    identity = {"user_id": "uid:1", "provider": "local", "profile_id": str(home), "instance_id": "owner",
+                "native_bootstrap": True}
+    transport.desktop_local = True  # the Desktop's accepted ``client.capabilities {desktop_local}``
     connection = AuthorityConnection(authority, transport, identity)
     from gateway.session_local_migration import bind_native_transport
     bind_native_transport(authority, connection.actor, identity)
@@ -229,7 +231,9 @@ async def test_start_from_a_secondary_profile_claims_in_the_default_home(tmp_pat
         "user_id": "uid:1", "provider": "local", "profile_id": str(work), "instance_id": "owner",
         "profile_scope": "host"})
     try:
-        started = await connection.dispatch({"jsonrpc": "2.0", "id": 1, "method": "onboarding.start", "params": {}})
+        from hermes_cli.process_identity import serving_local_desktop
+        with serving_local_desktop(True):  # what ws._dispatch_request binds for the declared Desktop socket
+            started = await connection.dispatch({"jsonrpc": "2.0", "id": 1, "method": "onboarding.start", "params": {}})
         assert "result" in started, started
         assert claims == [home]
         assert started["result"]["stored_session_id"] in desktop.authority.sessions
@@ -262,11 +266,22 @@ async def test_deleting_the_onboarding_chat_from_the_sidebar_ends_the_run(tmp_pa
         stored = (await _request(desktop, 1, "onboarding.start", {"rerun": True}))["result"]["stored_session_id"]
         await async_wait_until(lambda: turns, timeout=10)
         await _settled(desktop, stored)
-        row = desktop.db.get_session(stored)
-        deleted = await _request(desktop, 2, "session.mutate", {
-            "session_id": stored, "request_id": "delete-onboarding", "expected_revision": row["runtime_revision"],
-            "expected_generation": row["runtime_generation"], "operation": "delete", "payload": {}})
-        assert "result" in deleted, deleted
+        replies = []
+
+        async def delete_at_the_current_revision():
+            # The settlement can still bump the revision after the lease releases; the Desktop
+            # re-reads and resends on a conflict, so the test does too.
+            row = desktop.db.get_session(stored)
+            replies.append(await _request(desktop, 2 + len(replies), "session.mutate", {
+                "session_id": stored, "request_id": f"delete-onboarding-{len(replies)}",
+                "expected_revision": row["runtime_revision"], "expected_generation": row["runtime_generation"],
+                "operation": "delete", "payload": {}}))
+            return "result" in replies[-1] or replies[-1].get("error", {}).get("data", {}).get("reason") != "revision_conflict"
+
+        for _ in range(5):
+            if await delete_at_the_current_revision():
+                break
+        assert "result" in replies[-1], replies
         assert [e["outcome"] for e in ended if e["stored_session_id"] == stored] == ["deleted"]
         assert read_user_config_raw(_root_config())["onboarding"]["run"] is False
     finally:
@@ -296,4 +311,114 @@ async def test_a_fresh_launch_deletes_the_chat_the_last_launch_left_with_no_view
         assert desktop.db.get_session(first) is None
         assert first not in desktop.authority.sessions
     finally:
+        await desktop.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_onboarding_start_from_a_client_that_is_not_the_local_desktop_changes_nothing(tmp_path, monkeypatch):
+    """A CLI or TUI holds a native ticket too. Its ``onboarding.start`` is refused before the install
+    flag is written, so it never schedules first-run onboarding for the Desktop."""
+    from hermes_cli.onboarding_run import _explicit_run
+    desktop = await _desktop(tmp_path, monkeypatch, [])
+    desktop.transport.desktop_local = False
+    try:
+        refused = await _request(desktop, 1, "onboarding.start", {"facts_source": "local", "locale": "en"})
+        assert "error" in refused, refused
+        assert _explicit_run() is None
+        assert desktop.authority.sessions == {}
+    finally:
+        await desktop.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_window_that_reopens_the_old_chat_while_a_fresh_launch_starts_keeps_it(tmp_path, monkeypatch):
+    """The start decided the old chat had no viewer, then another window resumed it before the delete
+    ran: the chat stays with its messages, and its run ends as replaced."""
+    from agent import onboarding_record
+    from gateway.session_controls import AuthorityConnection
+    turns = []
+    desktop = await _desktop(tmp_path, monkeypatch, turns)
+    first = (await _request(desktop, 1, "onboarding.start", {"rerun": True}))["result"]["stored_session_id"]
+    await async_wait_until(lambda: turns, timeout=10)
+    await _settled(desktop, first)
+    desktop.db.append_message(first, "user", "Call me Sid.")  # the answer the user gave the name card
+    messages = desktop.db.get_messages(first)
+    await desktop.connection.close()
+    identity = {"user_id": "uid:1", "provider": "local", "profile_id": desktop.authority.profile_id,
+                "instance_id": "owner"}
+    desktop.connection = AuthorityConnection(desktop.authority, desktop.transport, identity)
+    other = AuthorityConnection(desktop.authority, _Transport(), identity)
+    loop, resumed, record_new_run = asyncio.get_running_loop(), [], onboarding_record.start
+
+    def new_run_then_another_window_resumes(db, stored, facts):
+        record_new_run(db, stored, facts)
+        resumed.append(asyncio.run_coroutine_threadsafe(other.dispatch({
+            "jsonrpc": "2.0", "id": 9, "method": "session.resume", "params": {"session_id": first}}),
+            loop).result(timeout=20))
+    monkeypatch.setattr(onboarding_record, "start", new_run_then_another_window_resumes)
+    try:
+        second = (await _request(desktop, 2, "onboarding.start", {"fresh_launch": True}))["result"]
+        assert second["stored_session_id"] != first
+        assert "result" in resumed[0], resumed
+        assert desktop.db.get_messages(first) == messages
+        assert (onboarding_record.load(desktop.db, first) or {}).get("ended_by") == "replaced"
+        assert first in desktop.authority.sessions
+    finally:
+        await other.close()
+        await desktop.connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_window_whose_resume_reads_history_while_a_fresh_launch_claims_the_chat_keeps_it(tmp_path, monkeypatch):
+    """Another window's resume was reading the old chat's history when the fresh launch's start found
+    the chat unwatched and claimed it; the resume finished before the delete ran. The chat stays with its
+    messages, and its run ends as replaced."""
+    import threading
+    from agent import onboarding_record
+    from gateway import session_local_recovery
+    from gateway.session_controls import AuthorityConnection
+    turns = []
+    desktop = await _desktop(tmp_path, monkeypatch, turns)
+    first = (await _request(desktop, 1, "onboarding.start", {"rerun": True}))["result"]["stored_session_id"]
+    await async_wait_until(lambda: turns, timeout=10)
+    await _settled(desktop, first)
+    desktop.db.append_message(first, "user", "Call me Sid.")
+    messages = desktop.db.get_messages(first)
+    await desktop.connection.close()
+    identity = {"user_id": "uid:1", "provider": "local", "profile_id": desktop.authority.profile_id,
+                "instance_id": "owner"}
+    desktop.connection = AuthorityConnection(desktop.authority, desktop.transport, identity)
+    other = AuthorityConnection(desktop.authority, _Transport(), identity)
+    reading, release, resume_done = threading.Event(), threading.Event(), threading.Event()
+    read_rows = session_local_recovery.display_rows
+
+    def history_read_held_open(db, target):
+        if not reading.is_set():
+            reading.set()
+            assert release.wait(timeout=20), "the history read was never released"
+        return read_rows(db, target)
+
+    record_new_run = onboarding_record.start
+
+    def new_run_then_the_resume_finishes(db, stored, facts):
+        record_new_run(db, stored, facts)
+        release.set()
+        assert resume_done.wait(timeout=20), "the resume never finished"
+
+    monkeypatch.setattr(session_local_recovery, "display_rows", history_read_held_open)
+    resume = asyncio.ensure_future(other.dispatch({
+        "jsonrpc": "2.0", "id": 9, "method": "session.resume", "params": {"session_id": first}}))
+    resume.add_done_callback(lambda _: resume_done.set())
+    try:
+        await async_wait_until(reading.is_set, timeout=10)
+        monkeypatch.setattr(onboarding_record, "start", new_run_then_the_resume_finishes)
+        second = (await _request(desktop, 2, "onboarding.start", {"fresh_launch": True}))["result"]
+        assert second["stored_session_id"] != first
+        assert "result" in (await resume), resume.result()
+        assert desktop.db.get_messages(first) == messages
+        assert (onboarding_record.load(desktop.db, first) or {}).get("ended_by") == "replaced"
+        assert first in desktop.authority.sessions
+    finally:
+        release.set()
+        await other.close()
         await desktop.connection.close()

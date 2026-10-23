@@ -709,7 +709,7 @@ def _run_nous_portal_login_only(*, capability: str) -> bool:
                 else:
                     auth_store.pop("active_provider", None)
                 auth._save_auth_store(auth_store)
-            auth._write_shared_nous_state(auth_state)
+            auth._write_shared_nous_state(auth_state, renewal=False)
         auth._sync_nous_pool_from_auth_store()
         settle_after_upgrade(auth_state)  # a config left on the free tier's route moves to the account
         print("  Nous Portal login successful.")

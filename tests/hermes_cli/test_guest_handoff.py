@@ -134,7 +134,7 @@ def _sibling_adoption(account, monkeypatch, tmp_path):
     sibling.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(sibling))
     monkeypatch.setattr(auth_nous, "drain", lambda: None)   # the sibling's own run is not this test
-    auth_nous._write_shared_nous_state(account)
+    auth_nous._write_shared_nous_state(account, renewal=False)
     monkeypatch.setattr(auth_nous, "drain", guest_handoff.drain)
     monkeypatch.setenv("HERMES_HOME", mine)
     anon_auth.ensure_portal_identity(explicit=True)

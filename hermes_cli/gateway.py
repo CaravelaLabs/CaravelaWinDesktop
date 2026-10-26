@@ -1086,13 +1086,13 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
     # cwd/env overlay are embedded as JSON literals in the watcher source (no extra argv plumbing).
     watcher = textwrap.dedent(
         """
+        import sys
+        if sys.path[:1] == [""]: del sys.path[0]  # -c puts the cwd first: never import from it
         import os
         import subprocess
-        import sys
         import time
-        # Stdlib-only imports: the watcher runs on the updater's interpreter, which after the
-        # package-manager handoff is the bare store Python without the dependency environment.
-        # ``-c`` only puts the cwd on sys.path, so name the checkout explicitly.
+        # Stdlib-only imports: after the package-manager handoff this is the bare store Python;
+        # name the checkout explicitly.
         sys.path.insert(0, {project_root_literal})
         from hermes_cli._subprocess_compat import (
             _WINDOWS_GATEWAY_BREAKAWAY_ENV, pid_exists_stdlib, windows_detach_flags,

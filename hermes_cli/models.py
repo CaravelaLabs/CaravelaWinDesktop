@@ -1930,8 +1930,9 @@ def _credential_fingerprint(provider: str) -> str:
         ]
 
     def _mtime_part(label: str, path) -> None:
+        from utils import file_cache_version  # hashed every time: keys a disk cache later processes read
         try:
-            parts.append(f"{label}@{os.stat(path).st_mtime_ns}")
+            parts.append(f"{label}@{file_cache_version(path, always_digest=True)}")
         except FileNotFoundError:
             parts.append(f"{label}@missing")
         except Exception:
@@ -1939,7 +1940,6 @@ def _credential_fingerprint(provider: str) -> str:
 
     if provider == "openai-codex":
         from hermes_cli.codex_models import codex_catalog_credential_identity
-
         parts.append(f"codex_identity={codex_catalog_credential_identity()}")
     else:
         try:

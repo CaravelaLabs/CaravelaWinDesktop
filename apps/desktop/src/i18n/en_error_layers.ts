@@ -9,7 +9,7 @@ export const enErrorLayers: Pick<ThreadCopy, 'errorLayerBodies' | 'errorLayers'>
     billing: 'Out of credits',
     disk: 'Disk full',
     endpoint: "Can't reach your model server",
-    gateway: 'Caravela hit a problem',
+    gateway: "Couldn't send your message",
     generic: "Caravela couldn't finish this reply",
     provider: 'The AI service returned an error',
     runtime: 'Caravela hit a problem',

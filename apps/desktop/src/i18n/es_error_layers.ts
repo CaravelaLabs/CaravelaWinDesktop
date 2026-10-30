@@ -9,7 +9,7 @@ export const esErrorLayers: Pick<ThreadCopy, 'errorLayerBodies' | 'errorLayers'>
     billing: 'Créditos agotados',
     disk: 'Disco lleno',
     endpoint: 'No se puede conectar con tu servidor de modelos',
-    gateway: 'Caravela tuvo un problema',
+    gateway: 'No se pudo enviar tu mensaje',
     generic: 'Caravela no pudo terminar esta respuesta',
     provider: 'El servicio de IA devolvió un error',
     runtime: 'Caravela tuvo un problema',

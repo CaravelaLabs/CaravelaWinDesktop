@@ -2058,6 +2058,10 @@ export const zhOverrides = {
     changesApplyNewSessions: '更改将应用于新会话。',
     skillUpdated: '技能已更新',
     edit: '编辑',
+    lock: '锁定',
+    locked: '已锁定',
+    lockHint: '锁定期间，智能体无法更改此技能。你仍可以自己编辑。',
+    unlockedHint: '锁定后，智能体将无法更改此技能。你仍可以自己编辑。',
     archive: '归档',
     skillArchivedTitle: '技能已归档',
     skillArchivedMessage: '可通过 hermes curator restore 恢复。',
@@ -4085,6 +4089,14 @@ export const zhOverrides = {
     terminalNew: '新建终端',
     terminalCloseOthers: '关闭其他',
     terminalCloseAll: '关闭全部',
+    terminalNewOn: '新建终端于…',
+    terminalGatewayRemoved: '已移除的网关',
+    terminalGatewayRemovedBody:
+      '此终端所在的网关已被移除，无法重新打开。请关闭此标签页。',
+    terminalGatewayNoShellBody:
+      '此网关不提供 Shell 访问，此终端无法重新打开。请关闭此标签页。',
+    terminalDisconnectedBody:
+      '终端已断开。按 Enter 启动新的 shell；滚动记录会保留。',
     addToChat: '添加到对话'
   },
 

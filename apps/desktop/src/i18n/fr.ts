@@ -2463,6 +2463,12 @@ export const frOverrides = {
     changesApplyNewSessions: "Les modifications s'appliquent aux nouvelles sessions.",
     skillUpdated: 'Skill mis à jour',
     edit: 'Modifier',
+    lock: 'Verrouiller',
+    locked: 'Verrouillé',
+    lockHint:
+      'L’agent ne peut pas modifier ce skill tant qu’il est verrouillé. Vous pouvez toujours le modifier vous-même.',
+    unlockedHint:
+      'Verrouillez-le pour que l’agent ne puisse pas modifier ce skill. Vous pouvez toujours le modifier vous-même.',
     archive: 'Archiver',
     skillArchivedTitle: 'Skill archivé',
     skillArchivedMessage: 'Restaurable via hermes curator restore.',
@@ -4680,6 +4686,14 @@ export const frOverrides = {
     terminalNew: 'Nouveau terminal',
     terminalCloseOthers: 'Fermer les autres',
     terminalCloseAll: 'Tout fermer',
+    terminalNewOn: 'Nouveau terminal sur…',
+    terminalGatewayRemoved: 'Passerelle supprimée',
+    terminalGatewayRemovedBody:
+      'La passerelle sur laquelle ce terminal tournait a été supprimée ; il ne peut pas être rouvert. Fermez cet onglet.',
+    terminalGatewayNoShellBody:
+      'Cette passerelle n’offre pas d’accès shell ; ce terminal ne peut pas être rouvert. Fermez cet onglet.',
+    terminalDisconnectedBody:
+      'Terminal déconnecté. Appuyez sur Entrée pour démarrer un nouveau shell ; l’historique est conservé.',
     addToChat: 'Ajouter à la conversation'
   },
   preview: {

@@ -2457,6 +2457,11 @@ export const deOverrides = {
     changesApplyNewSessions: 'Änderungen gelten für neue Sessions.',
     skillUpdated: 'Skill aktualisiert',
     edit: 'Bearbeiten',
+    lock: 'Sperren',
+    locked: 'Gesperrt',
+    lockHint:
+      'Der Agent kann diesen Skill nicht ändern, solange er gesperrt ist. Du kannst ihn weiterhin selbst bearbeiten.',
+    unlockedHint: 'Sperren, damit der Agent diesen Skill nicht ändert. Du kannst ihn weiterhin selbst bearbeiten.',
     archive: 'Archivieren',
     skillArchivedTitle: 'Skill archiviert',
     skillArchivedMessage: 'Wiederherstellbar über „hermes curator restore“.',
@@ -4671,6 +4676,14 @@ export const deOverrides = {
     terminalNew: 'Neues Terminal',
     terminalCloseOthers: 'Andere schließen',
     terminalCloseAll: 'Alle schließen',
+    terminalNewOn: 'Neues Terminal auf…',
+    terminalGatewayRemoved: 'Entfernter Gateway',
+    terminalGatewayRemovedBody:
+      'Der Gateway, auf dem dieses Terminal lief, wurde entfernt; es kann nicht wieder geöffnet werden. Schließe diesen Tab.',
+    terminalGatewayNoShellBody:
+      'Dieser Gateway bietet keinen Shell-Zugang; dieses Terminal kann nicht wieder geöffnet werden. Schließe diesen Tab.',
+    terminalDisconnectedBody:
+      'Terminal getrennt. Drücke Enter, um eine neue Shell zu starten; der Verlauf bleibt erhalten.',
     addToChat: 'Zum Chat hinzufügen'
   },
   preview: {

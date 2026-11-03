@@ -145,7 +145,29 @@ PM prepares core requirements, enabled extras, and enabled plugin requirements
 together. It seeds resolution from the existing lock. Compatible transitive
 versions can change, but declared constraints and exact pins remain binding.
 Each candidate gets a fresh workspace with explicit source, lock seed, and
-prepared environment inputs. The generated workspace and extended lock remain
+prepared environment inputs. Plugin snapshots keep a plugin's runtime dependencies
+and the optional extras this install selects (or the plugin's own requirements name);
+its `dependency-groups`, legacy uv development dependencies and unselected extras
+(`dev`, `test`) are left out, together with the `tool.uv.sources` entries scoped to
+them, because PM never installs them yet uv would still
+resolve them against core's pins. The original plugin metadata and core development
+pins are unchanged; genuine runtime conflicts still refuse admission. A plugin with no
+build backend gets a unique `hermes-plugin-…` name in its snapshot, and its references to
+its own extras (`myplugin[runtime]`) are renamed with it. Hermes itself always comes from
+the checkout: a plugin requirement naming `hermes-agent` (a runtime dependency in
+`pyproject.toml` or `plugin.yaml`, or an extra this install selects, such as
+`hermes-agent[web]>=0.20`) is satisfied by it, whatever its version specifier says. PM
+therefore checks that specifier itself against the running Hermes version (the one
+`requires_hermes` reads), with standard PEP 440 comparison and the requirement's environment
+marker; a requirement in an unselected extra or one whose marker is false on this machine is
+not checked, and with no known version (`unknown`) nothing is. A plugin that excludes the
+running version is treated like one whose `requires_hermes` does: enabling or installing it is
+refused, and one already enabled is left out of the environment and skipped at load, with its
+config untouched, until Hermes reaches a version it accepts. The two checks compare differently:
+`requires_hermes` compares only `major.minor.patch` (pre/post-release suffixes are dropped, and a
+clause it cannot parse passes), while a `hermes-agent` requirement is compared as any Python
+requirement would be (`>=0.27.0.post1` excludes 0.27.0). Either one can keep a plugin out.
+The generated workspace and extended lock remain
 outside shipped source. The workspace is solved only for the platform and
 architecture of the interpreter it installs into, so a plugin dependency with no
 wheels for another platform (onnxruntime or torch on Android) does not block it;
@@ -170,6 +192,18 @@ plugin updates can change the selected plugin's files. A wrapper with no Python
 dependency declaration does not join the shared environment. Its external
 sidecar remains separately owned. See the
 [plugin guide](../developer-guide/plugins/index.md).
+
+The first PM generation that replaces a pre-PM `venv/` or `.venv` also carries
+the extras that venv held (Matrix, FAL, ...), so features that worked keep
+working. Those extras are carried, not requested: if one no longer builds (a
+native package such as Matrix's `python-olm` whose compiler or CMake is
+missing), the update installs everything else, prints which extra it left out,
+and records that beside the install's dependency state, so a later scan of the
+old venv does not carry it again. `hermes pm install --extra NAME` adds it back
+once the build is fixed. A carried extra that fails only for the moment (a
+download or a missing tool) is never dropped: the update fails before it
+publishes anything, so the next update scans the old venv again and retries
+it. An extra you request yourself still fails the install when it cannot build.
 
 ### Lazy-install policy
 

@@ -4453,6 +4453,24 @@
       }
     },
     {
+      "name": "vault.preview.fill",
+      "summary": "Fill a saved login into the in-app browser tab the renderer pinned (never submits).",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/VaultPreviewFillParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VaultPreviewFillResult"
+        }
+      }
+    },
+    {
       "name": "vault.remove",
       "summary": "Remove a local vault item by id.",
       "params": [
@@ -29649,6 +29667,17 @@
             ],
             "default": null,
             "title": "Allow Shortcut"
+          },
+          "vault": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviewVaultOperation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -29776,6 +29805,50 @@
           "text"
         ],
         "title": "PreviewRestartProgressPayload",
+        "type": "object"
+      },
+      "PreviewVaultOperation": {
+        "additionalProperties": false,
+        "description": "Internal vault transport, never arguments exposed to the model.",
+        "properties": {
+          "operation": {
+            "enum": [
+              "open",
+              "evaluate",
+              "close"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target"
+          },
+          "expression": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expression"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "PreviewVaultOperation",
         "type": "object"
       },
       "ProcessEntry": {
@@ -47500,6 +47573,21 @@
             "default": null,
             "title": "Has Otp"
           },
+          "allowed_origins": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allowed Origins"
+          },
           "backend": {
             "title": "Backend",
             "type": "string"
@@ -47578,6 +47666,101 @@
           }
         },
         "title": "VaultLockResult",
+        "type": "object"
+      },
+      "VaultPreviewFillParams": {
+        "additionalProperties": false,
+        "description": "``target`` is the opaque binding the renderer minted for one in-app browser tab.",
+        "properties": {
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "handle": {
+            "title": "Handle",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "handle",
+          "target"
+        ],
+        "title": "VaultPreviewFillParams",
+        "type": "object"
+      },
+      "VaultPreviewFillResult": {
+        "additionalProperties": false,
+        "description": "Counts and the page origin only: never a secret.",
+        "properties": {
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          },
+          "filled_fields": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Filled Fields"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Origin"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          }
+        },
+        "required": [
+          "success"
+        ],
+        "title": "VaultPreviewFillResult",
         "type": "object"
       },
       "VaultRemoveParams": {

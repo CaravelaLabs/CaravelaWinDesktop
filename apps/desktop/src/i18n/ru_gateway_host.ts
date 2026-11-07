@@ -6,7 +6,14 @@ export const ruGatewayHost: GatewayHostTranslations = {
   unavailableDesc: 'IPC-мост приложения не предоставляет настройки шлюза.',
   webappHostTitle: 'Хост Caravela',
   webappHostDesc:
-    'Webapp всегда использует хост Caravela, который его обслуживает. Чтобы сменить шлюз, войти в Caravela Cloud или управлять сохранёнными подключениями, используйте приложение Caravela Desktop.',
+    'Webapp всегда работает на хосте Caravela, который её обслуживает. Сохранённые подключения ниже — список этого компьютера, общий с приложением Caravela Desktop; другие шлюзы доступны через этот хост.',
+  webappOauthPaste: {
+    title: 'Завершить вход',
+    description: 'Если вкладка входа остановилась на адресе, который не открывается (этот браузер не на компьютере шлюза), вставьте этот адрес сюда.',
+    placeholder: 'http://127.0.0.1:…/webapp/gateway-connections/oauth/callback?…',
+    finish: 'Завершить',
+    failed: 'Не удалось завершить вход'
+  },
   webAccess: {
     title: 'Веб-доступ',
     intro: 'Откройте Caravela этого компьютера с телефона или другого компьютера, войдя через аккаунт Nous. Вошедший может запускать команды на этом компьютере.',

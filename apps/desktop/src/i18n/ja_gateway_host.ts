@@ -6,7 +6,14 @@ export const jaGatewayHost: GatewayHostTranslations = {
   unavailableDesc: 'デスクトップ IPC ブリッジはゲートウェイ設定を公開していません。',
   webappHostTitle: 'Caravela ホスト',
   webappHostDesc:
-    'Webapp は常に配信元の Caravela ホストを使用します。ゲートウェイの切り替え、Caravela Cloud へのサインイン、保存済み接続の管理は Caravela Desktop アプリで行ってください。',
+    'Webapp は常にそれを配信する Caravela ホスト上で動作します。下の保存済み接続はこのマシンの一覧で、Caravela Desktop アプリと共有されます。他のゲートウェイにはこのホスト経由で接続します。',
+  webappOauthPaste: {
+    title: 'サインインを完了',
+    description: 'サインインのタブが読み込めないアドレスで止まった場合（このブラウザがゲートウェイのマシン上にない場合）、そのアドレスをここに貼り付けてください。',
+    placeholder: 'http://127.0.0.1:…/webapp/gateway-connections/oauth/callback?…',
+    finish: '完了',
+    failed: 'サインインを完了できませんでした'
+  },
   webAccess: {
     title: 'Web アクセス',
     intro: 'スマートフォンや別のコンピューターから、Nous アカウントでサインインしてこのコンピューターの Caravela を開きます。サインインした人はこのコンピューターでコマンドを実行できます。',

@@ -280,6 +280,40 @@ def test_observed_group_context_preserves_slash_command_text_for_dispatch():
     assert "observed Telegram group context" in attributed.channel_prompt
 
 
+def test_observe_mode_commands_and_text_turns_share_one_group_session():
+    """Regression: in a non-forum observe chat a slash command kept the sender id for slash access
+    checks, so the default ``group_sessions_per_user`` keyed it to a per-user session; ``/new``,
+    ``/model`` and skill commands acted on a session the observed transcript never reached."""
+    from gateway.config import GatewayConfig
+    from gateway.session import build_session_context, build_session_context_prompt, build_session_key
+
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"], group_allowed_chats=["-100"],
+                            observe_unmentioned_group_messages=True)
+    seen = []
+    adapter.handle_message = AsyncMock(side_effect=seen.append)
+    adapter._enqueue_text_event = seen.append
+    adapter._ensure_forum_commands = AsyncMock()
+    text, command = "@hermes_bot summarise the chat", "/new@hermes_bot"
+
+    async def _run():
+        await adapter._handle_text_message(SimpleNamespace(
+            update_id=1, message=_group_message(text, entities=[_mention_entity(text)]), effective_message=None), None)
+        await adapter._handle_command(SimpleNamespace(
+            update_id=2, message=_group_message(command, entities=[_bot_command_entity(command, command)]),
+            effective_message=None), None)
+
+    asyncio.run(_run())
+    text_turn, command_turn = seen
+    assert command_turn.message_type == MessageType.COMMAND and command_turn.source.user_id == "111"
+    observed = adapter._telegram_group_observe_shared_source(command_turn.source)
+    restored = SessionSource.from_dict(command_turn.source.to_dict())
+    keys = {build_session_key(s) for s in (text_turn.source, command_turn.source, observed, restored)}
+    assert len(keys) == 1, keys
+    config = GatewayConfig()
+    assert build_session_context_prompt(build_session_context(command_turn.source, config)) == (
+        build_session_context_prompt(build_session_context(text_turn.source, config)))
+
+
 def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkeypatch):
     from gateway.run import GatewayRunner
 
@@ -1228,3 +1262,41 @@ async def test_photo_batch_addressed_to_the_bot_keeps_the_silence_notice():
     turn_ctx.reply_expected = pending["album"].reply_expected
     await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
     assert "silence marker" in runner._deliver_queued_first_response.await_args.args[0]
+
+
+def test_rich_message_wake_word_or_mention_in_group_is_dispatched():
+    """A text-less ``rich_message`` group message carrying the wake word or @handle is addressed to the bot: it
+    passes the trigger gate (not dropped or merely observed) and the agent gets the flattened text."""
+    adapter = _make_adapter(require_mention=True, mention_patterns=[r"\bchompy\b"],
+                            observe_unmentioned_group_messages=True)
+    msg = _group_message(None)
+    msg.api_kwargs = {"rich_message": {"blocks": [
+        {"type": "paragraph", "text": "chompy, summarise this"},
+        {"type": "paragraph", "text": "second paragraph"}]}}
+    other = _group_message(None)
+    other.api_kwargs = {"rich_message": {"blocks": [{"type": "paragraph", "text": "side chatter"}]}}
+
+    assert adapter._should_process_message(msg) is True
+    assert adapter._build_message_event(msg, MessageType.TEXT).text == "chompy, summarise this\nsecond paragraph"
+    assert adapter._should_process_message(other) is False
+    mentioned = _group_message(None)
+    mentioned.api_kwargs = {"rich_message": {"blocks": [{"type": "paragraph", "text": "@hermes_bot look"}]}}
+    assert adapter._should_process_message(mentioned) is True
+
+
+def test_rich_message_handle_inside_code_span_does_not_wake_the_bot():
+    """A rich-only group message that pastes the bot handle as ``code`` is not a mention, exactly like
+    plain text whose @handle sits under a ``code`` entity; the same handle outside code still wakes it."""
+    adapter = _make_adapter(require_mention=True)
+    plain = _group_message("run @hermes_bot to test", entities=[SimpleNamespace(type="code", offset=4, length=11)])
+    in_code = _group_message(None)
+    in_code.api_kwargs = {"rich_message": {"blocks": [
+        {"type": "paragraph", "text": ["run ", {"type": "code", "text": "@hermes_bot"}, " to test"]},
+        {"type": "pre", "text": "@hermes_bot --help"}]}}
+    outside = _group_message(None)
+    outside.api_kwargs = {"rich_message": {"blocks": [
+        {"type": "paragraph", "text": ["@hermes_bot run ", {"type": "code", "text": "make"}]}]}}
+
+    assert adapter._should_process_message(plain) is False
+    assert adapter._should_process_message(in_code) is False
+    assert adapter._should_process_message(outside) is True

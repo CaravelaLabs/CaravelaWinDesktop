@@ -23,9 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      # Node + pnpm at the versions pinned in pm/lock.json (upstream refuses npm).
+      - uses: ./.github/actions/setup-pm
         with:
-          node-version: 22
+          toolchain: node
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -33,11 +34,12 @@ jobs:
         with:
           workspaces: apps/bootstrap-installer/src-tauri
 
-      - name: Install npm deps
-        run: npm install --no-audit --no-fund
+      - name: Install deps
+        working-directory: .
+        run: pnpm install --frozen-lockfile --filter "{./apps/bootstrap-installer}..."
 
       - name: Build setup exe (no bundle — we only need the raw binary)
-        run: npm run tauri:build -- --no-bundle
+        run: pnpm exec tauri build --no-bundle
 
       - name: Collect exe
         shell: pwsh

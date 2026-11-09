@@ -73,12 +73,12 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
-    gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
-    SendResult, resolve_proxy_url, proxy_kwargs_for_aiohttp, ssrf_redirect_guard,
+    gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, transcode_to_ogg_opus,
+    SendResult, resolve_proxy_url, proxy_kwargs_for_aiohttp, safe_proxy_url_for_log, ssrf_redirect_guard, describe_proxy_error,
 )
-from gateway.platforms.base import transcode_to_ogg_opus
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import ThreadParticipationTracker
+from plugins.platforms.matrix.session_proxy import matrix_redaction_proxy
 from plugins.platforms.matrix.voice_mention import ParkedVoices, VoiceGate, has_voice_marker, is_voice_event
 
 logger = logging.getLogger(__name__)
@@ -485,7 +485,7 @@ def _create_matrix_session(proxy_url: str | None):
             return aiohttp.ClientSession(connector=ProxyConnector.from_url(proxy_url, rdns=True))
         except ImportError:
             logger.warning(
-                "aiohttp_socks not installed — SOCKS proxy %s ignored. Run: pip install aiohttp-socks", proxy_url)
+                "aiohttp_socks not installed — SOCKS proxy %s ignored. Run: pip install aiohttp-socks", safe_proxy_url_for_log(proxy_url))
             return aiohttp.ClientSession(trust_env=gateway_trust_env())
     return aiohttp.ClientSession(proxy=proxy_url)
 
@@ -879,7 +879,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._reaction_redaction_tasks: set[asyncio.Task] = set()
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
         if self._proxy_url:
-            logger.info("Matrix: proxy configured — %s", self._proxy_url)
+            logger.info("Matrix: proxy configured — %s", safe_proxy_url_for_log(self._proxy_url))
         self._max_media_bytes = _env_number("MATRIX_MAX_MEDIA_BYTES", 100 * 1024 * 1024, int)
         # Text batching merges client-side splits (~4000 chars) of one long message.
         self._text_batch_delay_seconds = float(os.getenv("HERMES_MATRIX_TEXT_BATCH_DELAY_SECONDS", "0.6"))
@@ -1121,8 +1121,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 if resolved_user_id:
                     self._user_id = str(resolved_user_id)
                     client.mxid = UserID(self._user_id)
-                # The configured device_id wins when whoami() reports none, but a token can
-                # only upload keys for its own device — on conflict whoami() wins, loudly.
+                # Configured device_id wins when whoami() reports none; on conflict whoami() wins, loudly.
                 if resolved_device_id and self._device_id and resolved_device_id != self._device_id:
                     logger.error(
                         "Matrix: MATRIX_DEVICE_ID=%s does not match the device this access token "
@@ -1155,8 +1154,9 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: using access token for %s%s", self._user_id or "(unknown user)",
                     f" (device {effective_device_id})" if effective_device_id else "")
             except Exception as exc:
-                logger.error(
-                    "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s", exc, exc_info=True)
+                proxy_error = describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver))
+                logger.error("Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER: %s",
+                             proxy_error or exc, exc_info=not proxy_error)
                 return await self._abort_connect(api)
         elif self._password and self._user_id:
             try:
@@ -1167,7 +1167,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     client.device_id = resp.device_id
                 logger.info("Matrix: logged in as %s", self._user_id)
             except Exception as exc:
-                logger.error("Matrix: login failed — %s", exc)
+                logger.error("Matrix: login failed — %s", describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver)) or exc)
                 return await self._abort_connect(api)
         else:
             logger.error("Matrix: need MATRIX_ACCESS_TOKEN or MATRIX_USER_ID + MATRIX_PASSWORD")
@@ -1305,7 +1305,7 @@ class MatrixAdapter(BasePlatformAdapter):
             else:
                 logger.warning("Matrix: initial sync returned unexpected type %s", type(sync_data).__name__)
         except Exception as exc:
-            logger.warning("Matrix: initial sync error: %s", exc)
+            logger.warning("Matrix: initial sync error: %s", describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver)) or exc)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._device_id_unverified = False
@@ -1876,9 +1876,9 @@ class MatrixAdapter(BasePlatformAdapter):
                     return
                 # Detect permanent auth/permission failures. Transient 5xx outages must retry.
                 if _is_permanent_matrix_auth_error(exc):
-                    logger.error("Matrix: permanent auth error, stopping sync: %s", exc)
+                    logger.error("Matrix: permanent auth error, stopping sync: %s", describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver)) or exc)
                     return
-                logger.warning("Matrix: sync error: %s — retrying in 5s", exc)
+                logger.warning("Matrix: sync error: %s — retrying in 5s", describe_proxy_error(exc, matrix_redaction_proxy(self._proxy_url, self._homeserver)) or exc)
                 await asyncio.sleep(5)
 
     async def _absorb_sync(self, client: Any, sync_data: dict[str, Any], *, initial: bool = False) -> Optional[str]:

@@ -516,6 +516,44 @@ def test_gating_forum_general_topic_normalizes_to_one():
     assert adapter2._should_process_message(general) is False
 
 
+def test_bot_created_forum_topic_anchor_is_not_a_reply_to_bot():
+    """Topic creation anchors must not bypass the group mention requirement."""
+    adapter = _make_adapter(require_mention=True)
+    topic_message = _forum_message(
+        chat_id=-100, thread_id=73, is_topic_message=True, is_forum=True
+    )
+    topic_message.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999),
+        message_id=73,
+        forum_topic_created=SimpleNamespace(name="Bot-created topic"),
+    )
+
+    assert adapter._is_reply_to_bot(topic_message) is False
+    assert adapter._should_process_message(topic_message) is False
+
+    genuine_reply = _forum_message(
+        chat_id=-100, thread_id=73, is_topic_message=True, is_forum=True
+    )
+    genuine_reply.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999), message_id=72
+    )
+    assert adapter._is_reply_to_bot(genuine_reply) is True
+
+
+def test_non_forum_reply_anchor_to_bot_still_bypasses_mention_gate():
+    """A reply-UI anchor is a real bot reply, not a forum creation event."""
+    adapter = _make_adapter(require_mention=True)
+    reply = _forum_message(
+        chat_id=-100, thread_id=73, is_topic_message=False, is_forum=False, chat_type="group"
+    )
+    reply.reply_to_message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999), message_id=73
+    )
+
+    assert adapter._is_reply_to_bot(reply) is True
+    assert adapter._should_process_message(reply) is True
+
+
 def test_bot_self_messages_are_ignored_in_dm_and_group():
     """Bot-authored messages must not re-enter as fresh user turns (issue #11905).
 
@@ -1013,6 +1051,110 @@ def test_sibling_bot_explicit_mention_still_dispatches_and_is_not_observed():
     human = _group_message("hermes, hello")
     assert adapter._should_process_message(human) is True
     assert adapter._should_observe_unmentioned_group_message(human) is False
+
+
+def _in_topic(message, thread_id):
+    message.message_thread_id = thread_id
+    message.is_topic_message = True
+    return message
+
+
+def _free_response_adapter(scope, **extra):
+    """Adapter whose chat -100 (``scope="chat"``) or topic -100:31 (``scope="topic"``) is free-response,
+    plus the matching message-placement helper."""
+    if scope == "chat":
+        adapter = _make_adapter(free_response_chats=["-100"], **extra)
+        return adapter, (lambda m: m)
+    adapter = _make_adapter(free_response_topics=["-100:31"], **extra)
+    return adapter, (lambda m: _in_topic(m, 31))
+
+
+@pytest.mark.parametrize("scope", ["chat", "topic"])
+def test_bots_require_mention_still_vetoes_other_bots_in_free_response_scope(scope):
+    """#147623: free_response_chats/topics let humans trigger without a mention; they must not switch off
+    ``bots_require_mention`` for other bots (an unmentioned bot message or quote-reply passed the gate)."""
+    adapter, place = _free_response_adapter(scope, require_mention=True, bots_require_mention=True)
+
+    # Humans keep the free-response behaviour: no mention needed, quote-replies work.
+    assert adapter._should_process_message(place(_group_message("just chatting"))) is True
+    assert adapter._should_process_message(place(_group_message("replying", reply_to_bot=True))) is True
+    # Another bot must still @mention us: plain chatter and quote-replies are vetoed ...
+    assert adapter._should_process_message(place(_bot_sender_message("routine notification"))) is False
+    assert adapter._should_process_message(place(_bot_sender_message("auto-reply", reply_to_bot=True))) is False
+    # ... while an explicit @mention from that bot still goes through.
+    text = "@hermes_bot ping"
+    mentioned = place(_bot_sender_message(text, entities=[_mention_entity(text)]))
+    assert adapter._should_process_message(mentioned) is True
+
+
+def test_free_response_exemption_stays_scoped_to_its_own_chat():
+    """The bot veto now runs before the free-response check; the exemption for HUMANS must not widen."""
+    adapter = _make_adapter(require_mention=True, bots_require_mention=True, free_response_chats=["-100"])
+
+    assert adapter._should_process_message(_group_message("hi", chat_id=-100)) is True
+    assert adapter._should_process_message(_group_message("hi", chat_id=-200)) is False
+
+
+@pytest.mark.parametrize("scope", ["chat", "topic"])
+def test_free_response_still_admits_bot_chatter_when_bots_require_mention_is_off(scope):
+    """No behaviour change for anyone who has not opted in to ``bots_require_mention``."""
+    adapter, place = _free_response_adapter(scope, require_mention=True)
+
+    assert adapter._should_process_message(place(_bot_sender_message("routine notification"))) is True
+    assert adapter._should_process_message(place(_bot_sender_message("auto-reply", reply_to_bot=True))) is True
+
+
+@pytest.mark.parametrize("scope", ["chat", "topic"])
+def test_vetoed_bot_message_in_free_response_scope_is_observed_not_dropped(scope):
+    """#147623: a bot message the veto refuses is not dispatched, so it must stay eligible as observed
+    context (#115119) -- the observation gate used to exclude free-response chats/topics outright."""
+    adapter, place = _free_response_adapter(
+        scope,
+        require_mention=True,
+        bots_require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    chatter = place(_bot_sender_message("routine notification"))
+    assert adapter._should_process_message(chatter) is False
+    assert adapter._should_observe_unmentioned_group_message(chatter) is True
+
+    # A human message dispatches (free-response), so it is NOT also observed ...
+    human = place(_group_message("just chatting"))
+    assert adapter._should_process_message(human) is True
+    assert adapter._should_observe_unmentioned_group_message(human) is False
+    # ... and neither is a bot @mention, which dispatches.
+    text = "@hermes_bot ping"
+    mentioned = place(_bot_sender_message(text, entities=[_mention_entity(text)]))
+    assert adapter._should_process_message(mentioned) is True
+    assert adapter._should_observe_unmentioned_group_message(mentioned) is False
+
+
+def test_free_response_chat_bot_chatter_is_stored_as_observed_context_end_to_end():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            bots_require_mention=True,
+            free_response_chats=["-100"],
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        msg = _bot_sender_message("deploy finished")
+        update = SimpleNamespace(update_id=2002, message=msg, effective_message=None)
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert len(store.messages) == 1
+        _session_id, message, _skip_db = store.messages[0]
+        assert message["observed"] is True
+        assert message["content"].endswith("deploy finished")
+
+    asyncio.run(_run())
 
 
 def _replying_to(message, *, user_id=None, message_id=10, sender_chat=None):

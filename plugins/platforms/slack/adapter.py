@@ -51,7 +51,7 @@ from plugins.platforms.slack.adapter_config_readers import (
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
     SendResult, SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, _TEXT_INJECT_EXTENSIONS,
-    is_host_excluded_by_no_proxy, resolve_proxy_url, ssrf_redirect_guard,
+    is_host_excluded_by_no_proxy, resolve_proxy_url, safe_proxy_url_for_log, ssrf_redirect_guard, describe_proxy_error,
     cache_document_from_bytes_async, cache_video_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
@@ -871,7 +871,7 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     if not normalized.startswith(("http://", "https://")):
         logger.info(
             "[Slack] Ignoring unsupported proxy scheme for Slack transport: %s",
-            safe_url_for_log(proxy_url))
+            safe_proxy_url_for_log(proxy_url))
         return None
     if any(is_host_excluded_by_no_proxy(host) for host in _SLACK_PROXY_HOSTS):
         logger.info("[Slack] NO_PROXY bypasses Slack proxy configuration")
@@ -1778,7 +1778,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return False
         proxy_url = _resolve_slack_proxy_url()
         if proxy_url:
-            logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
+            logger.info("[Slack] Using proxy for Slack transport: %s", safe_proxy_url_for_log(proxy_url))
         bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
         lock_acquired = False
         try:
@@ -1792,11 +1792,9 @@ class SlackAdapter(BasePlatformAdapter):
             # A zombie Socket Mode handler would double-respond to every event.
             await self._stop_socket_mode_handler()
             await self._close_workspace_clients()
-            # Close any previous handler before creating a new one so that calling connect() a second time
-            # (e.g. during a gateway restart or in-process reconnect attempt) does not leave a zombie Socket
-            # Mode connection alive. Both the old and new connections would otherwise receive every Slack
-            # event and dispatch it twice, producing double responses — the same bug that affected
-            # DiscordAdapter (#18187).
+            # Close any previous handler before creating a new one so a second connect() (gateway restart,
+            # in-process reconnect) leaves no zombie Socket Mode connection receiving and dispatching every
+            # event twice — the same bug that affected DiscordAdapter (#18187).
             self._app = None
             self._app_token = app_token
             self._proxy_url = proxy_url
@@ -1827,7 +1825,8 @@ class SlackAdapter(BasePlatformAdapter):
             self._hint_allow_bots()
             return True
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[Slack] Connection failed: %s", e, exc_info=True)
+            proxy_error = describe_proxy_error(e, proxy_url)
+            logger.error("[Slack] Connection failed: %s", proxy_error or e, exc_info=not proxy_error)
             return False
         finally:
             if lock_acquired and not self._running:
@@ -6601,7 +6600,7 @@ async def _resolve_slack_user_dm(token: str, user_id: str) -> Optional[str]:
                 data.get("error", "unknown"))
             return None
     except Exception as e:
-        logger.warning("[Slack] conversations.open exception for %s: %s", user_id, e)
+        logger.warning("[Slack] conversations.open exception for %s: %s", user_id, describe_proxy_error(e, resolve_proxy_url()) or e)
         return None
 
 
@@ -6668,7 +6667,7 @@ async def _standalone_send_media(
             'error': "slack_sdk not installed. Run: pip install 'slack-sdk' (required for Slack MEDIA delivery via send_message)",
         }
     client = _AsyncWebClient(token=token)
-    _apply_slack_proxy(client, resolve_proxy_url())
+    _apply_slack_proxy(client, proxy := resolve_proxy_url())  # every catch below: the error may echo it
     last_message_id = None
     # The upload API cannot carry unfurl controls; explicit ones need a separate caption post.
     caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs
@@ -6681,7 +6680,7 @@ async def _standalone_send_media(
                 return send_error(f"Slack API error: {post_payload.get('error', 'unknown')}")
             last_message_id = post_payload.get("ts")
         except Exception as e:
-            return send_error(f"Slack send failed: {e}")
+            return send_error(f"Slack send failed: {describe_proxy_error(e, proxy) or e}")
     caption_pending = caption_as_upload_comment
     uploaded_any = False
     for media_path, _is_voice in media_files:
@@ -6697,9 +6696,9 @@ async def _standalone_send_media(
                     if fb.get("ok", True):
                         last_message_id = fb.get("ts") or last_message_id
                         caption_pending = False
-                except Exception:
+                except Exception as e:
                     logger.warning(
-                        "[Slack] Caption-fallback send failed for missing media", exc_info=True)
+                        "[Slack] Caption-fallback send failed for missing media", exc_info=describe_proxy_error(e, proxy) is None)
             continue
         try:
             upload_result = await _standalone_upload_file(
@@ -6713,8 +6712,8 @@ async def _standalone_send_media(
             caption_pending = False
             last_message_id = upload_result.get("message_id") or last_message_id
         except Exception as e:
-            warning = f"Failed to send media {media_path}: {e}"
-            logger.error("[Slack] %s", warning, exc_info=True)
+            warning = f"Failed to send media {media_path}: {(shown := describe_proxy_error(e, proxy)) or e}"
+            logger.error("[Slack] %s", warning, exc_info=not shown)
             warnings.append(warning)
     if last_message_id is None and not uploaded_any and not text_to_send.strip():
         result: dict[str, Any] = {"error": "No deliverable text or media remained after processing"}
@@ -6799,8 +6798,8 @@ async def _standalone_send(
                 if last_error not in _WRONG_WORKSPACE_TOKEN_ERRORS:
                     break
         return send_error(f"Slack API error: {last_error}")
-    except Exception as e:
-        return send_error(f"Slack send failed: {e}")
+    except Exception as e:  # the text may echo the proxy URL: it reaches the model
+        return send_error(f"Slack send failed: {describe_proxy_error(e, resolve_proxy_url()) or e}")
 
 
 _SETUP_STEPS = (

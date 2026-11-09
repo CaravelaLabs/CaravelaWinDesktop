@@ -19,7 +19,9 @@ import uuid
 import weakref
 from abc import ABC, abstractmethod
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
-from gateway.platforms.base_log_safety import safe_url_for_log
+from gateway.platforms.base_log_safety import describe_proxy_error, env_proxy_for_redaction, safe_proxy_url_for_log, safe_url_for_log
+from gateway.platforms.base_image_sniff import _looks_like_image
+from gateway.platforms.base_media_flags import pad_inline_flags
 
 from utils import normalize_proxy_url, unlink_files_older_than
 from agent.i18n import t
@@ -369,7 +371,7 @@ def _aiohttp_socks_connector(proxy_url: str):
     except ImportError:
         if proxy_url.lower().startswith("socks"):
             logger.warning("aiohttp_socks not installed — SOCKS proxy %s ignored. "
-                           "Use an HTTP proxy instead.", proxy_url)
+                           "Use an HTTP proxy instead.", safe_proxy_url_for_log(proxy_url))
         return None
 
 
@@ -559,13 +561,6 @@ def _cache_dir_accessors(kind: str, constant_name: str, new_subpath: str, old_na
 
 get_image_cache_dir, cleanup_image_cache = _cache_dir_accessors(
     "image", "IMAGE_CACHE_DIR", "cache/images", "image_cache")
-
-
-def _looks_like_image(data: bytes) -> bool:
-    """Return True if *data* starts with a known image magic-byte sequence."""
-    return len(data) >= 4 and (data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff"
-               or data[:6] in {b"GIF87a", b"GIF89a"} or data[:2] == b"BM"
-               or (data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP"))
 
 
 def _secure_media_cache_dir(cache_dir: Path) -> None:
@@ -1706,13 +1701,10 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
         both_photo = existing_is_photo and incoming_is_photo
         incoming_has_media = bool(event.media_urls)
 
-        def _padded_inline_flags(msg: MessageEvent) -> list[Optional[bool]]:
-            flags = list(getattr(msg, "media_text_inlined", []) or [])
-            return flags + [None] * (len(msg.media_urls) - len(flags))
         incoming_inline_flags: list[Optional[bool]] = []
         if incoming_has_media:
-            existing.media_text_inlined = _padded_inline_flags(existing)
-            incoming_inline_flags = _padded_inline_flags(event)
+            existing.media_text_inlined = pad_inline_flags(existing)
+            incoming_inline_flags = pad_inline_flags(event)
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
@@ -2485,6 +2477,7 @@ class BasePlatformAdapter(ABC):
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             if event.media_urls:
+                existing.media_text_inlined = pad_inline_flags(existing) + pad_inline_flags(event)
                 existing.extend_media(event)
             existing.absorb_reply_expected(event)
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
@@ -4778,7 +4771,7 @@ class BasePlatformAdapter(ABC):
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
-        INDICATOR_RESERVE = 10   # room for " (XX/XX)"
+        INDICATOR_RESERVE = 12   # room for " (XXX/XXX)" once MarkdownV2-escaped to " \(XXX/XXX\)"
         FENCE_CLOSE = "\n```"
         chunks: list[str] = []
         remaining = content

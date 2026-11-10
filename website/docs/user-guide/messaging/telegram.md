@@ -158,6 +158,10 @@ platforms:
       media_group_wait_seconds: 3.0
 ```
 
+A short text followed right away by a photo (a question, then the screenshot it is about) also
+reaches the agent as one message. If the photo starts arriving before the text has been sent on,
+the text waits up to 8 seconds for the photo's download and joins it.
+
 ### Repeated inbound updates
 
 Hermes suppresses repeated Telegram `update_id` values before message batching,
@@ -282,6 +286,8 @@ telegram:
 ```
 
 With this mode enabled, unmentioned group messages from explicitly allowlisted chats/topics are appended to the shared chat/topic session transcript as observed context, but they do not dispatch the agent. `allowed_chats` gates where the bot responds; `group_allowed_chats` authorizes the shared group session used for observed context, so use the same chat IDs for this mode. A later `@botname` mention, reply to the bot, or configured mention pattern in that same allowlisted chat/topic can use that observed context. The triggered message is also tagged with `[nickname|user_id]` and gets a per-turn safety prompt so the model treats prior observed lines as context, not instructions addressed to the bot. Slash commands sent in that chat/topic (`/new`, `/model`, `/undo`, skill commands) act on the same shared session, while admin-only commands are still checked against the sender.
+
+Observed context is text only. A photo, video or file sent without a trigger is cached, and the observed line gives its saved path; the next addressed turn does not attach it inline. When a later message asks about it, the agent opens the cached file itself (`vision_analyze` for images; `video_analyze` for videos when the opt-in `video` toolset is enabled, otherwise its file tools), so image tokens are only spent when someone asks.
 
 Equivalent environment variable:
 

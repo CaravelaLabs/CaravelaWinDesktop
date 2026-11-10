@@ -1569,6 +1569,7 @@ Manage the fallback provider chain. Fallback providers are tried in order when t
 | `add` | Pick a provider + model (same picker as `hermes model`) and append to the chain |
 | `remove` (alias: `rm`) | Pick an entry to delete from the chain |
 | `clear` | Remove all fallback entries |
+| `check [--live] [--json]` | Check each entry resolves with usable credentials (`--live`: one minimal request per statically ready fixed-route entry, on that entry's own provider/model, never another). Exits 1 when any entry is not ready. No agent session is created |
 
 See [Fallback Providers](../user-guide/features/fallback-providers.md).
 
@@ -2045,7 +2046,7 @@ Manage profiles — multiple isolated Hermes instances, each with its own config
 |------------|-------------|
 | `list` | List all profiles. |
 | `use <name>` | Set a sticky default profile. |
-| `create <name> [--clone] [--clone-all] [--clone-from <source>] [--no-alias]` | Create a new profile. `--clone` copies config, `.env`, `SOUL.md`, skills, and the curated `MEMORY.md`/`USER.md` memory files from the active profile. `--clone-all` copies all state. `--clone-from` specifies a source profile and implies config clone unless paired with `--clone-all`. |
+| `create <name> [--clone] [--clone-all] [--clone-from <source>] [--no-alias] [--isolated-auth] [--no-credentials]` | Create a new profile. By default it gets the active profile's API keys (bot tokens left out) and model and shares the default profile's logins (from a named profile, that profile's logins are copied instead). `--isolated-auth` copies the logins instead; `--no-credentials` copies none of these. `--clone` copies config, `.env`, `SOUL.md`, skills, and the curated `MEMORY.md`/`USER.md` memory files from the active profile. `--clone-all` copies all state. `--clone-from` specifies a source profile and implies config clone unless paired with `--clone-all`. |
 | `delete <name> [-y]` | Delete a profile. |
 | `show <name>` | Show profile details (home directory, config, etc.). |
 | `alias <name> [--remove] [--name NAME]` | Manage wrapper scripts for quick profile access. |

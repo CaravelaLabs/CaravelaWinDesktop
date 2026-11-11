@@ -194,6 +194,7 @@ from plugins.platforms.telegram.telegram_media_flood import TelegramMediaFloodMi
 from plugins.platforms.telegram import telegram_flood_window as _flood_window
 from plugins.platforms.telegram.telegram_media_fetch import (
     cache_replied_media, fetch_telegram_file, merged_typed_text, record_typed_text)
+from plugins.platforms.telegram.telegram_media_budget import media_sources, scaled_budgets
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, log_resolved, tap_matches_prompt
@@ -400,9 +401,7 @@ _POLLING_PROGRESS_TIMEOUT = 60.0  # generation unhealthy until getUpdates return
 # #92991) and no other probe can see it. ~3x the worst-case poll window leaves ample margin against false
 # positives while still recovering within a few heartbeat intervals.
 _POLLING_STALL_TIMEOUT = 150.0
-# Sustained getUpdates progress this long, counted from the first progress after the last 409's restart, ends a
-# conflict episode; it exceeds the gap between two conflicts of one storm (the next poll), so the ladder can climb.
-_POLLING_CONFLICT_QUIET_PERIOD = 120.0
+_POLLING_CONFLICT_QUIET_PERIOD = 120.0  # sustained progress since the last 409 that ends a conflict episode
 # Ingress dispatch stall (#102260, #130407): the transport probes prove getUpdates round-trips complete, not
 # that PTB's dispatcher ever handed the fetched updates to a handler. A backlog with no dispatch progress for
 # four heartbeats (360s) hands the adapter to the supervisor for a rebuild (an in-place restart keeps the
@@ -423,10 +422,8 @@ _TEXT_SEND_DEADLINE = 30.0
 # (up to the 60 s read timeout) — 300 s covers it. It is also >2x the sum of the per-phase httpx budgets
 # (pool 8 + connect 10 + media_write 60 + read 60 = 138 s), so it only fires when a shielded socket has
 # stopped raising at all, never on a merely slow link.
-# On expiry `run_bounded_async` cancels and then abandons the upload task (never awaited), inside
-# `_chat_send_lock`: the lock is released while the abandoned task drains. Awaiting the cancel with a grace
-# period would re-hang the lock on exactly the wedged socket this bounds, so the rare late landing is
-# accepted; httpx's own timeouts free the pool slot.
+# On expiry the upload task is cancelled and abandoned inside `_chat_send_lock` (awaiting it would re-hang the
+# lock on the wedged socket this bounds). On-disk payloads widen it with size: telegram_media_budget.py.
 _MEDIA_SEND_DEADLINE = 300.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
@@ -1068,15 +1065,15 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         return any(marker in str(error).lower() for marker in ("message to be replied not found", "reply message not found"))
 
     async def _send_with_dm_topic_reply_anchor_retry(
-        self, send_fn: Any, send_kwargs: dict[str, Any], metadata: Optional[dict[str, Any]], media_label: str, reset_media: Optional[Any] = None) -> Any:
+        self, send_fn: Any, send_kwargs: dict[str, Any], metadata: Optional[dict[str, Any]], media_label: str, reset_media: Optional[Any] = None, deadline: Optional[float] = None) -> Any:
         """Send private-topic media, retrying a deleted anchor or a dead topic one step at a time. Serialized per chat with
-        ``send()`` so a file upload cannot land between two chunks of the text it accompanies."""
+        ``send()`` so a file upload cannot land between two chunks of the text it accompanies. ``deadline`` bounds each try."""
         async with self._media_send_slot(send_kwargs.get("chat_id")):
             same_thread_retried = False  # a one-off "thread not found" flake retries the same thread first, as send() does
             while True:  # anchor drop / same thread once / chat root, so it ends
                 try:
                     return await _await_with_thread_deadline(
-                        send_fn(**send_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
+                        send_fn(**send_kwargs), timeout=deadline or _MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
                 except Exception as send_err:
                     gone = dead_topic_may_reroute(send_kwargs.get("chat_id"), metadata) and topic_gone(send_kwargs.get("chat_id"), send_err)
                     if self._should_retry_without_dm_topic_reply_anchor(send_err, metadata, send_kwargs.get("reply_to_message_id")):
@@ -1586,10 +1583,10 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
         self._send_path_degraded = True
-        # No proven progress yet: stall-watchdog age (#92991) and the conflict quiet window restart
-        # here, so a network recovery's downtime never counts as sustained healthy polling.
+        # No proven progress yet: stall-watchdog age (#92991) restarts here; the conflict quiet window pauses.
+        self._bank_conflict_quiet_window()
         self._polling_generation_started_monotonic = time.monotonic()
-        self._polling_last_progress_monotonic = self._polling_conflict_quiet_since = None
+        self._polling_last_progress_monotonic = None
         # Re-base the backlog per generation. On an in-place updater restart PTB keeps the old
         # update_queue, so old dispatches can briefly exceed received; the check treats that as no backlog.
         self._updates_received_total = self._updates_dispatched_total = 0
@@ -1608,16 +1605,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self._polling_progress_event.set()
         self._polling_last_progress_monotonic = time.monotonic()
         self._polling_network_error_count = 0
-        # A conflict episode ends only after a quiet period: getUpdates also succeeds between the 409s of a
-        # live storm, so resetting on any progress pinned the ladder at (1/5) forever (#82303). The window opens
-        # at the first progress after the restart, so recovery downtime (stop, backoff, drain) never counts.
-        if self._polling_conflict_count:
-            quiet_since = self._polling_conflict_quiet_since
-            if quiet_since is None:
-                self._polling_conflict_quiet_since = self._polling_last_progress_monotonic
-            elif self._polling_last_progress_monotonic - quiet_since >= _POLLING_CONFLICT_QUIET_PERIOD:
-                self._polling_conflict_count = 0
-                self._polling_conflict_quiet_since = None
+        self._note_conflict_quiet_progress(self._polling_last_progress_monotonic)
         mark_send_path_recovered(self)
         return True
 
@@ -2248,7 +2236,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
         self._polling_conflict_count += 1
-        self._polling_conflict_quiet_since = None
+        self._polling_conflict_quiet_since, self._polling_conflict_quiet_banked = None, 0.0
         MAX_CONFLICT_RETRIES = 5
         # 15s, 25s, 35s, 45s, 55s — clears Telegram's ~30s session window without hammering the API.
         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
@@ -2300,18 +2288,24 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 # Fall through to fatal on the last retry.
         if self._teardown_started:
             return
-        # Retries exhausted — fatal so the runner surfaces it and the user knows to act.
+        # Retries exhausted — fatal, but RETRYABLE: a 409 getUpdates conflict is contention for the
+        # single-writer polling slot (a zombie session from the previous process, or another instance
+        # holding the token), not a permanent config error. Marking it non-retryable dropped the
+        # platform with no path back: the runner only queues retryable fatals, and the stranded-platform
+        # safety net is also gated on retryable, so telegram stayed dead until a manual restart even
+        # after the competing session expired on Telegram's side.
         message = (
             f"Telegram polling could not recover after {MAX_CONFLICT_RETRIES} retries "
             f"({sum(10 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1))}s total wait). "
             "The previous gateway session is still held open on Telegram's servers, "
-            "or another process is using the same bot token. To recover: ensure no other Hermes or OpenClaw instance is running "
-            "with this token, then restart the gateway with 'hermes gateway restart'.")
+            "or another process is using the same bot token. Retrying in the background; "
+            "it reconnects automatically once the competing getUpdates session expires. "
+            "If it never recovers, check for another Hermes or OpenClaw instance using this token.")
         logger.error("[%s] %s Original error: %s", self.name, message, _redact_telegram_error_text(error, self._ptb_proxy_url))
         # Snapshot whether WE transition to fatal: a concurrent retry task suspended past the entry
         # guard reaches this branch too. Only the first transition notifies.
         _already_fatal = self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict"
-        self._set_fatal_error("telegram_polling_conflict", message, retryable=False)
+        self._set_fatal_error("telegram_polling_conflict", message, retryable=True)
         try:
             if self._app and self._app.updater:
                 await _await_with_thread_deadline(self._app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
@@ -3369,16 +3363,16 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
 
     async def _retrigger_typing(self, chat_id: str, metadata: Optional[dict[str, Any]]) -> None:
         """Re-arm typing after an intermediate send (Telegram clears it when a message lands). Skipped on
-        the FINAL reply (``metadata["notify"]``): the refresh loop is gone and no API cancels the bubble.
+        the FINAL reply (``notify``) and cron deliveries (``job_id``): no refresh loop, no API cancels the bubble.
 
         Scheduled, never awaited: ``sendChatAction`` is a fire-and-forget UI hint, and awaiting its TLS
         round-trip on the send path after *every* streamed chunk pinned the event loop the ``getUpdates``
         long-polls live on until they rotted into CLOSE-WAIT while the adapter still reported connected
         (#111727). ``_keep_typing`` already refreshes every 2s, so one in-flight re-arm per chat, at most
         one per ``typing_retrigger_min_interval_seconds``, covers the gap a landed message leaves."""
-        if (metadata or {}).get("notify") or not getattr(getattr(self, "config", None), "typing_indicator", True):
+        final = any((metadata or {}).get(k) for k in ("notify", "job_id"))
+        if final or not getattr(getattr(self, "config", None), "typing_indicator", True):
             return
-        # __dict__.setdefault: tests build adapters via object.__new__() (no __init__).
         tasks: dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_typing_retrigger_tasks", {})
         sent_at: dict[str, float] = self.__dict__.setdefault("_telegram_typing_retrigger_at", {})
         key = str(chat_id)
@@ -3645,15 +3639,15 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         elif not finalize:
             # Content shrank back under the cap — clear stale saturation state so dedup can't mask an edit.
             self._last_overflow_preview.pop(_preview_key, None)
+        # Previews edit in the final's parse mode (#49536): a plain -> MarkdownV2 flip on the same message makes
+        # clients draw the old layout over the new text. A rejected preview retries as raw text (nothing lost).
+        formatted = self.format_message(content)
+        plain = (_strip_mdv2(content) if content else content) if finalize else content
+        warn = "[%s] MarkdownV2 edit failed, falling back to plain text: %s"
         try:
-            if not finalize:
-                await self._edit_text(chat_id, message_id, content)
-                if _saturated_preview:
-                    self._last_overflow_preview[_preview_key] = content
-                return SendResult(success=True, message_id=message_id)
-            await self._edit_markdown_or_plain(
-                chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
-                "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+            await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
+            if _saturated_preview:
+                self._last_overflow_preview[_preview_key] = content
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -3686,7 +3680,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 await asyncio.sleep(wait)
                 try:
-                    await self._edit_text(chat_id, message_id, content)
+                    await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
@@ -3725,7 +3719,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         self, chat_id: str, chunk: str, reply_to_id: Optional[int], thread_kwargs: dict[str, Any],
         thread_id: Optional[str], metadata: Optional[dict[str, Any]], finalize: bool):
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
-        reply anchor once on 'reply message not found'. Returns the sent message or None."""
+        reply anchor once on 'reply message not found'. Returns the sent message, the flood-cap result on
+        a flood refusal, or None."""
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
         for use_markdown in (True, False) if finalize else (False,):
             try:
@@ -3750,9 +3745,13 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                             **retry_thread_kwargs, **base),
                             timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
                     except Exception as _retry_err:
+                        if getattr(_retry_err, "retry_after", None) is not None or "retry after" in str(_retry_err).lower():
+                            return _flood_cap_result(float(getattr(_retry_err, "retry_after", None) or 30.0))
                         logger.warning(
                             "[%s] Overflow continuation no-reply retry failed: %s", self.name, _redact_telegram_error_text(_retry_err))
                         return None
+                if getattr(send_err, "retry_after", None) is not None or "retry after" in str(send_err).lower():
+                    return _flood_cap_result(float(getattr(send_err, "retry_after", None) or 30.0))  # no plain retry into the penalty (#76494)
                 if use_markdown:
                     continue  # try plain text on next loop iteration
                 logger.warning("[%s] Overflow continuation send failed: %s", self.name, _redact_telegram_error_text(send_err))
@@ -3788,16 +3787,24 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             reply_to_id = int(prev_id) if prev_id else None
             thread_kwargs = self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to_id)
             sent_msg = await self._send_overflow_continuation(chat_id, chunk, reply_to_id, thread_kwargs, thread_id, metadata, finalize)
-            if sent_msg is None:
+            flood = sent_msg if isinstance(sent_msg, SendResult) else None  # flood-refused: the caller holds off
+            if sent_msg is None or flood:
                 # Partial delivery: do NOT report success — the consumer would treat it as final delivery.
                 logger.warning("[%s] Overflow split: stopped at %d/%d chunks delivered", self.name, 1 + len(continuation_ids), len(chunks))
                 delivered_prefix = "".join(re.sub(r" \(\d+/\d+\)$", "", delivered) for delivered in delivered_chunks)
+                raw = {
+                    "partial_overflow": True, "delivered_chunks": 1 + len(continuation_ids),
+                    "total_chunks": len(chunks), "last_message_id": prev_id, "delivered_prefix": delivered_prefix,
+                    "continuation_message_ids": tuple(continuation_ids)}
+                if flood and finalize:
+                    # A flood refusal posted nothing, so the rest is certain-undelivered: hand it over in the
+                    # shape _resume_partial_send sends (the MarkdownV2 continuation text), as send() does.
+                    raw["undelivered_chunks"] = tuple(
+                        _separate_chunk_indicator_from_fence(self.format_message(rest)) for rest in chunks[len(delivered_chunks):])
+                    raw["delivered_message_ids"] = (str(message_id), *continuation_ids)
                 return SendResult(
-                    success=False, message_id=prev_id, error="overflow_continuation_failed", retryable=True,
-                    raw_response={
-                        "partial_overflow": True, "delivered_chunks": 1 + len(continuation_ids),
-                        "total_chunks": len(chunks), "last_message_id": prev_id, "delivered_prefix": delivered_prefix,
-                        "continuation_message_ids": tuple(continuation_ids)},
+                    success=False, message_id=prev_id, retryable=True, retry_after=flood and flood.retry_after,
+                    error=flood.error if flood else "overflow_continuation_failed", raw_response=raw,
                     continuation_message_ids=tuple(continuation_ids))
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
             continuation_ids.append(new_id)
@@ -4844,8 +4851,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         reset_media: Optional[Any] = None, **media_kwargs: Any) -> Any:
         """Send one native media payload with thread routing + DM-topic anchor retry."""
         _, kwargs = self._media_send_kwargs(chat_id, reply_to, metadata)
+        budget, deadline = scaled_budgets(media_sources(media_kwargs), _MEDIA_SEND_DEADLINE, _MEDIA_SEND_READ_TIMEOUT)  # #133093
         return await self._send_with_dm_topic_reply_anchor_retry(
-            send_fn, {**kwargs, **media_kwargs}, metadata, media_label, reset_media=reset_media)
+            send_fn, {**kwargs, **budget, **media_kwargs}, metadata, media_label, reset_media=reset_media, deadline=deadline)
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
@@ -5887,7 +5895,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if self._is_own_message(message):
             return False
         if not self._is_group_chat(message):
-            return True
+            return not self._is_ignored_root_dm(message, is_command=is_command)
         thread_id = self._effective_message_thread_id(message)
         if self._topic_gates_pass(thread_id, warn_non_numeric=True, message=message) is False:
             return False
@@ -5987,6 +5995,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
+            event._lobby_split_owner = self._root_lobby_key(msg)  # type: ignore[attr-defined]  # admits continuations past ignore_root_dm
             self._enqueue_text_event(event)
             return
         await self.handle_message(event)

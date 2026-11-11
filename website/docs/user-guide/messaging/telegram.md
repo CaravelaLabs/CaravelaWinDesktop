@@ -1200,8 +1200,6 @@ The same setting applies to sends made outside the gateway process: `hermes send
 
 CJK text (Chinese, Japanese, Korean, and rare Han extensions) stays on the legacy MarkdownV2 path by default because affected Telegram Desktop/macOS clients have rendered Bot API rich messages with overlapping CJK glyph artifacts. If you use an unaffected client and prefer native rich tables/task lists/details/math for CJK payloads, set `allow_cjk_rich_messages: true` alongside `rich_messages: true` to opt in to that client-side risk.
 
-If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
-
 **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
 
 ```yaml
@@ -1367,7 +1365,9 @@ In some restricted networks, `api.telegram.org` may resolve to an IP that is unr
 5. Once a path succeeds, it becomes "sticky" — subsequent requests use it directly. The hostname is kept as a last resort for IPv6-only networks.
 6. One request's walk across these paths shares a 15s connect budget, half the 30s send deadline. The first path keeps its full connect timeout and later paths split the rest. If every path hangs, the send fails with a connect timeout before the deadline. The gateway retries it, because the message never left.
 
-Sends made outside the gateway process (`hermes send`, the `send_message` tool, standalone cron delivery) use the same transport with your configured IPs or the seed list. They skip DoH discovery so a one-shot send stays fast. They also use the gateway's `HERMES_TELEGRAM_HTTP_*` timeouts and its 60s media-upload write timeout. A connect or pool timeout is retried there, because the request never left. Any other timeout is not retried: Telegram may already have delivered the message.
+Sends made outside the gateway process (`hermes send`, the `send_message` tool, standalone cron delivery) use the same transport with your configured IPs or the seed list. They skip DoH discovery so a one-shot send stays fast. They also use the gateway's `HERMES_TELEGRAM_HTTP_*` timeouts and its media-upload budgets. A connect or pool timeout is retried there, because the request never left. Any other timeout is not retried: Telegram may already have delivered the message, and `hermes send` says so in its warning instead of inviting a resend.
+
+A media upload from a file on disk (gateway or standalone) gets read and write timeouts of 60s plus the time the file takes at 128 KB/s. Gateway uploads also get a wall-clock cap of 300s plus 1.5x that time (at most one hour). `hermes send` and the `send_message` tool are bounded only by those per-request timeouts. Standalone cron delivery keeps its `cron.standalone_send_timeout_seconds` cap (60s by default), widened by 1.5x the upload time when the delivery carries files, and a cron delivery through the live gateway widens `cron.media_send_timeout_seconds` the same way. A large file on a slow uplink, or through a self-hosted Bot API server that only answers once it has forwarded the file, then waits for Telegram's answer instead of reporting a failure for a file that lands minutes later.
 
 ### Configuration
 
@@ -1485,6 +1485,7 @@ Numeric YAML keys are automatically normalized to strings.
 | Bot ignores group messages | Privacy mode is likely on. Disable it (Step 3) or make the bot a group admin. **Remember to remove and re-add the bot after changing privacy.** |
 | Voice messages not transcribed | Verify STT is available: install `faster-whisper` for local transcription, or set `GROQ_API_KEY` / `VOICE_TOOLS_OPENAI_KEY` in `~/.hermes/.env`. |
 | Voice replies are files, not bubbles | Install `ffmpeg` (needed for Edge TTS Opus conversion). |
+| Logs show `Telegram polling conflict` (409) | Another poller holds the bot's `getUpdates` session. This is usually the gateway's own previous long poll, which Telegram expires on its own: the adapter retries for about 200 s, then the gateway reconnects it again about 2, 5 and 10 minutes later (every profile in a multiplexed gateway does this). If the token is still in use after that, `hermes status` shows the platform as `fatal` with `token_in_use_elsewhere` and needs-attention, and the gateway stops retrying. Stop the other poller (another machine, a leftover process, or another bot framework using this token), then run `hermes gateway restart`. Two of your own profiles set up with the same token never get this far: the second one is refused at startup with `duplicate_credential` (or `telegram-bot-token_lock` when the other is a separate local gateway). |
 | Bot token revoked/invalid | Generate a new token via `/revoke` then `/newbot` or `/token` in BotFather. Update your `.env` file. |
 | Webhook not receiving updates | Verify `TELEGRAM_WEBHOOK_URL` is publicly reachable (test with `curl`). Ensure your platform/reverse proxy routes inbound HTTPS traffic from the URL's port to the local listen port configured by `TELEGRAM_WEBHOOK_PORT` (they do not need to be the same number). Ensure SSL/TLS is active — Telegram only sends to HTTPS URLs. Check firewall rules. |
 

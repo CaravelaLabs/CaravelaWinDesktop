@@ -2886,6 +2886,9 @@ export const frOverrides = {
       debugShare: 'Partage de débogage',
       debugShareDesc:
         'Téléverser un rapport expurgé + journaux, obtenir des liens partageables (auto-suppression après 6h)',
+      debugShareConfirm: 'Téléverser le rapport de débogage vers un paste public ?',
+      debugShareConfirmDesc:
+        'Téléverse les infos système + les journaux complets vers un service de paste public. Les secrets sont masqués, mais vos messages récents, la sortie des outils, les chemins et noms de fichiers restent dans les journaux et sont lisibles par toute personne disposant du lien. Les pastes sont supprimés automatiquement après 6 heures ; si paste.rs est injoignable, le service de secours dpaste.com les garde publics 1 jour et ils ne peuvent pas être supprimés plus tôt.',
       debugShareRunning: 'Téléversement du rapport de débogage...',
       debugShareLinks: 'Liens de partage',
       debugShareFailed: 'Échec du partage de débogage',
@@ -3238,6 +3241,14 @@ export const frOverrides = {
     fieldSkillsPlaceholder: 'noms de skills séparés par des virgules (facultatif)',
     fieldDeliver: 'Livrer vers',
     fieldDeliverOnly: 'Livrer le payload uniquement',
+    fieldSignature: 'Signature',
+    fieldSignatureHint: 'Le seul schéma de signature accepté par cette route. Les livraisons GitHub, GitLab et Linear exigent leur propre schéma.',
+    signatureOptions: {
+      generic: 'Générique (horodatée)',
+      github: 'GitHub',
+      gitlab: 'GitLab',
+      linear: 'Linear'
+    },
     fieldPrompt: 'Invite',
     fieldPromptPlaceholder: "Instructions pour l'agent quand ce webhook se déclenche (facultatif)",
     nameRequired: 'Nom requis',
@@ -3909,7 +3920,7 @@ export const frOverrides = {
       '/topup': 'Afficher votre solde Nous et gérer la facturation sur le portail',
       '/platform': 'Suspendre, reprendre ou lister une plateforme de gateway en échec',
       '/version': 'Afficher la version de Caravela Agent',
-      '/debug': 'Téléverser un rapport de débogage (infos système + journaux) et obtenir des liens partageables',
+      '/debug': 'Rapport de débogage (infos système + journaux) : affiche d\'abord l\'avis de confidentialité ; /debug upload partage les liens',
       '/model': 'Changer le modèle de cette session'
     },
     hotkeyDescs: {

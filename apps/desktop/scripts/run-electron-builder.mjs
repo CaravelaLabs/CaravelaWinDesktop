@@ -7,6 +7,7 @@ import { isMain } from './utils.mjs'
 import { readPackagingInputs, preparationRequired } from './prepared-packaging.mjs'
 import { readNativeInputs } from './prepared-native-deps.mjs'
 import { pinnedPackageRoot } from './prepare-packaging-tools.mjs'
+import { skipUnboundedNodeModuleWalk } from './skip-node-module-walk.mjs'
 
 const source = path.resolve(import.meta.dirname, '../../..')
 const app = path.join(source, 'apps/desktop')
@@ -159,6 +160,9 @@ export function runElectronBuilder(args, { spawn = spawnSync } = {}) {
     HERMES_PREPARED_NATIVE_DEPS: nativeDeps, HERMES_PREPARED_TARGET: inputs.target }
   if (inputs.dmgbuild) env.CUSTOM_DMGBUILD_PATH = inputs.dmgbuild
   if (inputs.windows?.dotnetRoot) env.DOTNET_ROOT = inputs.windows.dotnetRoot
+  // pnpm install during Update restores the stock collector. Re-apply before spawn.
+  const skipped = skipUnboundedNodeModuleWalk(source)
+  if (skipped) console.log(`[pack] skipped unbounded node_modules walk in ${skipped} collector(s)`)
   const result = spawn(process.execPath, [...preloads, path.join(builder, bin), ...args,
     '--config', 'electron-builder.config.cjs', '--publish', 'never', `-c.electronDist=${inputs.electron}`,
     ...toolsetArguments(inputs)], { cwd: app, stdio: 'inherit', env })

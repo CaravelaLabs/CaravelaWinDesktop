@@ -3,6 +3,7 @@ import { test } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { builderNodeOptions, runElectronBuilder } from './run-electron-builder.mjs'
+import { patchCollectorSource, skipUnboundedNodeModuleWalk, WALK_SKIP_MARKER } from './skip-node-module-walk.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import { publishPackagingInputs } from './prepared-packaging.mjs'
@@ -102,4 +103,25 @@ test('source builds hand every child the builder heap without rewriting inherite
   const quoted = '--require "/tmp/sp  ace/p.cjs"'
   assert.ok(builderNodeOptions(quoted).startsWith(quoted))
   assert.match(builderNodeOptions('--max-old-space-size=16384 --max-old-space-size=4096'), heap)
+})
+
+test('pack skips the unbounded pnpm production walk and is idempotent', () => {
+  const open = 'async getNodeModules({ packageName, archFilter, ignoredDependencies, }) {\n        const tree = await this.getDependenciesTree(this.installOptions.manager);'
+  const once = patchCollectorSource(open + '\n')
+  assert.equal(once.changed, true)
+  assert.match(once.text, new RegExp(WALK_SKIP_MARKER))
+  assert.match(once.text, /return \{ nodeModules: \[\{ name: "react"/)
+  assert.equal(patchCollectorSource(once.text).changed, false)
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nm-walk-'))
+  const file = path.join(root, 'node_modules', '.pnpm', 'app-builder-lib@test', 'node_modules', 'app-builder-lib', 'dist', 'node-module-collector', 'nodeModulesCollector.js')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, open + '\n')
+  try {
+    assert.equal(skipUnboundedNodeModuleWalk(root), 1)
+    assert.match(fs.readFileSync(file, 'utf8'), new RegExp(WALK_SKIP_MARKER))
+    assert.equal(skipUnboundedNodeModuleWalk(root), 0)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

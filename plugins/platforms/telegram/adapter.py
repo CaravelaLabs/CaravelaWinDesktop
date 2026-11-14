@@ -210,6 +210,7 @@ from plugins.platforms.telegram.telegram_network import (
     proxy_target_hosts, telegram_verify)
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
 from plugins.platforms.telegram.telegram_send_path_recovery import TelegramSendPathRecoveryMixin, mark_send_path_recovered
+from plugins.platforms.telegram.telegram_flood_cooldown import TelegramFloodCooldownMixin, land_persisted_state
 from plugins.platforms.telegram.telegram_send_errors import LOST, classify_send_exception, explain_username_chat_not_found, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind, FLOOD, UNSENT, rich_failure_result
 from plugins.platforms.telegram.telegram_split import REPLY_FILE_MAX_BYTES, reply_message_count, send_reply_document
 from plugins.platforms.telegram.telegram_typing_gate import claim_ai_action, typing_may_fire
@@ -217,6 +218,7 @@ from plugins.platforms.telegram.telegram_voice_mention import admit_media, cache
 from plugins.platforms.telegram.telegram_group_observe import apply_group_observe_attribution, observed_media_note, shared_sender_suffix
 from plugins.platforms.telegram.telegram_picker_labels import model_button_labels
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
+from plugins.platforms.telegram.telegram_vault_code import TelegramVaultCodeMixin
 from utils import env_float, env_int
 
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
@@ -392,7 +394,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramReplacementMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, TelegramMediaFloodMixin, TelegramSendPathRecoveryMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramReplacementMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, TelegramMediaFloodMixin, TelegramSendPathRecoveryMixin, TelegramVaultCodeMixin, TelegramFloodCooldownMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -3166,10 +3168,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
         self._bot = None
-        # Land the last completed receipts before a replacement adapter reads them.
-        flush = getattr(self, "_update_receipt_flush", None)
-        if flush is not None and not flush.done():
-            await self._await_disconnect_step(asyncio.shield(flush), _DISCONNECT_STEP_TIMEOUT, "update-receipt flush")
+        await land_persisted_state(self)  # update receipts + flood windows, before a replacement reads them
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -5116,26 +5115,6 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 if not getattr(lock, "_waiters", None):  # nobody queued: drop the entry (bounded dict)
                     locks.pop(key, None)
 
-    def _record_send_flood_cooldown(self, chat_id: Any, wait: float) -> SendResult:
-        """A send refused with ``retry_after=wait`` arms a per-chat window during which ``send()`` fails
-        closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
-        unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
-        until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
-        return _flood_cap_result(wait)
-
-    def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
-        """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
-        until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        key = str(normalize_telegram_chat_id(chat_id))
-        deadline = until.get(key)
-        if deadline is None:
-            return None
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining > 0:
-            return remaining
-        until.pop(key, None)
-        return None
 
     # --- shared per-chat send+edit pacing budget (#116312) -----------------------------------------
     # One slot per chat that sendMessage AND editMessageText both draw from (Telegram counts them
@@ -5906,6 +5885,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        if await self.consume_vault_code_reply(msg):  # a one-time code: deleted, handed over, never a turn
             return
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return

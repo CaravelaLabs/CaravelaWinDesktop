@@ -4,6 +4,7 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+import copy
 import json
 import logging
 import os
@@ -194,6 +195,7 @@ _PREFIX_PATTERNS = [
     r"AIza[A-Za-z0-9_-]{30,}",          # Google API keys
     r"GOCSPX-[A-Za-z0-9_-]{8,}",        # Google OAuth client secret (pasted client_secret.json, #64351)
     r"ya29\.(?:[a-z]\.)?[A-Za-z0-9_-]{20,}",  # Google OAuth access token: user a0…, service-account c., STS d. (#64351)
+    r"AQ\.[A-Za-z0-9_-]{40,}",           # Google Gemini authorization keys (newer "AQ." prefix; AIza pattern doesn't catch them) — #66920
     r"pplx-[A-Za-z0-9]{10,}",           # Perplexity
     r"fal_[A-Za-z0-9_-]{10,}",          # Fal.ai
     r"fc-[A-Za-z0-9]{10,}",             # Firecrawl
@@ -203,7 +205,7 @@ _PREFIX_PATTERNS = [
     r"sk_live_[A-Za-z0-9]{10,}",        # Stripe secret key (live)
     r"sk_test_[A-Za-z0-9]{10,}",        # Stripe secret key (test)
     r"rk_live_[A-Za-z0-9]{10,}",        # Stripe restricted key
-    r"SG\.[A-Za-z0-9_-]{10,}",          # SendGrid API key
+    r"SG\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?",  # SendGrid API key (2- or 3-part)
     r"hf_[A-Za-z0-9]{10,}",             # HuggingFace token
     r"r8_[A-Za-z0-9]{10,}",             # Replicate API token
     r"npm_[A-Za-z0-9]{10,}",            # npm access token
@@ -215,7 +217,7 @@ _PREFIX_PATTERNS = [
     # prefix, so the charset stays broad and the length floor does the discriminating.
     r"am_(?:org_)?[A-Za-z0-9]{20,}",
     r"sk_[A-Za-z0-9_]{10,}",            # ElevenLabs TTS key (sk_ underscore, not sk- dash)
-    r"tvly-[A-Za-z0-9]{10,}",           # Tavily search API key
+    r"tvly-(?:(?:dev|prod)-)?[A-Za-z0-9]{10,}",  # Tavily search API key (incl. tvly-dev-/tvly-prod-, #72925)
     r"exa_[A-Za-z0-9]{10,}",            # Exa search API key
     r"gsk_[A-Za-z0-9]{10,}",            # Groq Cloud API key
     r"syt_[A-Za-z0-9]{10,}",            # Matrix access token
@@ -1900,11 +1902,29 @@ def _reset_plugin_redaction_patterns() -> None:
         _rebuild_prefix_matcher()
 
 
+# Control chars + Unicode line separators (NEL, LS, PS) that log aggregators treat as breaks:
+# interpolated text must not forge a log line.
+_LOG_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]")
+# Same class minus "\n": the appended traceback/stack keeps its line structure.
+_EXC_UNSAFE_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f\x85\u2028\u2029]")
+# hermes_cli/logs.py _TS_RE (searched anywhere in a line) makes any stamped line a record.
+# Zero-width context so overlapping stamps ("12:00:2026-07-09 12:00:00") are all broken.
+_LOG_LINE_STAMP = re.compile(r"(?<=\d{4}-\d{2}-\d{2})[T ](?=\d{2}:\d{2}:\d{2})")
+
+
 class RedactingFormatter(logging.Formatter):
-    """Log formatter that redacts secrets from all log messages."""
+    """Redact secrets and prevent message text from forging log records."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return redact_sensitive_text(super().format(record))
+        # Other handlers must receive the original message and exception cache.
+        safe_record = copy.copy(record)
+        safe_record.msg = _LOG_UNSAFE_CHARS.sub(" ", redact_sensitive_text(record.getMessage()))
+        safe_record.args = None
+        formatted = redact_sensitive_text(super().format(safe_record))
+        first, *rest = _EXC_UNSAFE_CHARS.sub(" ", formatted).split("\n")
+        # Traceback lines carry exception text; break their stamps so `hermes logs` keeps them
+        # as continuation lines of this record.
+        return "\n".join([first, *(_LOG_LINE_STAMP.sub("_", line) for line in rest)])
 
     def formatMessage(self, record: logging.LogRecord) -> str:
         from hermes_logging import display_record  # lazy: hermes_logging imports this module lazily

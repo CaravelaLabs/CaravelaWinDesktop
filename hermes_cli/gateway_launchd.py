@@ -880,7 +880,9 @@ def _wait_for_launchd_service_pid(
     return poll_until(_fresh_pid, max(timeout, 0.5), 0.5)
 
 
-def launchd_restart():
+def launchd_restart() -> int | None:
+    """Restart the invoking profile's launchd gateway. Returns the PID left running with its restart
+    pending (live work outlived the drain wait; KeepAlive relaunches it once idle), else None."""
     gateway_service_owner.refuse_foreign_launchd_plist("restart")
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
@@ -895,9 +897,10 @@ def launchd_restart():
     # bootout/bootstrap-retry path, which is bounded and reports its own
     # failure instead of stalling the update for 90s.
     refresh_ok = _gw().refresh_launchd_plist_if_needed()
-    from gateway.status import get_running_pid
+    from gateway.status import get_process_start_time, get_running_pid
     try:
         pid = get_running_pid()
+        born = get_process_start_time(pid) if pid is not None else None  # the identity signalled
         if pid is not None and _gw()._request_gateway_self_restart(pid):
             _launchd_ok("✓ Service restart requested")
             return
@@ -907,6 +910,10 @@ def launchd_restart():
             print(f"⚠ Gateway PID {pid} event loop is unresponsive — " "skipping drain and forcing a bounded stop...")
             _gw()._escalate_wedged_gateway(pid)
             pid = None
+        from hermes_cli.update_cmd_drain_report import leave_restart_pending
+        from hermes_cli.update_cmd_posix_pause import is_left_pending
+        if pid is not None and is_left_pending(pid) and leave_restart_pending(pid, f"Gateway PID {pid}", start_time=born):
+            return pid  # the update's pause already waited it out
         if pid is not None:
             # Graceful in-band restart via SIGUSR1 (mirrors systemd); the budget covers both the idle wait
             # and the drain. A bare SIGTERM would lose the resume_pending handoff. Announce BEFORE waiting:
@@ -922,6 +929,8 @@ def launchd_restart():
                     return
                 print("⚠ launchd did not revive the gateway after its graceful exit — forcing restart")
             else:
+                if leave_restart_pending(pid, f"Gateway PID {pid}", start_time=born):
+                    return pid  # the budget bounds the wait, never the work: KeepAlive relaunches it once idle
                 print(f"⚠ Gateway drain timed out after {wait_budget:.0f}s — forcing launchd restart")
         if not refresh_ok and _gw().get_launchd_plist_path().exists() and not _gw().launchd_plist_is_current():
             # The refresh attempted a reload and launchd never re-registered

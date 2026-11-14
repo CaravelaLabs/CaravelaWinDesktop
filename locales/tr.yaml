@@ -604,6 +604,7 @@ gateway:
     disabled: "⚠️ Bu oturumda YOLO modu **KAPALI** — tehlikeli komutlar onay gerektirecek."
     enabled: "⚡ Bu oturumda YOLO modu **AÇIK** — tüm komutlar otomatik onaylanır. Dikkatli kullanın."
   shared:
+    fallback_model_suffix: " — yedek, asıl model `{primary}`"
     session_db_unavailable: "Oturum veritabanı kullanılamıyor."
     session_db_unavailable_prefix: "Oturum veritabanı kullanılamıyor"
     session_not_found: "Oturum veritabanında bulunamadı."
@@ -808,6 +809,7 @@ gateway:
     ack_generate: "AGENTS.md proje taramasından oluşturuluyor…"
   moa:
     prepare_failed: "MoA turu hazırlanamadı."
+    managed_session: "/moa bu oturumda kullanılamaz: güvenli mod, yapılandırmasız, kanban ve yönetilen worker oturumları her turu kendi modelinde çalıştırır. İstemi /moa olmadan gönderin."
   quick_command:
     no_output: "Komut çıktı döndürmedi."
     timed_out: "Hızlı komut zaman aşımına uğradı (30 sn)."
@@ -1252,6 +1254,11 @@ platform:
       affirm: "✓ Evet"
       negate: "✗ Hayır"
       other: "✏️ Diğer (yanıt yazın)"
+      multi_hint: "Bir veya daha fazla seçin, ardından Gönder'e dokunun."
+      send: "✅ Gönder"
+      selected_count: "Seçilen: {count}"
+      select_one: "Önce en az bir seçenek seçin."
+      toggle_failed: "Seçim güncellenemedi — tekrar dokunun."
       expired_toast: "⚠️ Bu istemin süresi doldu — lütfen /retry kullanın."
       expired_body: "⚠️ Bu sorunun süresi doldu veya oturum sıfırlandı — lütfen /retry kullanın."
       type_answer: "✏️ Yanıtınızı sohbete yazın."
@@ -3823,7 +3830,7 @@ tips:
   t246: "HERMES_HOME_MODE ortam değişkeni (sekizlik, örn. 0701), web sunucusu erişimi için özel dizin izinleri belirler."
   t247: "Container modu: HERMES_HOME içine .container-mode koyun; ana makine CLI'sı otomatik olarak container içine geçer."
   t248: "Ctrl+C'nin 5 öncelik kademesi vardır: kaydı iptal et → istemleri iptal et → seçiciyi iptal et → ajanı kes → çık."
-  t249: "Ajan çalışması sırasındaki her kesme, zaman damgasıyla ~/.hermes/interrupt_debug.log dosyasına kaydedilir."
+  t249: "Ajan çalışması sırasındaki kesmeler agent.log dosyasına kaydedilir (`hermes logs` ile görüntüleyin); ayrıntılı izleme için HERMES_DEBUG_INTERRUPT=1 ayarlayın."
   t250: "BROWSER_CDP_URL, tarayıcı araçlarını çalışan herhangi bir Chromium ailesi tarayıcıya bağlar — WebSocket, HTTP veya host:port kabul eder."
   t251: "BROWSERBASE_ADVANCED_STEALTH=true, özel Chromium ile gelişmiş tespit önlemeyi etkinleştirir (Scale Plan)."
   t252: "CLI, 80 sütundan dar terminallerde otomatik olarak kompakt moda geçer."

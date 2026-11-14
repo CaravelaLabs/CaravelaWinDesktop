@@ -970,7 +970,7 @@ Manage dynamic webhook subscriptions for event-driven agent activation. Requires
 
 | Subcommand | Description |
 |------------|-------------|
-| `subscribe` / `add` | Create a webhook route. Returns the URL and HMAC secret to configure on your service. |
+| `subscribe` / `add` | Create a webhook route. Prints the URL and a masked HMAC secret; the full secret is stored in `webhook_subscriptions.json` under the Hermes home. |
 | `list` / `ls` | Show all agent-created subscriptions. |
 | `remove` / `rm` | Delete a dynamic subscription. Static routes from config.yaml are not affected. |
 | `test` | Send a test POST to verify a subscription is working. |
@@ -1697,6 +1697,7 @@ Unified plugin management — general plugins, memory providers, and context eng
 | `enable <name>` | Enable a disabled plugin. |
 | `disable <name>` | Disable a plugin without removing it. |
 | `list` (alias: `ls`) | List installed plugins with enabled/disabled status. |
+| `idle-tasks [name] [--pause TASK \| --resume TASK]` | List the idle tasks plugins registered with `ctx.register_idle_task` in this profile (status, run count, last and next run, last summary or error), or pause/resume one task of the named plugin. |
 | `doctor [path-or-id] [--ci]` | Validate a native plugin through the real manifest parser, loader, and registration path. `--ci` exits 1 on errors. |
 | `pack install <path-or-url> [--force]` | Install a plugin pack (`hermes-pack.yaml`) — a declarative set of plugins each pinned to an exact 40-character commit SHA. Shows a mandatory review screen (every plugin, source, pinned ref, declared capabilities), asks one confirmation for the pack contents, then runs ordinary pinned installs. Each plugin's declared capabilities still go through the standard per-plugin consent — a pack never bulk-grants. Partial failures are reported per plugin; exits non-zero when any plugin failed. Interactive only (no `--yes`). |
 | `pack export [--enabled-only] [--name NAME]` | Emit a pack YAML on stdout from the current install: repo + exact SHA of each git-installed plugin plus sanitized non-secret `plugins.entries` config. Local-only plugins (no git provenance) are listed as warning comments, never as installable entries. Secrets, capability grants, and `allow_*` gates are always stripped. |

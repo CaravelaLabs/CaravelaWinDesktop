@@ -451,6 +451,7 @@ from hermes_cli.observability.shared_metrics_gateway import records_delivery, st
 from hermes_cli.home_data_layout import SECRET_CACHE_STORES
 from agent.file_safety import deny_path_under
 from gateway.session import SessionSource, build_session_key
+from gateway.session_dm_threads import dm_thread_batch_suffix, dm_thread_key_source, session_db_for_source
 from gateway.session_transcript import TranscriptReadError
 from hermes_constants import CONNECTOR_DOWNLOADS_SUBDIR, get_default_hermes_root, get_hermes_dir, get_hermes_home
 from agent.provider_media import GENERATED_SUBDIR, MEDIA_CACHE_MAX_AGE_HOURS
@@ -1906,6 +1907,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         self._authorization_check: Optional[Callable[[str, Optional[str], Optional[str]], bool]] = None
         # Auto-TTS on voice input: ``voice.auto_tts`` default plus per-chat /voice on|tts / off.
         self._auto_tts_default: bool = False
+        self._auto_tts_mode: str = "all"  # Global scope: all (legacy) | voice_only.
         self._auto_tts_enabled_chats, self._auto_tts_disabled_chats = set(), set()
         # Turn keys where streaming TTS already delivered audio; whole-file auto-TTS skips them.
         # When the gateway streaming-TTS consumer successfully delivers audio, it adds the turn key here so
@@ -2028,12 +2030,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     fatal_error_retryable = property(lambda self: self._fatal_error_retryable)
 
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
-        """Whether auto-TTS fires for ``chat_id``: explicit ``/voice on|tts`` wins,
-        then explicit ``/voice off``, then the global ``voice.auto_tts`` default.
-
-        Decision layers (Issue #16007): 1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-        ``voice.auto_tts`` is False). 2. 3.
-        """
+        """Explicit /voice on|tts wins over off, then fall back to voice.auto_tts (#16007)."""
         return chat_id in self._auto_tts_enabled_chats or (
             chat_id not in self._auto_tts_disabled_chats and bool(self._auto_tts_default))
 
@@ -2456,15 +2453,14 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
     def _source_session_key(self, source: SessionSource) -> str:
         self._canonicalize(source)  # identity FIRST; no key derivation before it
-        extra = self.config.extra
+        extra, store = self.config.extra, getattr(self, "_session_store", None)
         return build_session_key(
-            source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
-            profile=self._session_key_profile(source))
+            dm_thread_key_source(source, extra, lambda: session_db_for_source(store, source)), group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=self._session_key_profile(source))
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text batching (subclasses may override)."""
-        return self._event_session_key(event)
+        return self._event_session_key(event) + dm_thread_batch_suffix(event.source, self.config.extra)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""

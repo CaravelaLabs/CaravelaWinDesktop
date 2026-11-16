@@ -601,6 +601,8 @@ async def get_status(profile: Optional[str] = None,
 
         status = {
             "version": local["version"], "release_date": __release_date__,
+            # `hermes import --keep-host` and /api/ops/transfer/*: a client checks it before a transfer.
+            "import_keep_host": 1,
             "config_version": local["config_version"], "latest_config_version": local["latest_config_version"],
             "can_update_hermes": local["can_update_hermes"],
             "gateway_running": gateway_running, "gateway_state": gateway_state,
@@ -836,6 +838,17 @@ async def get_portal_status(profile: Optional[str] = None):
     # load_config() + auth/subscription snapshots are disk reads on a polled endpoint —
     # keep them off the event loop.
     return await config_scoped_to_thread(profile, _get_portal_status_sync)
+
+
+@router.get("/api/cloud/agents")
+async def list_cloud_agents(org: Optional[str] = None, profile: Optional[str] = None):
+    """The signed-in Nous account's Hermes Cloud agents, for a client with no portal session of its
+    own (the Webapp's browser tab): ``hermes_cli.cloud_agents``."""
+    from hermes_cli.cloud_agents import CloudAgentsError, discover
+    try:
+        return await config_scoped_to_thread(profile, lambda: discover(org))
+    except CloudAgentsError as exc:
+        raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": str(exc)}) from None
 
 
 def _feature_state(feat) -> str:

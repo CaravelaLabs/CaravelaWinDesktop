@@ -94,7 +94,7 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] =  frozenset({
 # duplicate deliveries) the moment its gateway starts. The empty dir is recreated below.
 _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "state.db", "state.db-wal", "state.db-shm", "sessions", "backups", "state-snapshots", "checkpoints",
-    "cron", "webapp",  # webapp/: the source gateway's sign-in state (credential, native grants, Portal callback)
+    "cron", "webapp", "backend_migration", "backend_migration.json",  # webapp/: its sign-in; backend_migration*: its migration
 })
 
 # Marker written by `hermes profile create --no-skills`. When present at a profile root,
@@ -185,7 +185,7 @@ PROFILE_CREDENTIAL_PATHS = frozenset({
     "proxy",                        # iron-proxy CA key + proxy tokens
     "chrome-debug",                 # /browser connect Chrome profile (cookies, logins)
     "home",                         # subprocess HOME: gh, git, ssh, npm and skill-CLI credentials
-    "backups", "state-snapshots",   # pre-update zips, config copies, update snapshots of the stores
+    "backups", "state-snapshots", "backend_migration", "backend_migration.json",  # update/migration store copies
     *_GATEWAY_CONNECTION_STORES,    # saved gateways' session tokens + OAuth sign-ins (sidecars: _STORE_COPY_RE)
     *_OS_CREDENTIAL_STORES,
 })
@@ -1399,7 +1399,7 @@ def create_profile(
     # on every create and every 30 s, and ``_iter_named_profile_dirs`` only lists valid ids (no leading
     # dot), so it can never adopt the half-copied tree and start adapters on credentials the strip
     # below has not removed yet.
-    from hermes_cli.profiles_initialization import clone_staging_dir, discard_unpublished_vault_key, finish_profile_layout
+    from hermes_cli.profiles_initialization import clone_staging_dir, discard_unpublished_vault_key, finish_profile_layout, publish_staging
     staging = clone_staging_dir(profile_dir)
     clone_key = None  # the keychain entry made for this clone's vault, if any
     try:
@@ -1413,7 +1413,7 @@ def create_profile(
             if stripped:
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
         finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description, soul=soul)
-        os.rename(staging, profile_dir)
+        publish_staging(staging, profile_dir, lambda: _profile_exists_error(canon))
     except BaseException:
         discard_unpublished_vault_key(clone_key)
         shutil.rmtree(staging, ignore_errors=True)

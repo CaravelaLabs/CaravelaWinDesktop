@@ -88,14 +88,15 @@ def _install_plugin_python_deps(
     *assume_yes* is ``--yes-deps``: the user's own non-interactive answer
     to the Python question, so a headless install is not refused (#122134).
     """
-    from pm.plugin_declarations import read_python_declaration
+    from pm.plugin_declarations import assess_workspace_membership, read_python_declaration
 
     try:
         declaration = read_python_declaration(target)
-        deps = declaration.install_requirements
+        assessment = assess_workspace_membership(declaration)
+        deps = assessment.unsatisfied_requirements
+        has_python = assessment.needs_member
     except Exception as exc:
         return False, _ConsentRefusal(f"invalid Python dependency declaration: {exc}", "manifest_invalid")
-    has_python = declaration.installs_packages
     has_package_json = (target / "package.json").is_file()
     if not has_python and not has_package_json:
         return True, None  # no declared deps at all
@@ -982,7 +983,19 @@ def dashboard_install_plugin(
         return placed
     target, installed_manifest, installed_name = placed
     deps = _pc()._python_dependency_summary(target, warnings)
-    if enable and (refused := _enable_placed(installed_name, deps, step)):
+    needs_python_sync = False
+    if deps:
+        from pm.plugin_declarations import needs_workspace_member, read_python_declaration
+        from pm.workspace import enabled_member_dirs
+
+        try:
+            decl = read_python_declaration(target)
+            needs_python_sync = needs_workspace_member(decl) or (
+                decl.installs_packages and bool(enabled_member_dirs())
+            )
+        except (OSError, ValueError):
+            needs_python_sync = True
+    if enable and (refused := _enable_placed(installed_name, needs_python_sync, step)):
         return refused
     ap = target / "after-install.md"
     # Deps first, then load: the plugin activates in this process (TUI/Desktop server subscribers see it)

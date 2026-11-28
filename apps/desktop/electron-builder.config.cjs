@@ -66,8 +66,10 @@ if (!/^\d+\.\d+\.\d+$/.test(electronVersion)) {
   throw new Error(`invalid electron version ${electronVersion} in package.json`)
 }
 
-const macFeed = channelRequest ? null : feedContract.darwinFeed(channel === 'canary' || channel === 'light-canary' ? 'canary' : 'stable', light)
+const feedChannel = channel === 'canary' || channel === 'light-canary' ? 'canary' : 'stable'
+const macFeed = channelRequest ? null : feedContract.darwinFeed(feedChannel, light)
 const publicUrl = feedContract.feedBaseUrl(process.env.CLOUDFLARE_R2_PUBLIC_URL)
+const linuxFeed = channelRequest || light ? null : feedContract.linuxFeed(feedChannel, 'x64')
 
 /** @satisfies {Configuration} */
 module.exports = {
@@ -282,7 +284,11 @@ module.exports = {
     synopsis: light
       ? 'Remote-only desktop client for Caravela Agent.'
       : 'Caravela — chart the course.',
-    target: ['AppImage']
+    target: ['AppImage'],
+    // The packaged AppImage updater reads the app-update.yml generated from this.
+    publish: publicUrl && channel && linuxFeed
+      ? [{ provider: 'generic', url: `${publicUrl}/${linuxFeed.directory}/`, channel: linuxFeed.channel }]
+      : null
   }
 }
 

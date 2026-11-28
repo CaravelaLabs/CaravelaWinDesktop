@@ -15,6 +15,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from tests.gateway.test_multiplex_hot_serve_live import control, start_daemon, stop, tail
 from tests.waiting import wait_until
+from tests.fixtures.child_env import hermes_child_env
 
 
 def _free_port():
@@ -47,7 +48,7 @@ def test_single_profile_gateway_starts_restarts_and_stops_a_platform_live(tmp_pa
     root.mkdir(mode=0o700)
     (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: false\n", encoding="utf-8")
     repo = Path(__file__).resolve().parents[2]
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
+    env = hermes_child_env(("PATH", "LANG", "TZ"))
     env.update(HOME=str(user), HERMES_HOME=str(root), PYTHONPATH=str(repo), PYTHONUNBUFFERED="1")
     mux = {"root": root, "env": env, "log": tmp_path / "gateway.log"}
     proc, _desc = start_daemon(mux)
@@ -87,7 +88,7 @@ def test_a_platform_configured_by_the_launch_environment_survives_a_reconcile(tm
     (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: false\n", encoding="utf-8")
     port = _free_port()
     repo = Path(__file__).resolve().parents[2]
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
+    env = hermes_child_env(("PATH", "LANG", "TZ"))
     env.update(HOME=str(user), HERMES_HOME=str(root), PYTHONPATH=str(repo), PYTHONUNBUFFERED="1",
                WEBHOOK_ENABLED="true", WEBHOOK_PORT=str(port))
     mux = {"root": root, "env": env, "log": tmp_path / "gateway.log"}
@@ -107,6 +108,11 @@ def _closed_port():
     return f"http://127.0.0.1:{port}"
 
 
+def _default_listener_env() -> dict:
+    """The default profile's webhook listener: a named profile's LINE is served at /p/<profile>/ on it."""
+    return {"WEBHOOK_ENABLED": "true", "WEBHOOK_PORT": str(_free_port())}
+
+
 @pytest.mark.platforms("linux")
 @pytest.mark.spawns_gateway_lookalike
 def test_named_profile_restart_with_the_same_token_comes_back_up_live(tmp_path):
@@ -123,11 +129,12 @@ def test_named_profile_restart_with_the_same_token_comes_back_up_live(tmp_path):
     dotenv = named / ".env"
     dotenv.write_text("LINE_CHANNEL_ACCESS_TOKEN=same-token\nLINE_CHANNEL_SECRET=first\n", encoding="utf-8")
     repo = Path(__file__).resolve().parents[2]
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
+    env = hermes_child_env(("PATH", "LANG", "TZ"))
     closed = _closed_port()
     env.update(HOME=str(user), HERMES_HOME=str(root), PYTHONPATH=str(repo), PYTHONUNBUFFERED="1",
                HERMES_GATEWAY_LOCK_DIR=str(tmp_path / "locks"), HTTPS_PROXY=closed, HTTP_PROXY=closed,
-               https_proxy=closed, http_proxy=closed, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+               https_proxy=closed, http_proxy=closed, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1",
+               **_default_listener_env())
     mux = {"root": root, "env": env, "log": tmp_path / "gateway.log"}
     proc, _desc = start_daemon(mux)
     try:
@@ -157,11 +164,12 @@ def test_a_named_profile_rescan_leaves_its_restart_for_the_next_answer(tmp_path)
     (named / "config.yaml").write_text("platforms:\n  line:\n    token: same-token\n", encoding="utf-8")
     dotenv = named / ".env"
     dotenv.write_text("LINE_CHANNEL_ACCESS_TOKEN=same-token\nLINE_CHANNEL_SECRET=first\n", encoding="utf-8")
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
+    env = hermes_child_env(("PATH", "LANG", "TZ"))
     closed = _closed_port()
     env.update(HOME=str(user), HERMES_HOME=str(root), PYTHONPATH=str(Path(__file__).resolve().parents[2]),
                PYTHONUNBUFFERED="1", HERMES_GATEWAY_LOCK_DIR=str(tmp_path / "locks"), HTTPS_PROXY=closed,
-               HTTP_PROXY=closed, https_proxy=closed, http_proxy=closed, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+               HTTP_PROXY=closed, https_proxy=closed, http_proxy=closed, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1",
+               **_default_listener_env())
     mux = {"root": root, "env": env, "log": tmp_path / "gateway.log"}
     proc, _desc = start_daemon(mux)
     try:
@@ -650,7 +658,7 @@ def test_racing_reconciles_report_each_change_to_exactly_one_ask(tmp_path, monke
     assert gw.settled_ask()["started"] == []  # taken: asked again about the same files, nothing is new
 
 
-_NAMED_FRESH = [p.value.upper() for p in (Platform.FEISHU, Platform.DINGTALK, Platform.WECOM, Platform.BLUEBUBBLES,
+_NAMED_FRESH = [p.value.upper() for p in (Platform.FEISHU, Platform.WHATSAPP_CLOUD, Platform.SMS, Platform.BLUEBUBBLES,
                                           Platform.QQBOT, Platform.WHATSAPP)]
 
 
@@ -869,7 +877,7 @@ def test_an_unreadable_config_keeps_the_running_platforms_until_it_is_fixed(tmp_
     config = root / "config.yaml"
     config.write_text(_webhook_yaml(first), encoding="utf-8")
     repo = Path(__file__).resolve().parents[2]
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
+    env = hermes_child_env(("PATH", "LANG", "TZ"))
     env.update(HOME=str(user), HERMES_HOME=str(root), PYTHONPATH=str(repo), PYTHONUNBUFFERED="1")
     mux = {"root": root, "env": env, "log": tmp_path / "gateway.log"}
     proc, _desc = start_daemon(mux)
@@ -899,6 +907,39 @@ def test_an_unreadable_config_keeps_the_running_platforms_until_it_is_fixed(tmp_
 
 @pytest.mark.platforms("linux")
 @pytest.mark.spawns_gateway_lookalike
+def test_a_named_profile_port_binder_with_no_default_listener_is_not_started_live(tmp_path):
+    """Under multiplex a named profile's LINE binds no port: it is served at /p/b/ on the default's
+    api_server or webhook listener. With neither on the default, the live reconcile does not start it
+    as "connected" while nothing listens; it reports why it is not served."""
+    user, root = tmp_path / "user", tmp_path / "state"
+    user.mkdir()
+    root.mkdir(mode=0o700)
+    (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n", encoding="utf-8")
+    named = root / "profiles" / "b"
+    named.mkdir(parents=True, mode=0o700)
+    (named / "config.yaml").write_text("platforms:\n  line:\n    token: same-token\n", encoding="utf-8")
+    (named / ".env").write_text("LINE_CHANNEL_ACCESS_TOKEN=same-token\nLINE_CHANNEL_SECRET=s\n", encoding="utf-8")
+    repo = Path(__file__).resolve().parents[2]
+    env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
+    closed = _closed_port()
+    env.update(HOME=str(user), HERMES_HOME=str(root), PYTHONPATH=str(repo), PYTHONUNBUFFERED="1",
+               HERMES_GATEWAY_LOCK_DIR=str(tmp_path / "locks"), HTTPS_PROXY=closed, HTTP_PROXY=closed,
+               https_proxy=closed, http_proxy=closed, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+    mux = {"root": root, "env": env, "log": tmp_path / "gateway.log"}
+    proc, _desc = start_daemon(mux)
+    try:
+        answer = control(root, "reconcile-platforms", {"home": str(named)}, timeout=20)
+        assert answer["profile"] == "b" and answer["started"] == [], (answer, tail(mux))
+        assert answer["platforms"].get("line") != "connected", (answer, tail(mux))
+        assert "the default runs neither. Not starting it" in tail(mux), tail(mux)
+        assert "line connected (profile: b)" not in tail(mux), tail(mux)
+        assert proc.poll() is None, tail(mux)
+    finally:
+        stop(proc, expect=None)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.spawns_gateway_lookalike
 def test_an_unreadable_named_profile_config_keeps_its_platforms(tmp_path):
     """The same for a multiplexed named profile: its rescan keeps the last good config and adapters."""
     user, root = tmp_path / "user", tmp_path / "state"
@@ -911,11 +952,12 @@ def test_an_unreadable_named_profile_config_keeps_its_platforms(tmp_path):
     (named / "config.yaml").write_text(good, encoding="utf-8")
     (named / ".env").write_text("LINE_CHANNEL_ACCESS_TOKEN=same-token\nLINE_CHANNEL_SECRET=s\n", encoding="utf-8")
     repo = Path(__file__).resolve().parents[2]
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "TZ") if k in os.environ}
+    env = hermes_child_env(("PATH", "LANG", "TZ"))
     closed = _closed_port()
     env.update(HOME=str(user), HERMES_HOME=str(root), PYTHONPATH=str(repo), PYTHONUNBUFFERED="1",
                HERMES_GATEWAY_LOCK_DIR=str(tmp_path / "locks"), HTTPS_PROXY=closed, HTTP_PROXY=closed,
-               https_proxy=closed, http_proxy=closed, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+               https_proxy=closed, http_proxy=closed, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1",
+               **_default_listener_env())
     mux = {"root": root, "env": env, "log": tmp_path / "gateway.log"}
     proc, _desc = start_daemon(mux)
     try:

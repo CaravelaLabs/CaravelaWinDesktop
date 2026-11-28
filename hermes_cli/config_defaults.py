@@ -945,8 +945,6 @@ DEFAULT_CONFIG = {
             "telegram": {"streaming": True},
             "discord": {"streaming": False},
             "slack": {"streaming": False},
-            # WeCom native streaming (msgtype "stream" via aibot_respond_msg).
-            "wecom": {"streaming": True},
         },
         # Gateway runtime footer on the FINAL message, e.g. `model · 68% · ~/projects/hermes`.
         # Per-platform: display.platforms.<platform>.runtime_footer.
@@ -1270,8 +1268,8 @@ DEFAULT_CONFIG = {
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
         "nudge_interval": 10,
-        # One external provider: bundled (retaindb, byterover) or catalog-installed (honcho,
-        # hindsight, supermemory, mem0, openviking, holographic). Empty = built-in only.
+        # One catalog-installed external provider (honcho, hindsight, supermemory, mem0,
+        # openviking, holographic). Empty = built-in only.
         "provider": "",
     },
     # Subagent delegation: `backend` = task-routing strategy ("default": keys below), `backends.<name>` = its settings.
@@ -2662,7 +2660,7 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    "_config_version": 54,  # Config schema version - bump this when adding new required fields
+    "_config_version": 55,  # Config schema version - bump this when adding new required fields
 }
 
 
@@ -2895,15 +2893,6 @@ OPTIONAL_ENV_VARS = OptionalEnvVars({
     # ── Mem0 ──
     "MEM0_API_KEY": _tool("Mem0 Platform API key for semantic persistent memory", "Mem0 API key",
         "https://app.mem0.ai", tools=["mem0_search"]),
-    # ── RetainDB ──
-    "RETAINDB_API_KEY": _tool("RetainDB API key for persistent memory", "RetainDB API key",
-        "https://retaindb.com", tools=["retaindb_search"]),
-    "RETAINDB_BASE_URL": _tool(
-        "Base URL for self-hosted RetainDB instances (default: https://api.retaindb.com)",
-        "RetainDB base URL", password=None, advanced=True),
-    # ── ByteRover ──
-    "BRV_API_KEY": _tool("ByteRover API key (optional, for cloud sync — local-first by default)",
-        "ByteRover API key", "https://app.byterover.dev", tools=["brv_query"]),
     # ── OpenViking ──
     "OPENVIKING_API_KEY": _tool("OpenViking API key (leave blank for local dev mode)",
         "OpenViking API key", tools=["viking_search"]),

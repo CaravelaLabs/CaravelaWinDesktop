@@ -64,6 +64,9 @@ _STATIC_PROVIDER_ENV_BLOCKLIST = DEPLOYMENT_STAMP_ENV | frozenset({
     "HERMES_ANON_API_SECRET", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
     "HERMES_DASHBOARD_BASIC_AUTH_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
     "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_MEET_REALTIME_KEY",
+    # Keys of the ByteRover/RetainDB providers (now Hermes Labs plugins): a profile's .env still loads
+    # them, and no OPTIONAL_ENV_VARS row declares them any more.
+    "BRV_API_KEY", "RETAINDB_API_KEY", "RETAINDB_BASE_URL",
 })
 
 
@@ -146,6 +149,9 @@ def _build_adapter_secret_env() -> frozenset:
                  and meta.get("category") == "messaging" and meta.get("password"))
     names |= platform_manifest_secret_envs(source="bundled", strict=True)
     names.update(n.upper() for n in config_env_table_keys() if n.upper().endswith(PLATFORM_SECRET_ENV_SUFFIXES))
+    # A platform that left core: its manifest secrets stay adapter secrets while the plugin is absent.
+    from hermes_cli.left_core_migration import LEFT_CORE
+    names.update(name for feature in LEFT_CORE if feature.platform for name in feature.secret_env)
     return frozenset(names)
 
 
@@ -579,6 +585,8 @@ def _static_gate_env_prefixes() -> frozenset:
     try:
         from gateway.config import Platform
         names.update(m.value for m in Platform.__members__.values())
+        from hermes_cli.left_core_migration import LEFT_CORE  # platforms that left core keep their gates
+        names.update(f.platform for f in LEFT_CORE if f.platform)
         bundled, aliases = Platform._scan_bundled_plugin_platforms()
         names.update(bundled)
         names.update(aliases)

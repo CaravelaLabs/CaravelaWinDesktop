@@ -247,13 +247,10 @@ class Platform(Enum):
     MATRIX = "matrix"
     EMAIL = "email"
     SMS = "sms"
-    DINGTALK = "dingtalk"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
     MSGRAPH_WEBHOOK = "msgraph_webhook"
     FEISHU = "feishu"
-    WECOM = "wecom"
-    WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
@@ -267,12 +264,10 @@ class Platform(Enum):
         value = value.strip().lower()
         if value in cls._value2member_map_:
             return cls._value2member_map_[value]
-        global _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
-        if _Platform__bundled_plugin_names is None:
-            _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases = cls._scan_bundled_plugin_platforms()
-        registered = value in _Platform__bundled_plugin_names
+        bundled_names, bundled_aliases = cls._bundled_plugin_platforms()
+        registered = value in bundled_names
         if not registered:
-            alias = _Platform__bundled_plugin_aliases.get(value)
+            alias = bundled_aliases.get(value)
             if alias is not None:
                 # A bundled platform whose plugin.yaml ``name:`` differs from its directory (e.g. dir
                 # "a2a", name "a2a-platform") is configured under the manifest name — ``plugins
@@ -283,6 +278,14 @@ class Platform(Enum):
                 from gateway.platform_registry import platform_registry
                 registered = platform_registry.is_registered(value)
         return cls._add_pseudo_member(value) if registered else None
+
+    @classmethod
+    def _bundled_plugin_platforms(cls) -> tuple[set, dict]:
+        """:meth:`_scan_bundled_plugin_platforms`, scanned once per process."""
+        global _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
+        if _Platform__bundled_plugin_names is None:
+            _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases = cls._scan_bundled_plugin_platforms()
+        return _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
 
     @classmethod
     def _add_pseudo_member(cls, value: str) -> "Platform":
@@ -317,6 +320,19 @@ class Platform(Enum):
             return set(), {}
 
 
+def platform_value(key: Any) -> str:
+    """The platform a ``platforms`` map key names, by name alone (no plugin needs to be registered): what
+    ``Platform(key)`` resolves it to in ``GatewayConfig.from_dict`` (:meth:`Platform._missing_`): stripped and
+    lower-cased, a bundled plugin's manifest name mapped to its platform. ``""`` for a key that names nothing."""
+    if not isinstance(key, str) or not key.strip():
+        return ""
+    value = key.strip().lower()
+    if value in Platform._value2member_map_:
+        return Platform._value2member_map_[value].value
+    names, aliases = Platform._bundled_plugin_platforms()
+    return value if value in names else aliases.get(value, value)
+
+
 # Built-in values snapshotted before any dynamic _missing_ lookup.
 _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.values())
 
@@ -324,7 +340,7 @@ _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.value
 # profile's port-binder is built in shared-listener mode and served at /p/<profile>/<path> on the
 # default's listener (gateway/platforms/shared_ingress.py); api_server/webhook are mirrored there.
 PORT_BINDING_PLATFORM_VALUES = frozenset({
-    "webhook", "api_server", "msgraph_webhook", "feishu", "wecom_callback",
+    "webhook", "api_server", "msgraph_webhook", "feishu",
     "bluebubbles", "sms", "whatsapp_cloud", "line", "teams",
 })
 # Platforms that only bind in one connection mode (Feishu's default websocket mode is outbound).
@@ -339,10 +355,39 @@ SERVED_PROFILE_MIRROR_PLATFORMS = SHARED_LISTENER_MIRROR_PLATFORMS | frozenset({
 SHARED_LISTENER_MIRROR_PATHS: dict[str, str] = {"api_server": "/v1", "webhook": "/webhooks/<route>"}
 
 
-def platform_binds_port(platform_value: str, extra: Optional[dict] = None) -> bool:
-    """True when *platform_value* actually binds a port for *extra* config."""
+def plugin_listen_port(platform_value: str, home: Optional[Path] = None, *, discover: bool = False) -> tuple:
+    """``PlatformEntry.listen_port`` (``(extra key, default port)``) of a registered plugin platform,
+    else ``()``. Plugins register per profile home, so a caller outside the owning profile's scope
+    (a multiplexed secondary, another profile's dashboard row) passes *home*: the lookup then runs
+    in that home's registry scope. *discover* also runs that home's plugin discovery first (a
+    migration preflight that may never have loaded it); never for a parked profile, whose plugins must not
+    run in this process. A lookup by name imports a deferred adapter, as every registry read does."""
+    from agent.runtime_scope import bind_profile_scope
+
+    def lookup() -> tuple:
+        from hermes_cli.plugins import discover_plugins
+        from gateway.platform_registry import platform_registry
+        if discover:
+            discover_plugins()  # idempotent per profile scope
+        port = tuple(getattr(platform_registry.get(platform_value), "listen_port", ()) or ())
+        return port if len(port) == 2 else ()
+    try:
+        if home is None:
+            return lookup()
+        with bind_profile_scope(home, hydrate_secrets=False):
+            return lookup()
+    except Exception:
+        logger.debug("listen_port lookup failed for %s", platform_value, exc_info=True)
+        return ()
+
+
+def platform_binds_port(platform_value: str, extra: Optional[dict] = None, *, home: Optional[Path] = None,
+                        discover: bool = False) -> bool:
+    """True when *platform_value* actually binds a port for *extra* config: a row above, or a plugin
+    platform that declares ``PlatformEntry.listen_port`` in *home*'s plugin scope (the ambient one
+    when None; *discover* as for :func:`plugin_listen_port`)."""
     if platform_value not in PORT_BINDING_PLATFORM_VALUES:
-        return False
+        return bool(plugin_listen_port(platform_value, home, discover=discover))
     expected_mode = PORT_BINDING_CONDITIONAL_MODES.get(platform_value)
     return expected_mode is None or str((extra or {}).get("connection_mode", "websocket")).strip().lower() == expected_mode
 

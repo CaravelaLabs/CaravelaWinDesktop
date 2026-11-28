@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Uni
 
 from utils import fast_safe_load
 from hermes_cli.plugin_capabilities import parse_declared_capabilities as _parse_declared_capabilities
+from hermes_cli.plugin_identity import tree_key
 
 try:
     import hermes_yaml as yaml
@@ -108,7 +109,7 @@ def _manifest_list(data: Mapping, key: str, field_name: str, what: str, coerce: 
 
 
 def _config_key_path(item: object) -> Optional[str]:
-    """A ``config_keys`` entry: a dotted path at least two segments deep (``memory.retaindb``), else None.
+    """A ``config_keys`` entry: a dotted path at least two segments deep (``memory.mem0``), else None.
     A bare section (``agent``) would silence typo notices for the whole section."""
     parts = item.strip().split(".") if isinstance(item, str) else []
     return ".".join(parts) if len(parts) >= 2 and all(parts) else None
@@ -414,7 +415,7 @@ class PluginManifest:
     # ``{endonym, rtl}`` from the mapping form of a ``provides_locales`` entry.
     provides_locales: list[str] = field(default_factory=list)
     locale_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Dotted paths in Hermes' own config sections the plugin reads (``memory.retaindb``), so
+    # Dotted paths in Hermes' own config sections the plugin reads (``memory.mem0``), so
     # ``hermes config get/set`` recognizes them while the plugin is active (hermes_cli/config_runtime_keys.py).
     config_keys: list[str] = field(default_factory=list)
 
@@ -516,7 +517,7 @@ def portable_plugin_manifest(child: Path, source: str, prefix: str) -> PluginMan
     data, diagnostics = read_agent_plugin_manifest(child)
     for diagnostic in diagnostics:
         logger.warning("Agent Plugin '%s': %s", child, diagnostic.message)
-    key = f"{prefix}/{child.name}" if prefix else data["name"]
+    key = tree_key(prefix, child.name, data["name"])
     return PluginManifest(
         name=data["name"], version=data.get("version", ""), description=data.get("description", ""),
         author=_display_author(data.get("author", "")), source=source, path=str(child), key=key,
@@ -562,7 +563,7 @@ def parse_manifest_file(
                            manifest_file, type(data).__name__)
             return None
         name = data.get("name", plugin_dir.name)
-        key = f"{prefix}/{plugin_dir.name}" if prefix else name
+        key = tree_key(prefix, plugin_dir.name, name)
         kind = _manifest_kind(data, key, plugin_dir)
         logger.debug(
             "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s", key, name, kind, source, plugin_dir)

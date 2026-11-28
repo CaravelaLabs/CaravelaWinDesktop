@@ -38,7 +38,7 @@ import os
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -67,44 +67,11 @@ def _read_config(home: Path) -> dict:
 
 
 def _merged_platform_block(home: Path, name: str) -> Optional[dict]:
-    """Platform *name*'s block as the gateway loader merges it for *home*: legacy ``gateway.json`` base
-    layer, then config.yaml's ``gateway.platforms`` / ``platforms`` / ``gateway.<name>`` blocks and a top-level
-    ``<name>:`` block in the loader's order (managed overlay and ``${VAR}`` applied). ``None`` when no layer names it."""
+    """Platform *name*'s block as the gateway loader builds it for *home* (``config_loader.platform_blocks``,
+    the one normalized view: key case and aliases, every layer, the malformed-layer fallback); ``None`` when no
+    layer names it. Its ``gateway.<name>`` shorthand counts before the platform's plugin registers."""
     from gateway import config_loader
-    also = frozenset({name})
-
-    def merged() -> Optional[dict]:
-        from hermes_cli import managed_scope
-        gw_data = config_loader.load_legacy_gateway_json(home)
-        gw_data = gw_data if isinstance(gw_data, dict) else {}
-        yaml_cfg = config_loader.read_yaml_layers(home)
-        managed = managed_scope.apply_managed_overlay({})
-        yaml_cfg = yaml_cfg if isinstance(yaml_cfg, dict) else {}
-        platforms = config_loader.merge_platform_sections(yaml_cfg, yaml_cfg.get("gateway"), gw_data, also=also)
-        authored = config_loader.snapshot_authored_extra(config_loader.merge_platform_sections(
-            yaml_cfg, yaml_cfg.get("gateway"), {}, also=also))
-        # Reconcile cross-shape pins before the root bridge, even before this platform is registered.
-        managed["platforms"] = config_loader.merge_platform_sections(
-            managed, managed.get("gateway"), {}, also=also)
-        config_loader._apply_managed_extra(authored, managed, platforms)
-        block = platforms.get(name)
-        root = yaml_cfg.get(name)
-        if isinstance(root, dict):  # a top-level ``<name>:`` block, bridged as bridge_platform_shared_keys does: its
-            from gateway.config import PlatformConfig  # adapter keys beat gateway.json's extra, not config.yaml's nested one
-            block = dict(block) if isinstance(block, dict) else {}
-            block["extra"] = {**(block.get("extra") or {}), **PlatformConfig.from_dict({**root, "home_channel": None}).extra,
-                              **authored.get(name, {})}  # a home_channel names a plugin's Platform
-            if "enabled" in root:  # and its enabled wins
-                block["enabled"] = root["enabled"]
-        return block
-
-    def gateway_json_only() -> Optional[dict]:  # a fresh read: the failed merge may have half-filled its copy
-        gw_data = config_loader.load_legacy_gateway_json(home)
-        return config_loader.merge_platform_sections(
-            {}, None, gw_data if isinstance(gw_data, dict) else {}, also=also).get(name)
-
-    block = config_loader.with_yaml_fallback(home, merged, gateway_json_only)
-    return block if isinstance(block, dict) else None
+    return config_loader.platform_blocks(home, also=frozenset({name})).get(name)
 
 
 def platform_configured_on(home: Path, name: str) -> bool:
@@ -135,7 +102,10 @@ def _toolset_listed(config: dict, names: frozenset[str], *, own_platform: str = 
     config.yaml, and it carried ``homeassistant: [hermes-homeassistant]`` until Home Assistant left core,
     so that row alone is not use."""
     rows = config.get("platform_toolsets")
-    selections = [sel for platform, sel in rows.items() if platform != own_platform] if isinstance(rows, dict) else []
+    # Only platform rows were string-saved by older builds (the runtime parses those); the top level is list-only.
+    from hermes_cli.toolset_validation import parse_platform_toolsets_value
+    selections = [parse_platform_toolsets_value(sel) for platform, sel in rows.items()
+                  if platform != own_platform] if isinstance(rows, dict) else []
     selections.append(config.get("toolsets"))
     return any(isinstance(sel, list) and any(str(item) in names for item in sel) for sel in selections)
 
@@ -162,34 +132,102 @@ def homeassistant_in_use(home: Path, *, process_env: bool = False) -> bool:
         _read_config(home), frozenset({"homeassistant", "hermes-homeassistant"}), own_platform="homeassistant")
 
 
-def yuanbao_in_use(home: Path, *, process_env: bool = False) -> bool:
-    """What made core run Yuanbao for *home*. The adapter: unless the merged gateway config block says
-    ``enabled: false`` (core never re-enabled an explicitly disabled platform), the platform on there
-    (:func:`platform_configured_on`) or its credential gate passing as core's ``_is_connected`` read it,
-    per field: App ID from the block's ``app_id`` (``extra`` or top level), else ``YUANBAO_APP_ID``, else
-    the legacy ``YUANBAO_APP_KEY``; App Secret from the block's ``app_secret``, else ``YUANBAO_APP_SECRET``
-    (env read through :func:`_home_env`; the process env too for the launch home with *process_env*). The
-    tools: the ``yuanbao`` / ``hermes-yuanbao`` toolset selected for another platform or in the top-level
-    ``toolsets`` list. The shipped ``yuanbao: [hermes-yuanbao]`` platform_toolsets row is not use: it scoped
-    Yuanbao's own sessions, which need the platform on. Nothing counts when ``plugins.disabled`` names
-    ``platforms/yuanbao`` or core's manifest name ``yuanbao-platform``: core's loader never ran the adapter
-    there. A bare ``yuanbao`` there did not stop core's adapter, so it is still use (the notice says it
-    now turns the plugin off)."""
-    if _plugins_listed(home, ("platforms/yuanbao", "yuanbao-platform"))[1]:
-        return False
-    block = _merged_platform_block(home, "yuanbao")
-    if block is not None and "enabled" in block and not _platform_config(block).enabled:
-        return _toolset_listed(_read_config(home), frozenset({"yuanbao", "hermes-yuanbao"}), own_platform="yuanbao")
-    if platform_configured_on(home, "yuanbao"):
-        return True
-    extra = _platform_config(block).extra if block is not None else {}
+# A credential field: (block key, env name, legacy env names...). A credential set is a tuple of fields that
+# must ALL be present; a platform with several connection modes passes one set per mode.
+CredField = tuple[str, ...]
 
-    def field(key: str, *env_names: str) -> bool:
-        return bool(str(extra.get(key) or "").strip()) or any(
-            _home_env(home, env_name, process_env=process_env) for env_name in env_names)
-    if field("app_id", "YUANBAO_APP_ID", "YUANBAO_APP_KEY") and field("app_secret", "YUANBAO_APP_SECRET"):
+
+def platform_in_use(platform: str, *, plugin_keys: tuple[str, ...] = (),
+                    cred_sets: tuple[tuple[CredField, ...], ...] = (),
+                    toolsets: tuple[str, ...] = ()) -> Callable[..., bool]:
+    """The ``in_use`` predicate for a bundled platform leaving core: what made core run *platform* for a home.
+
+    The adapter: unless the merged gateway config block says ``enabled: false`` (core never re-enabled an
+    explicitly disabled platform), the platform on there (:func:`platform_configured_on`) or one of
+    *cred_sets* passing as core's ``_is_connected`` read it, per field: the block's key (``extra`` or top
+    level), else any of the field's env names (read through :func:`_home_env`; the process env too for the
+    launch home with *process_env*). The tools: a toolset in *toolsets* selected for another platform or in
+    the top-level ``toolsets`` list; the platform's own ``platform_toolsets`` row is not use (it scoped the
+    platform's own sessions, which need the platform on). Nothing counts when ``plugins.disabled`` names one
+    of *plugin_keys* (``platforms/<x>``, core's manifest name): core's loader never ran the adapter there."""
+    names = frozenset(toolsets)
+
+    def tools_selected(home: Path) -> bool:
+        return bool(names) and _toolset_listed(_read_config(home), names, own_platform=platform)
+
+    def in_use(home: Path, *, process_env: bool = False) -> bool:
+        if plugin_keys and _plugins_listed(home, plugin_keys)[1]:
+            return False
+        block = _merged_platform_block(home, platform)
+        if block is not None and "enabled" in block and not _platform_config(block).enabled:
+            return tools_selected(home)
+        if platform_configured_on(home, platform):
+            return True
+        extra = _platform_config(block).extra if block is not None else {}
+
+        def present(field: CredField) -> bool:
+            key, *env_names = field
+            return bool(str(extra.get(key) or "").strip()) or any(
+                _home_env(home, env_name, process_env=process_env) for env_name in env_names)
+        if any(all(present(field) for field in fields) for fields in cred_sets):
+            return True
+        return tools_selected(home)
+    return in_use
+
+
+# Yuanbao: a bare ``yuanbao`` in plugins.disabled did not stop core's adapter, so it is still use (the notice
+# says it now turns the plugin off).
+yuanbao_in_use = platform_in_use(
+    "yuanbao", plugin_keys=("platforms/yuanbao", "yuanbao-platform"),
+    cred_sets=((("app_id", "YUANBAO_APP_ID", "YUANBAO_APP_KEY"), ("app_secret", "YUANBAO_APP_SECRET")),),
+    toolsets=("yuanbao", "hermes-yuanbao"))
+
+
+# DingTalk: core's ``_is_connected`` / env gate needed Client ID + Client Secret (block ``extra`` or env). Its
+# ``hermes-dingtalk`` bundle carried only core tools; a platform that selected it keeps resolving it once the
+# plugin registers the platform. A bare ``dingtalk`` in plugins.disabled did not stop core's adapter. The
+# bundled plugin's standalone sender (cron / cross-platform delivery) also ran on the robot webhook alone.
+_DINGTALK_PLUGIN_KEYS = ("platforms/dingtalk", "dingtalk-platform")
+_dingtalk_stream_or_tools_in_use = platform_in_use(
+    "dingtalk", plugin_keys=_DINGTALK_PLUGIN_KEYS,
+    cred_sets=((("client_id", "DINGTALK_CLIENT_ID"), ("client_secret", "DINGTALK_CLIENT_SECRET")),),
+    toolsets=("hermes-dingtalk",))
+
+
+def dingtalk_in_use(home: Path, *, process_env: bool = False) -> bool:
+    if _dingtalk_stream_or_tools_in_use(home, process_env=process_env):
         return True
-    return _toolset_listed(_read_config(home), frozenset({"yuanbao", "hermes-yuanbao"}), own_platform="yuanbao")
+    if _plugins_listed(home, _DINGTALK_PLUGIN_KEYS)[1]:
+        return False
+    # The standalone sender works without Stream Mode credentials, even when Stream Mode is disabled.
+    block = _merged_platform_block(home, "dingtalk")
+    extra = _platform_config(block).extra if block is not None else {}
+    return bool(str(extra.get("webhook_url") or "").strip()
+                or _home_env(home, "DINGTALK_WEBHOOK_URL", process_env=process_env))
+
+
+# WeCom: one plugin, two platforms. Bot mode enabled on ``extra.bot_id`` alone (the registry pass's
+# ``is_connected``) or on WECOM_BOT_ID + WECOM_SECRET (its env row); callback mode on ``extra.corp_id`` /
+# ``extra.apps`` alone or on WECOM_CALLBACK_CORP_ID + WECOM_CALLBACK_CORP_SECRET. A bare ``wecom`` in
+# plugins.disabled did not stop core's adapter (its manifest was ``wecom-platform``), so it is still use.
+_WECOM_PLUGIN_KEYS = ("platforms/wecom", "wecom-platform")
+wecom_in_use = platform_in_use(
+    "wecom", plugin_keys=_WECOM_PLUGIN_KEYS,
+    cred_sets=((("bot_id",),), (("bot_id", "WECOM_BOT_ID"), ("secret", "WECOM_SECRET"))))
+wecom_callback_in_use = platform_in_use(
+    "wecom_callback", plugin_keys=_WECOM_PLUGIN_KEYS,
+    cred_sets=((("corp_id",),), (("apps",),),
+               (("corp_id", "WECOM_CALLBACK_CORP_ID"), ("corp_secret", "WECOM_CALLBACK_CORP_SECRET"))))
+
+
+_WECOM_NOTICE = ("WeCom is now a Hermes Labs plugin: built by Nous Research, not supported, and likely not "
+                 "maintained going forward. Fixes from the community are welcome.")
+
+
+def _wecom_notice(home: Path, *, process_env: bool = False) -> str:
+    # As for Yuanbao: the automatic install keeps a bare ``wecom`` in plugins.disabled (which core's adapter
+    # ignored), and its kept-off notice (_install_locked) names the enable command.
+    return _WECOM_NOTICE
 
 
 # ``gateway.config.Platform`` members in neither table above. Named, not imported: gateway.config imports
@@ -201,7 +239,7 @@ def _core_platforms_except(platform: str, *others: str) -> tuple[str, ...]:
     """Every platform name core knows, minus *platform*: the ``hermes_cli.platforms`` table, the shipped
     ``plugins/platforms/<name>`` dirs (the dir is the registered name), the gateway-only ``Platform``
     members, the ``acp`` surface and *others*
-    (platforms other rows moved out). Off-platforms derived here cover a platform added later too."""
+    (platforms rows moved out, :func:`_derive_off_platforms`). Covers a platform added later too."""
     from hermes_cli.platforms import PLATFORMS
     try:
         bundled = {p.name for p in (Path(project_root_str()) / "plugins" / "platforms").iterdir()
@@ -211,10 +249,6 @@ def _core_platforms_except(platform: str, *others: str) -> tuple[str, ...]:
     return tuple(sorted({*PLATFORMS, *bundled, *_GATEWAY_ONLY_PLATFORMS, "acp", *others} - {platform}))
 
 
-# Core put the yb_* tools in ``hermes-yuanbao`` only (toolsets.py before Yuanbao left core), so no other
-# platform's default composite carried them. A third-party plugin platform core never knew stays uncovered.
-_YUANBAO_OFF_PLATFORMS = _core_platforms_except("yuanbao", "homeassistant")
-
 _YUANBAO_NOTICE = ("Yuanbao is now a Hermes Labs plugin: built by Nous Research, not supported, and likely not "
                    "maintained going forward. Fixes from the community are welcome.")
 
@@ -223,6 +257,16 @@ def _yuanbao_notice(home: Path, *, process_env: bool = False) -> str:
     # Core's adapter ignored a bare ``yuanbao`` in plugins.disabled; the catalog plugin does not, and the
     # automatic install keeps the entry: its kept-off notice (_install_locked) names the enable command.
     return _YUANBAO_NOTICE
+
+
+_DINGTALK_NOTICE = ("DingTalk is now a Hermes Labs plugin: built by Nous Research, not supported, and likely not "
+                    "maintained going forward. Fixes from the community are welcome.")
+
+
+def _dingtalk_notice(home: Path, *, process_env: bool = False) -> str:
+    # As for Yuanbao: the automatic install keeps a bare ``dingtalk`` in plugins.disabled (which core's adapter
+    # ignored), and its kept-off notice (_install_locked) names the enable command.
+    return _DINGTALK_NOTICE
 
 
 def _auth_store(home: Path) -> dict:
@@ -242,9 +286,11 @@ def spotify_in_use(home: Path, *, process_env: bool = False) -> bool:
     return _toolset_listed(_read_config(home), frozenset({"spotify"}))
 
 
-def _plugins_listed(home: Path, names: tuple[str, ...]) -> tuple[bool, bool]:
-    """Whether a name in *names* is in *home*'s ``plugins.enabled`` / ``plugins.disabled``, read with the
-    managed overlay applied like the loader's config, so an administrator's pinned list counts."""
+def _plugins_listed(home: Path, identity) -> tuple[bool, bool]:
+    """Whether *home*'s ``plugins.enabled`` / ``plugins.disabled`` name the plugin with *identity*
+    (``plugin_identity.plugin_listed``, the loader's rule), read with the managed overlay applied like the
+    loader's config, so an administrator's pinned list counts."""
+    from hermes_cli.plugin_identity import plugin_listed
     from gateway import config_loader
     try:
         plugins = config_loader.read_yaml_layers(home).get("plugins")
@@ -253,17 +299,21 @@ def _plugins_listed(home: Path, names: tuple[str, ...]) -> tuple[bool, bool]:
         return False, False
     plugins = plugins if isinstance(plugins, dict) else {}
 
-    def listed(key: str) -> bool:
-        entries = plugins.get(key)
-        return isinstance(entries, list) and any(str(n) in names for n in entries)
-    return listed("enabled"), listed("disabled")
+    identity = frozenset(identity)
+    return plugin_listed(identity, plugins.get("enabled")), plugin_listed(identity, plugins.get("disabled"))
 
 
 def _plugin_lists(home: Path, plugin: str, *, also: tuple[str, ...] = ()) -> tuple[bool, bool]:
-    """Whether *plugin*'s key or name (or a name in *also*) is in *home*'s ``plugins.enabled`` /
-    ``plugins.disabled`` (:func:`_plugins_listed`)."""
-    feature = next(f for f in LEFT_CORE if f.plugin == plugin)
-    return _plugins_listed(home, (feature.plugin_key, *feature.plugin_names, feature.plugin, *also))
+    """Whether catalog *plugin* (by its catalog name or a core-era key, ``plugin_identity``) or a name in
+    *also* is in *home*'s ``plugins.enabled`` / ``plugins.disabled`` (:func:`_plugins_listed`)."""
+    from hermes_cli.plugin_identity import plugin_identity
+    return _plugins_listed(home, plugin_identity(plugin) | set(also))
+
+
+def _tree_lists(home: Path, plugin: str) -> tuple[bool, bool]:
+    """:func:`_plugins_listed` for the tree *home* has for *plugin*, by the names the loader gives that tree."""
+    from hermes_cli.plugin_identity import tree_identity
+    return _plugins_listed(home, tree_identity(home / "plugins", home / "plugins" / plugin, default=plugin))
 
 
 def _bundled_plugin_selected(home: Path, plugin: str) -> bool:
@@ -574,6 +624,10 @@ class LeftCoreFeature:
     toolsets: tuple[str, ...] = ()
     # Platforms whose core default composite (``hermes-<platform>``) never carried those toolsets.
     off_platforms: tuple[str, ...] = ()
+    # Core carried the toolsets in *platform*'s own ``hermes-<platform>`` bundle only (and ``hermes-gateway``):
+    # *off_platforms* is derived, every other platform core knows plus every platform a LEFT_CORE row moved
+    # out (:func:`_derive_off_platforms`), so the order two platform moves land in cannot leave one stale.
+    own_platform_only: bool = False
     # Core-era toolsets the plugin's toolsets replace while core keeps the name for something else
     # (core's ``browser`` is browser_exec now; Camofox's tools live in the plugin's ``camofox``). The
     # one-time scope conversion treats them as the plugin's toolsets for "did core carry it" and turns
@@ -618,6 +672,11 @@ class LeftCoreFeature:
     # only while the home's config is below it or when that version's config step found the feature in
     # use (:func:`record_core_use`). A newer home that sets the plugin up itself keeps core's toolsets.
     left_at: int = 0
+    # A Hermes Labs plugin (needs *left_at*): its code is downloaded automatically only for a home that proves
+    # it ran the core feature, a config.yaml stamped below *left_at* or whose step there found it in use. A
+    # missing or unstamped config.yaml is no proof (a new home whose setup wrote only .env looks the same), so
+    # that home, like every newer one, is told the install command.
+    labs: bool = False
     # Provider ids and aliases the plugin's model-provider profiles register. A name nothing resolves to
     # gets :func:`provider_install_hint` appended to its "unknown provider" error, runtime resolution
     # installs the plugin first for a home that uses it (:func:`recover_for_provider`), and those names
@@ -716,23 +775,81 @@ LEFT_CORE: tuple[LeftCoreFeature, ...] = (
                      "YUANBAO_DM_POLICY", "YUANBAO_DM_ALLOW_FROM", "YUANBAO_GROUP_POLICY", "YUANBAO_GROUP_ALLOW_FROM",
                      "YUANBAO_ALLOWED_USERS", "YUANBAO_ALLOW_ALL_USERS", "YUANBAO_HOME_CHANNEL",
                      "YUANBAO_HOME_CHANNEL_NAME"),
-        toolsets=("yuanbao",), off_platforms=_YUANBAO_OFF_PLATFORMS,
+        toolsets=("yuanbao",), own_platform_only=True,
         legacy_toolsets=("hermes-yuanbao", "hermes-gateway"),
         platform="yuanbao", enable_env=("YUANBAO_APP_ID", "YUANBAO_APP_SECRET"), notice=_yuanbao_notice,
     ),
+    LeftCoreFeature(
+        # The strip set is core's: CLIENT_SECRET as a secret, the rest as provider env (Tier 2), as on main.
+        plugin="dingtalk", label="DingTalk", in_use=dingtalk_in_use, plugin_key="platforms/dingtalk",
+        plugin_names=("dingtalk-platform",),
+        unchanged="DINGTALK_* settings, platforms.dingtalk and DINGTALK_HOME_CHANNEL are unchanged",
+        secret_env=("DINGTALK_CLIENT_SECRET",),
+        private_env=("DINGTALK_CLIENT_ID", "DINGTALK_ALLOWED_USERS", "DINGTALK_HOME_CHANNEL",
+                     "DINGTALK_HOME_CHANNEL_NAME", "DINGTALK_WEBHOOK_URL"),
+        platform="dingtalk", enable_env=("DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"), notice=_dingtalk_notice,
+        left_at=55, labs=True,  # a home that cannot prove it ran core's DingTalk is told the install command
+    ),
+    # One plugin ships both WeCom platforms, so two rows share ``plugin``: whichever a home uses installs
+    # it once (the install and v55 use markers are per plugin). ``hermes-wecom`` / ``hermes-wecom-callback`` carried
+    # only core tools, so there is no toolset scope to keep.
+    LeftCoreFeature(
+        plugin="wecom", label="WeCom", in_use=wecom_in_use, plugin_key="platforms/wecom",
+        plugin_names=("wecom-platform",),
+        unchanged="WECOM_* settings, platforms.wecom and WECOM_HOME_CHANNEL are unchanged",
+        secret_env=("WECOM_SECRET",),
+        private_env=("WECOM_BOT_ID", "WECOM_WEBSOCKET_URL", "WECOM_ALLOWED_USERS", "WECOM_HOME_CHANNEL"),
+        platform="wecom", enable_env=("WECOM_BOT_ID", "WECOM_SECRET"), notice=_wecom_notice,
+        left_at=55, labs=True,  # as DingTalk: a home that cannot prove it ran core's WeCom is told the command
+    ),
+    LeftCoreFeature(
+        plugin="wecom", label="WeCom callback", in_use=wecom_callback_in_use, plugin_key="platforms/wecom",
+        plugin_names=("wecom-platform",),
+        unchanged="WECOM_CALLBACK_* settings and platforms.wecom_callback are unchanged",
+        secret_env=("WECOM_CALLBACK_CORP_SECRET", "WECOM_CALLBACK_TOKEN", "WECOM_CALLBACK_ENCODING_AES_KEY"),
+        private_env=("WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_AGENT_ID"),
+        platform="wecom_callback", enable_env=("WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET"),
+        notice=_wecom_notice, left_at=55, labs=True,
+    ),
 )
 
-def _install_sentence(feature: LeftCoreFeature) -> str:
+
+def _derive_off_platforms(rows: tuple[LeftCoreFeature, ...]) -> tuple[LeftCoreFeature, ...]:
+    """*rows* with each ``own_platform_only`` row's ``off_platforms`` filled in: every platform core knows and
+    every platform a row in *rows* moved out of core, minus the row's own. A third-party plugin platform core
+    never knew stays uncovered."""
+    moved = tuple(row.platform for row in rows if row.platform)
+    return tuple(replace(row, off_platforms=_core_platforms_except(row.platform, *moved))
+                 if row.own_platform_only else row for row in rows)
+
+
+LEFT_CORE = _derive_off_platforms(LEFT_CORE)
+
+
+def _install_sentence(feature: LeftCoreFeature, home: Optional[Path] = None) -> str:
     from hermes_constants import get_hermes_home
     return (f"{feature.label} moved out of core into the '{feature.plugin}' plugin: install it with "
-            f"`{_install_command(feature.plugin, Path(get_hermes_home()))}`")
+            f"`{_install_command(feature.plugin, Path(home or get_hermes_home()))}`")
 
 
-def platform_install_hint(platform: str) -> str:
+def platform_install_hint(platform: str, home: Optional[Path] = None) -> str:
     """For an unknown platform name that left core: the sentence that names its install command for
-    the active home, else ``""``. Appended to "unknown platform" errors (``send_message``)."""
+    *home* (default: the active home; its enable command when installed but off), else ``""``. Appended to
+    "unknown platform" errors (``send_message``, cron delivery). Reads *home*'s files only, never its secrets,
+    so a caller on the event loop passes the routed profile's home instead of entering its runtime scope."""
+    from hermes_constants import get_hermes_home
     feature = next((f for f in LEFT_CORE if f.platform and f.platform == platform), None)
-    return f". {_install_sentence(feature)}" if feature else ""
+    home = Path(home or get_hermes_home())
+    if feature is None or not plugin_present(feature.plugin, home):
+        return f". {_install_sentence(feature, home)}" if feature else ""
+    install = _install_command(feature.plugin, home)
+    enabled, disabled = _plugin_lists(home, feature.plugin)
+    if enabled and not disabled:
+        return (f". {feature.label} moved out of core into the '{feature.plugin}' plugin, which is enabled but "
+                f"did not load: see `{install.replace(f' plugins install {feature.plugin}', ' logs')}` for the cause")
+    enable = install.replace(" install ", " enable ")
+    return (f". {feature.label} moved out of core into the '{feature.plugin}' plugin, which is installed but "
+            f"off: run `{enable}`")
 
 
 def terminal_backend_install_hint(backend: str) -> str:
@@ -1039,7 +1156,7 @@ def _installed_for_good(home: Path, plugin: str) -> bool:
     nobody enabled or disabled since (that one is owed, and the next attempt enables it in place)."""
     if not plugin_present(plugin, home):
         return False
-    return not _placed(home, plugin).exists() or any(_plugins_listed(home, (plugin,)))
+    return not _placed(home, plugin).exists() or any(_tree_lists(home, plugin))
 
 
 def _core_carried(feature: LeftCoreFeature, selection: list) -> bool:
@@ -1066,11 +1183,12 @@ _DEFAULT_INSTALLED_KEY = "_default_plugins_installed"
 _USED_KEY = "_left_core_used"
 
 
-def record_core_use(home: Path, config: dict, version: int) -> bool:
+def record_core_use(home: Path, config: dict, version: int, *, first_stamp: bool = False) -> bool:
     """Config step *version* hook, before it writes *config* (*home*'s raw config.yaml, still showing the
     core-era setup): mark every row that left core at *version* and that *home* uses. Returns whether
-    *config* changed. The launch home's process env counts, as at agent start."""
-    used = [feature for feature in LEFT_CORE if feature.left_at == version
+    *config* changed. The launch home's process env counts, as at agent start. *first_stamp*: *config* is
+    the first stamp of a missing or unstamped file, which proves no core-era use for a :attr:`labs` row."""
+    used = [feature for feature in LEFT_CORE if feature.left_at == version and not (first_stamp and feature.labs)
             and not _marked(config, _USED_KEY, feature) and feature_in_use(feature, home, process_env=True)]
     for feature in used:
         _mark(config, _USED_KEY, feature)
@@ -1082,12 +1200,15 @@ def _predates_split(home: Path, feature: LeftCoreFeature) -> bool:
     config step), that step recorded the feature in use, or config.yaml is missing or unstamped. Every
     config.yaml Hermes writes carries a stamp, and the first save that stamps one records the rows in use
     (``config_version_stamp.note_first_stamp``), so only a home from before the split lacks it; core ran
-    the feature there from its .env alone."""
+    the feature there from its .env alone. A :attr:`~LeftCoreFeature.labs` row takes only the stamp as
+    proof: a missing or unstamped config.yaml is also a new home whose setup wrote only .env."""
     if not feature.left_at:
         return True
     config = _read_config(home)
-    if _marked(config, _USED_KEY, feature) or "_config_version" not in config:
+    if _marked(config, _USED_KEY, feature):
         return True
+    if "_config_version" not in config:
+        return not feature.labs
     try:
         return int(config["_config_version"]) < feature.left_at
     except (TypeError, ValueError):
@@ -1209,6 +1330,7 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
     *backoff* (startup) skips a row whose last attempt failed recently, before any network."""
     from hermes_cli.memory_provider_migration import catalog_source
     out = []
+    told: set[str] = set()
     for feature in LEFT_CORE:
         config = _read_config(home)
         if _marked(config, _INSTALLED_KEY, feature) or any(f.plugin == feature.plugin for f in out):
@@ -1220,7 +1342,8 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
         # toolset scope is still kept below, so only the install and the "not installed" notice are skipped.
         placed_by_default = _marked(config, _DEFAULT_INSTALLED_KEY, feature)
         if not _predates_split(home, feature):
-            if not placed_by_default:
+            if not placed_by_default and feature.plugin not in told:  # one line per plugin, not per row
+                told.add(feature.plugin)
                 _say_post_split(home, feature, say=say, backoff=backoff, process_env=process_env)
             continue
         present = _installed_for_good(home, feature.plugin)
